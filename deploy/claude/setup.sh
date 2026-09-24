@@ -53,6 +53,9 @@ else
   echo "created"
 fi
 
+actual_node="$("$BIN/python" -c 'import sys, yaml; print(yaml.safe_load(open(sys.argv[1]))["node"])' "$CONFIG")"
+[ "$actual_node" = "$NODE" ] || { echo "--node $NODE does not match node $actual_node in $CONFIG" >&2; exit 2; }
+
 say "agents"
 "$BIN/agent-node" add-agent --config "$CONFIG" --id "$AGENT" --mode interactive --provider anthropic \
     --role lead --workdir "$WORKDIR" --permission READ --permission REQUEST_TASK --permission PUBLISH_ARTIFACT
@@ -71,15 +74,17 @@ load_unit() {   # $1 = extra args for `agent-node service` (empty or "--watch AG
   if [ "$(uname -s)" = Darwin ]; then
     label="dev.mutmuas.$PROJECT.$NODE${1:+.watch-$AGENT}"; plist="$HOME/Library/LaunchAgents/$label.plist"
     if [ -f "$plist" ]; then
+      grep -Fq -- "$CONFIG" "$plist" || { echo "$plist belongs to a different config; refusing to touch it" >&2; exit 2; }
       echo "$label exists — restarting it (not rewriting: another checkout may own it)"
     else
       "$BIN/agent-node" service --write --config "$CONFIG" $1 | head -1
-      launchctl bootstrap "gui/$(id -u)" "$plist"
     fi
+    launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1 || launchctl bootstrap "gui/$(id -u)" "$plist"   # (from codex branch)
     launchctl kickstart -k "gui/$(id -u)/$label"
   else
     unit="mutmuas-agent-node${1:+-$NODE.watch-$AGENT}"
     if [ -f "$HOME/.config/systemd/user/$unit.service" ]; then
+      grep -Fq -- "$CONFIG" "$HOME/.config/systemd/user/$unit.service" || { echo "$unit belongs to a different config" >&2; exit 2; }
       echo "$unit exists — restarting it"
     else
       "$BIN/agent-node" service --write --config "$CONFIG" $1 | head -1
