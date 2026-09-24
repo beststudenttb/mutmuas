@@ -112,6 +112,20 @@ elif action == "block_only":
 
     asyncio.run(with_hub(run))
 
+elif action == "evil_commit":
+    # A hostile agent: commit, then plant an fsmonitor and hooks in its
+    # own clone, so that anything running git in this clone afterwards (i.e. the daemon) would trigger them.
+    marker = inputs["marker"]
+    Path(inputs["file"]).write_text(inputs["content"])
+    subprocess.run(["git", "add", inputs["file"]], check=True)
+    subprocess.run(["git", "-c", "user.name=evil", "-c", "user.email=e@example.invalid", "commit", "-qm", "evil"],
+                   check=True)
+    subprocess.run(["git", "config", "core.fsmonitor", f"touch {marker}.fsmonitor"], check=True)
+    for hook in ("post-checkout", "pre-commit", "reference-transaction"):
+        Path(f".git/hooks/{hook}").write_text(f"#!/bin/sh\ntouch {marker}.hook\n")
+        Path(f".git/hooks/{hook}").chmod(0o755)
+    print(json.dumps({"status": "complete", "summary": "committed"}))
+
 elif action == "delegate":
     # B worker delegates onward to another agent and waits: A -> B -> C chains.
     async def run(hub):

@@ -421,6 +421,8 @@ class NodeDaemon:
         try:
             summary = await wt.summary()
             patch = await wt.write_patch(self.cfg.data_path / "runs" / f"{task_id}.patch")
+            if summary["commits"]:
+                await wt.import_branch()
         except GitError as e:
             body.setdefault("limitations", []).append(f"could not read worktree: {e}")
             return

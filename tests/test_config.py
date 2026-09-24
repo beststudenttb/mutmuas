@@ -150,23 +150,15 @@ def test_bare_init_add_agent_and_watch_unit(tmp_path, monkeypatch):
         cli.agent_node(["service", "--watch", "B:main", "--config", str(cfg)])
 
 
-def test_code_task_sandbox_can_write_the_repos_git_dir(tmp_path):
-    """A:codex-worker could not commit in its worktree: objects/refs live in <repo>/.git outside the sandbox."""
-    import subprocess
-
+def test_code_task_sandbox_never_gets_the_main_repos_git_dir(tmp_path):
+    """b461307 opened <repo>/.git to the sandbox (A:codex found it bypasses MERGE); code tasks now use a private clone."""
     from mutmuas.config import AgentConfig, NodeConfig
     from mutmuas.protocol import Envelope, request_body
     from mutmuas.runtime import ClaudeCodeRuntime, CodexRuntime, TaskContext
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
     node = NodeConfig(project="p", node="A", data_dir=str(tmp_path / "data"))
-    agent = AgentConfig(id="w", runtime="codex", workdir=str(repo), repo=str(repo),
+    agent = AgentConfig(id="w", runtime="codex", workdir=str(tmp_path), repo=str(tmp_path),
                         permissions=["READ", "WRITE_WORKTREE"])
     req = Envelope(type="REQUEST", sender="A:c", to="A:w", task_id="T-1", body=request_body("x", "y", kind="code"))
     ctx = TaskContext("T-1", req, agent, node, workdir=tmp_path / "wt", git_branch="mm/A-w/T-1")
     for runtime in (CodexRuntime, ClaudeCodeRuntime):
-        argv, _ = runtime(agent, node).command(ctx)
-        assert argv[argv.index("--add-dir") + 1] == str((repo / ".git").resolve())
-    plain = TaskContext("T-2", req, agent, node)                     # not in a worktree: no extra dir
-    assert "--add-dir" not in CodexRuntime(agent, node).command(plain)[0]
+        assert "--add-dir" not in runtime(agent, node).command(ctx)[0]
