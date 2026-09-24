@@ -459,8 +459,7 @@ class NodeDaemon:
             "node": self.cfg.node, "project": self.cfg.project, "description": self.cfg.description,
             "hostname": socket.gethostname(), "platform": f"{platform.system()} {platform.machine()}",
             "resources": self.cfg.resources, "agents": [a.id for a in self.cfg.agents],
-            "version": __version__, "code": self.code_version, "python": platform.python_version(),
-            "heartbeat_s": self.cfg.heartbeat_s,
+            "version": __version__, "code": self.code_version, "heartbeat_s": self.cfg.heartbeat_s,
             "last_heartbeat": now,
             "state": state_override or "online",
             "outbox_queued": hub.ledger.count("out", "queued")})
