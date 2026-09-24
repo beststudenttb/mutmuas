@@ -169,7 +169,7 @@ class Ledger:
                         (state, error, now_iso(), message_id))
 
     def unseen(self, local_agent: str, limit: int = 50, mark: bool = True,
-               types: tuple[str, ...] | None = None) -> list[Envelope]:
+               types: tuple[str, ...] | None = None, since: str | None = None) -> list[Envelope]:
         """Inbound messages an interactive agent has not looked at yet.
 
         Only messages the dispatcher has fully handled: a REQUEST shows up once its task exists
@@ -177,9 +177,10 @@ class Ledger:
         """
         with self.tx() as db:
             type_sql = f" AND type IN ({','.join('?' * len(types))})" if types else ""
+            since_sql = " AND created_at > ?" if since else ""
             rows = db.execute("SELECT message_id, envelope FROM messages WHERE direction='in' AND seen=0"
-                              f" AND state='handled' AND local_agent=?{type_sql} ORDER BY rowid LIMIT ?",
-                              (local_agent, *(types or ()), limit)).fetchall()
+                              f" AND state='handled' AND local_agent=?{type_sql}{since_sql} ORDER BY rowid LIMIT ?",
+                              (local_agent, *(types or ()), *((since,) if since else ()), limit)).fetchall()
             if mark and rows:
                 db.executemany("UPDATE messages SET seen=1 WHERE message_id=? AND direction='in'",
                                [(r["message_id"],) for r in rows])
@@ -188,9 +189,12 @@ class Ledger:
     def mark_seen(self, task_id: str) -> None:
         self.db.execute("UPDATE messages SET seen=1 WHERE direction='in' AND task_id=?", (task_id,))
 
-    def unseen_count(self, local_agent: str, types: tuple[str, ...] | None = None) -> int:
+    def unseen_count(self, local_agent: str, types: tuple[str, ...] | None = None, since: str | None = None) -> int:
         sql = "SELECT COUNT(*) FROM messages WHERE direction='in' AND seen=0 AND state='handled' AND local_agent=?"
         args: list[Any] = [local_agent]
+        if since:
+            sql += " AND created_at > ?"
+            args.append(since)
         if types:
             sql += f" AND type IN ({','.join('?' * len(types))})"
             args.extend(types)

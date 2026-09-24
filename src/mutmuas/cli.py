@@ -228,7 +228,8 @@ async def cmd_inbox(args, hub: Hub):
     types = None
     if args.only:
         types = tools.ACTIONABLE if args.only == "actionable" else tuple(t.strip().upper() for t in args.only.split(","))
-    rows = await tools.inbox(hub, _me(args), include_seen=args.all, peek=args.peek, wait_s=args.wait, types=types)
+    rows = await tools.inbox(hub, _me(args), include_seen=args.all, peek=args.peek, wait_s=args.wait, types=types,
+                             since=args.since)
     if args.json:
         _print(rows, True)
     elif not rows:
@@ -572,6 +573,8 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p = add("inbox", cmd_inbox, "messages addressed to me", bus=False)
     p.add_argument("--all", action="store_true", help="include already seen messages")
     p.add_argument("--peek", action="store_true", help="do not mark messages as read")
+    p.add_argument("--since", metavar="ISO_TIME", help="only messages received after this time (notifier cursor; "
+                                                         "each row's 'received_at' is the next cursor)")
     p.add_argument("--only", metavar="TYPES", help="'actionable' or comma separated types, e.g. REQUEST,RESULT; "
                                                    "a watcher using --wait --only actionable ignores ACKs/progress")
     p.add_argument("--wait", type=float, nargs="?", const=3600, metavar="SECONDS",

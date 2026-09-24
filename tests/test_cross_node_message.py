@@ -196,3 +196,35 @@ async def test_watcher_ignores_acks_with_only_actionable(make_config, cluster):
     rows = await tools.inbox(hub, "A:main", peek=True, wait_s=20, types=tools.ACTIONABLE)
     assert [m["type"] for m in rows] == ["RESULT"] and rows[0]["task_id"] == sent["task_id"]
     assert asyncio.get_running_loop().time() - start > 1.0      # did not wake on the ACK / UPDATEs
+
+
+async def test_notifier_announces_each_new_message_once(make_config, cluster, tmp_path):
+    """examples/watchers/inbox-notify.sh: peek + --since cursor → one notification per new actionable message."""
+    import asyncio
+    import subprocess
+    from pathlib import Path
+    a = make_config("A", [interactive("main")])
+    b = make_config("B", [interactive("coder")])
+    await cluster.start(a)
+    await cluster.start(b)
+    hub_a = await cluster.client(a)
+    hub_b = await cluster.client(b)
+    script = Path(__file__).resolve().parents[1] / "examples/watchers/inbox-notify.sh"
+    log = open(tmp_path / "notify.log", "w")
+    proc = subprocess.Popen(["bash", str(script), str(b.path), "B:coder", "--dry-run"], stdout=log, stderr=log)
+    try:
+        await asyncio.sleep(2)
+        first = await tools.send_request(hub_a, "A:main", "B:coder", "first question", "notifier test")
+        await eventually(lambda: "first question" in (tmp_path / "notify.log").read_text(), what="first notice")
+        await asyncio.sleep(3)                                   # the unread first message must not re-notify
+        await tools.send_request(hub_a, "A:main", "B:coder", "second question", "notifier test")
+        await eventually(lambda: "second question" in (tmp_path / "notify.log").read_text(), what="second notice")
+        await asyncio.sleep(2)
+        lines = [l for l in (tmp_path / "notify.log").read_text().splitlines() if "notify:" in l]
+        assert len(lines) == 2, lines
+        # the notifier only peeks: the session still sees both as unread
+        assert {m["task_id"] for m in await tools.inbox(hub_b, "B:coder")} >= {first["task_id"]}
+    finally:
+        proc.terminate()
+        proc.wait(5)
+        log.close()
