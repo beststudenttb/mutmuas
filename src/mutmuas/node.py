@@ -516,7 +516,27 @@ def _result_from(draft: dict[str, Any] | None, outcome) -> tuple[dict[str, Any],
             body.setdefault("limitations", []).append(f"agent process exited with code {outcome.exit_code}")
         return body, refs
     status = "failed" if outcome.exit_code != 0 else "partial"
-    return result_body(
-        status, f"agent finished without a structured result (exit code {outcome.exit_code})",
-        outputs={"raw_output_tail": outcome.output_tail[-2000:]},
-        limitations=["no submit_result call; outcome could not be verified", f"log: {outcome.log_path}"]), []
+    outputs = {"raw_output_tail": outcome.output_tail[-2000:]}
+    errors = _error_lines(outcome.log_path)
+    if errors:   # the CLI's own stderr usually says why (e.g. "workspace is out of credits")
+        outputs["error_lines"] = errors
+    summary = f"agent finished without a structured result (exit code {outcome.exit_code})"
+    if errors:
+        summary += f": {errors[-1][:200]}"
+    return result_body(status, summary, outputs=outputs,
+                       limitations=["no submit_result call; outcome could not be verified",
+                                    f"log: {outcome.log_path}"]), []
+
+
+def _error_lines(log_path: str | None, limit: int = 8) -> list[str]:
+    """Error-looking lines from a run log (stderr goes there), so the requester sees why a run failed."""
+    if not log_path:
+        return []
+    try:
+        lines = Path(log_path).read_text(errors="replace").splitlines()[1:]    # skip the "$ command" line
+    except OSError:
+        return []
+    keys = ("error", "exception", "traceback", "denied", "not found", "failed", "out of credits", "quota",
+            "rate limit", "unauthorized", "crash")
+    hits = [ln.strip() for ln in lines if any(k in ln.lower() for k in keys)]
+    return list(dict.fromkeys(hits))[-limit:]
