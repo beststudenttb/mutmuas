@@ -161,3 +161,23 @@ async def test_interactive_inbox_peek_wait_and_working_state(make_config, cluste
 async def _card_if(hub, address, state):
     card = await hub.agent_card(address)
     return card if card and card.get("state") == state else None
+
+
+async def test_request_withdrawn_before_seen_stays_out_of_inbox(make_config, cluster):
+    """C's load test sent 300 REQUEST+CANCEL pairs to A:main: withdrawn-before-seen requests are not inbox noise."""
+    a = make_config("A", [interactive("main")])
+    b = make_config("B", [interactive("coder")])
+    await cluster.start(a)
+    await cluster.start(b)
+    hub_a = await cluster.client(a)
+    hub_b = await cluster.client(b)
+    ids = []
+    for i in range(10):
+        sent = await tools.send_request(hub_a, "A:main", "B:coder", f"stress {i}", "load test")
+        await tools.cancel_task(hub_a, "A:main", sent["task_id"], "load test")
+        ids.append(sent["task_id"])
+    kept = await tools.send_request(hub_a, "A:main", "B:coder", "real question", "not withdrawn")
+    await eventually(lambda: all((hub_b.ledger.task(t, "owner") or {}).get("status") == "CANCELLED" for t in ids),
+                     what="all withdrawn tasks cancelled on the owner side")
+    inbox = await eventually(lambda: tools.inbox(hub_b, "B:coder"), what="the real question")
+    assert [m["task_id"] for m in inbox] == [kept["task_id"]]

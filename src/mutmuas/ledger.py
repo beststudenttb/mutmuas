@@ -183,6 +183,9 @@ class Ledger:
                                [(r["message_id"],) for r in rows])
         return [Envelope.from_json(r["envelope"]) for r in rows]
 
+    def mark_seen(self, task_id: str) -> None:
+        self.db.execute("UPDATE messages SET seen=1 WHERE direction='in' AND task_id=?", (task_id,))
+
     def unseen_count(self, local_agent: str) -> int:
         return self.db.execute("SELECT COUNT(*) FROM messages WHERE direction='in' AND seen=0 AND state='handled'"
                                " AND local_agent=?", (local_agent,)).fetchone()[0]

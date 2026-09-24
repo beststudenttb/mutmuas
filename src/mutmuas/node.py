@@ -212,7 +212,7 @@ class NodeDaemon:
         if env.type == "REQUEST":
             return await self._on_request(agent, env)
         elif env.type == "CANCEL":
-            await self._on_cancel(env)
+            return await self._on_cancel(env)
         elif env.type == "ANSWER":
             pass   # surfaced to the agent through its inbox (MCP/CLI); see technical debt in docs
         else:
@@ -258,10 +258,17 @@ class NodeDaemon:
         await self.hub.owner_transition(task_id, "ACCEPTED", "accepted into queue", msg_type="ACK",
                                         body={"state": "ACCEPTED", "message": "accepted into queue"})
 
-    async def _on_cancel(self, env: Envelope) -> None:
+    async def _on_cancel(self, env: Envelope) -> str | None:
         task = self.hub.ledger.task(env.task_id, "owner")
         if task is None or task["status"] in TERMINAL_STATES:
-            return
+            return None
+        if task["status"] == "PENDING":
+            # Withdrawn before anyone picked it up: close it and keep it out of the interactive inbox
+            # (both the REQUEST and this CANCEL are noise to someone who never saw the request).
+            await self.hub.owner_transition(env.task_id, "CANCELLED",
+                                            env.body.get("reason") or "withdrawn before it was accepted")
+            self.hub.ledger.mark_seen(env.task_id)
+            return None
         self._cancel_requested.add(env.task_id)
         runner = self._running.get(env.task_id)
         if runner:
