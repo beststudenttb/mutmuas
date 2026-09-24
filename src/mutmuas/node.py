@@ -73,6 +73,7 @@ class NodeDaemon:
         self._cancel_requested: set[str] = set()
         self._outbox_wake = asyncio.Event()
         self.started = asyncio.Event()
+        self._remote_pauses: dict[str, dict[str, Any]] = {}   # account -> pause announced by another node
         self.code_version = _code_version()
         self._stopping = False
 
@@ -342,7 +343,7 @@ class NodeDaemon:
         while True:
             task_id = await queue.get()
             requeue = False
-            await self._wait_while_paused(addr)
+            await self._wait_while_paused(agent, addr)
             try:
                 runner = asyncio.create_task(self._execute(agent, task_id), name=f"task:{task_id}")
                 self._running[task_id] = runner
@@ -359,9 +360,29 @@ class NodeDaemon:
             if requeue:                     # vendor quota: keep the task, run it again once the pause ends
                 self._enqueue(addr, task_id)
 
-    async def _wait_while_paused(self, addr: str) -> None:
-        while self.hub.ledger.pause_of(addr):
+    def _pause_for(self, agent: AgentConfig, addr: str) -> dict[str, Any] | None:
+        """Paused by hand (agent), or its vendor account is out of quota here or on any other node."""
+        acct = agent.quota_account
+        local = self.hub.ledger.pause_of(addr) or self.hub.ledger.pause_of(f"account:{acct}")
+        if local:
+            return local
+        remote = self._remote_pauses.get(acct)
+        if remote and (not remote.get("until") or remote["until"] > now_iso()):
+            return remote
+        return None
+
+    async def _wait_while_paused(self, agent: AgentConfig, addr: str) -> None:
+        while self._pause_for(agent, addr):
             await asyncio.sleep(1)
+
+    async def _refresh_remote_pauses(self) -> None:
+        pauses: dict[str, dict[str, Any]] = {}
+        for node, card in (await self.hub.bus.kv_all(self.hub.bus.names.nodes_kv)).items():
+            if node == self.cfg.node:
+                continue
+            for acct, p in (card.get("paused_accounts") or {}).items():
+                pauses[acct] = {**p, "reason": f"{p.get('reason')} (reported by node {node})"}
+        self._remote_pauses = pauses
 
     async def _execute(self, agent: AgentConfig, task_id: str) -> bool:
         """Run one task. Returns True if it must be queued again (the agent was paused for vendor quota)."""
@@ -418,12 +439,16 @@ class NodeDaemon:
         if quota and not current.get("result_draft"):
             addr = current["owner"]
             until = (datetime.now(timezone.utc) + timedelta(minutes=QUOTA_PAUSE_MIN)).isoformat(timespec="milliseconds")
-            hub.ledger.pause(addr, f"vendor quota/limit: {quota[:200]}", until)
+            acct = agent.quota_account
+            # Quota is per vendor account, not per agent (B:claude-secretary, RSI round 1): pause the account,
+            # which holds every agent spending it, on this node and (via the node card) on all others.
+            hub.ledger.pause(f"account:{acct}", f"vendor quota/limit: {quota[:200]}", until)
             hub.ledger.unbump_attempts(task_id)
-            await hub.owner_transition(task_id, "ACCEPTED", f"{addr} paused (vendor quota/limit: {quota[:160]}); "
-                                       f"task kept in its queue until {until} or `agentctl resume {addr}`")
+            await hub.owner_transition(task_id, "ACCEPTED", f"account {acct} paused (vendor quota/limit: "
+                                       f"{quota[:160]}); task kept in the queue of {addr} until {until} or "
+                                       f"`agentctl resume --account {acct}`")
             await self._publish_cards()
-            log.warning("%s paused until %s: %s", addr, until, quota)
+            log.warning("account %s paused until %s (seen by %s): %s", acct, until, addr, quota)
             return True
         body, refs = _result_from(current.get("result_draft"), outcome)
         if wt:
@@ -484,7 +509,12 @@ class NodeDaemon:
         hub = self.hub
         bus = hub.bus
         now = now_iso()
+        with contextlib.suppress(Exception):
+            await self._refresh_remote_pauses()
+        paused_accounts = {p["local_agent"].split(":", 1)[1]: {"until": p["until"], "reason": p["reason"]}
+                           for p in hub.ledger.active_pauses() if p["local_agent"].startswith("account:")}
         await bus.kv_put(bus.names.nodes_kv, self.cfg.node, {
+            "paused_accounts": paused_accounts,
             "node": self.cfg.node, "project": self.cfg.project, "description": self.cfg.description,
             "hostname": socket.gethostname(), "platform": f"{platform.system()} {platform.machine()}",
             "resources": self.cfg.resources, "agents": [a.id for a in self.cfg.agents],
@@ -500,7 +530,7 @@ class NodeDaemon:
                                           statuses=("PENDING", "ACCEPTED", "RUNNING", "WAITING", "BLOCKED"))
             if agent.mode == "interactive":      # an accepted task is RUNNING until its result is submitted
                 running = [t["task_id"] for t in owned_open if t["status"] == "RUNNING"]
-            pause = hub.ledger.pause_of(addr)
+            pause = self._pause_for(agent, addr)
             state = state_override or ("unavailable" if pause else "working" if running else "idle")
             pending = None
             with contextlib.suppress(Exception):
@@ -508,7 +538,7 @@ class NodeDaemon:
             await bus.kv_put(bus.names.agents_kv, f"{self.cfg.node}.{agent.id}", {
                 "address": addr, "node": self.cfg.node, "agent_id": agent.id, "display": agent.display,
                 "role": agent.role, "description": agent.description, "provider": agent.provider,
-                "model": agent.model, "runtime": agent.runtime, "mode": agent.mode,
+                "model": agent.model, "runtime": agent.runtime, "mode": agent.mode, "account": agent.quota_account,
                 "capabilities": agent.capabilities, "permissions": agent.permissions,
                 "accept_from": agent.accept_from, "resources": self.cfg.resources,
                 "state": state, "current_task": running[0] if running else None,

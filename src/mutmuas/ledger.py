@@ -68,7 +68,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(role, status);
 
 CREATE TABLE IF NOT EXISTS agent_pauses (
-    local_agent     TEXT PRIMARY KEY,        -- NODE:agent on this node
+    local_agent     TEXT PRIMARY KEY,        -- NODE:agent on this node, or "account:<name>"
     until           TEXT,                    -- ISO time; NULL = until resumed by hand
     reason          TEXT NOT NULL,
     created_at      TEXT NOT NULL
@@ -322,6 +322,10 @@ class Ledger:
             self.resume(local_agent)
             return None
         return dict(row)
+
+    def active_pauses(self) -> list[dict[str, Any]]:
+        keys = [r[0] for r in self.db.execute("SELECT local_agent FROM agent_pauses").fetchall()]
+        return [p for p in (self.pause_of(k) for k in keys) if p]
 
     def unbump_attempts(self, task_id: str) -> None:
         """A run that ended because the vendor quota ran out does not count as an attempt."""

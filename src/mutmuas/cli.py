@@ -319,11 +319,11 @@ def _parse_until(text: str | None) -> str | None:
 
 
 async def cmd_pause(args, hub: Hub):
-    _print(await tools.pause(hub, args.agent, args.reason, _parse_until(args.until)), args.json)
+    _print(await tools.pause(hub, args.agent, args.reason, _parse_until(args.until), account=args.account), args.json)
 
 
 async def cmd_resume(args, hub: Hub):
-    _print(await tools.resume(hub, args.agent), args.json)
+    _print(await tools.resume(hub, args.agent, account=args.account), args.json)
 
 
 async def cmd_cancel(args, hub: Hub):
@@ -739,9 +739,11 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p = add("pause", cmd_pause, "hold a local agent's queue (e.g. vendor quota exhausted)", bus=False)
     p.add_argument("agent")
     p.add_argument("--reason", default="paused by hand")
+    p.add_argument("--account", action="store_true", help="AGENT is a vendor account name (pauses all its agents)")
     p.add_argument("--until", help="'22:40', '+90m', '+2h' or ISO time; default: until resumed")
     p = add("resume", cmd_resume, "release a paused local agent", bus=False)
     p.add_argument("agent")
+    p.add_argument("--account", action="store_true", help="AGENT is a vendor account name")
     p = add("cancel", cmd_cancel, "cancel a task I requested", bus=False)
     p.add_argument("task_id")
     p.add_argument("--reason")

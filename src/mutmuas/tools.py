@@ -22,7 +22,7 @@ def _current_task() -> str | None:
 
 def card_summary(card: dict[str, Any]) -> dict[str, Any]:
     keys = ("address", "display", "role", "mode", "runtime", "provider", "model", "capabilities", "permissions",
-            "accept_from", "state", "unavailable_reason", "unavailable_until", "online", "current_task", "queue",
+            "accept_from", "account", "state", "unavailable_reason", "unavailable_until", "online", "current_task", "queue",
             "inbox_unread", "last_heartbeat", "description")
     return {k: card.get(k) for k in keys if card.get(k) not in (None, "", [])}
 
@@ -215,16 +215,24 @@ async def publish_artifact(hub: Hub, me: str, path: str, *, key: str | None = No
     return ref.to_dict()
 
 
-async def pause(hub: Hub, agent: str, reason: str, until: str | None = None) -> dict[str, Any]:
-    """Mark a local agent unavailable: its queue is held (tasks wait, nothing fails) until resume or `until`."""
-    addr, _ = hub.local_agent(agent)
-    hub.ledger.pause(str(addr), reason, until)
-    return {"agent": str(addr), "paused": True, "until": until, "reason": reason}
+def _pause_key(hub: Hub, target: str, account: bool) -> str:
+    if account:
+        return f"account:{target}"
+    return str(hub.local_agent(target)[0])
 
 
-async def resume(hub: Hub, agent: str) -> dict[str, Any]:
-    addr, _ = hub.local_agent(agent)
-    return {"agent": str(addr), "resumed": hub.ledger.resume(str(addr))}
+async def pause(hub: Hub, target: str, reason: str, until: str | None = None, account: bool = False) -> dict:
+    """Hold a local agent's queue, or a vendor account's (every agent spending it, on every node).
+    Tasks wait; nothing fails. Lifted by resume or when `until` passes."""
+    key = _pause_key(hub, target, account)
+    hub.ledger.pause(key, reason, until)
+    return {"paused": key, "until": until, "reason": reason}
+
+
+async def resume(hub: Hub, target: str, account: bool = False) -> dict[str, Any]:
+    """Lift a pause set on *this* node (an account pause reported by another node ends there or at `until`)."""
+    key = _pause_key(hub, target, account)
+    return {"resumed": key, "ok": hub.ledger.resume(key)}
 
 
 async def fetch_artifact(hub: Hub, uri: str, dest_dir: str | None = None, sha256: str | None = None) -> dict:
