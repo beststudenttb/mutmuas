@@ -322,6 +322,8 @@ def _parse_until(text: str | None) -> str | None:
 
 
 async def cmd_pause(args, hub: Hub):
+    if args.account and not args.until:
+        raise SystemExit("an account pause stops that account's agents on every node: give --until")
     _print(await tools.pause(hub, args.agent, args.reason, _parse_until(args.until), account=args.account), args.json)
 
 
@@ -743,7 +745,7 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("agent")
     p.add_argument("--reason", default="paused by hand")
     p.add_argument("--account", action="store_true", help="AGENT is a vendor account name (pauses all its agents)")
-    p.add_argument("--until", help="'22:40', '+90m', '+2h' or ISO time; default: until resumed")
+    p.add_argument("--until", help="'22:40', '+90m', '+2h' or ISO time; default: until resumed (required with --account)")
     p = add("resume", cmd_resume, "release a paused local agent", bus=False)
     p.add_argument("agent")
     p.add_argument("--account", action="store_true", help="AGENT is a vendor account name")

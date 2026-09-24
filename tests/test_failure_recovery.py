@@ -276,6 +276,20 @@ async def test_manual_pause_until(make_config, cluster):
     assert hub.ledger.pause_of("B:lab")["reason"] == "maintenance"
     hub.ledger.pause("B:lab", "expired", "2000-01-01T00:00:00.000+00:00")
     assert hub.ledger.pause_of("B:lab") is None                 # a past `until` lifts the pause by itself
+    with pytest.raises(ValueError, match="until"):                # account pauses must end by themselves
+        await tools.pause(hub, "acme", "quota", account=True)
+
+
+async def test_stale_or_open_ended_remote_account_pauses_are_ignored(make_config, cluster):
+    b = make_config("B", [worker("lab", "lab.py", account="acme")])
+    daemon = await cluster.start(b)
+    bus = daemon.hub.bus
+    await bus.kv_put(bus.names.nodes_kv, "Z", {"node": "Z", "paused_accounts": {
+        "acme": {"reason": "old", "until": "2000-01-01T00:00:00.000+00:00"},
+        "globex": {"reason": "forever"},
+        "initech": {"reason": "real", "until": "2999-01-01T00:00:00.000+00:00"}}})
+    await daemon._refresh_remote_pauses()
+    assert set(daemon._remote_pauses) == {"initech"}
 
 
 async def _card_state(hub, address, state):

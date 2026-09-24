@@ -380,6 +380,9 @@ class NodeDaemon:
             if node == self.cfg.node:
                 continue
             for acct, p in (card.get("paused_accounts") or {}).items():
+                # A card can outlive its node (offline, never updated): only trust pauses that end by themselves.
+                if not p.get("until") or p["until"] <= now_iso():
+                    continue
                 pauses[acct] = {**p, "reason": f"{p.get('reason')} (reported by node {node})"}
         self._remote_pauses = pauses
 

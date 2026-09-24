@@ -224,6 +224,9 @@ def _pause_key(hub: Hub, target: str, account: bool) -> str:
 async def pause(hub: Hub, target: str, reason: str, until: str | None = None, account: bool = False) -> dict:
     """Hold a local agent's queue, or a vendor account's (every agent spending it, on every node).
     Tasks wait; nothing fails. Lifted by resume or when `until` passes."""
+    if account and not until:
+        # An account pause stops that account's agents on every node; it must end by itself.
+        raise ValueError("an account pause needs an end time (until)")
     key = _pause_key(hub, target, account)
     hub.ledger.pause(key, reason, until)
     return {"paused": key, "until": until, "reason": reason}
