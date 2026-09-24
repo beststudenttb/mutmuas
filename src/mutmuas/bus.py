@@ -84,14 +84,16 @@ class Names:
         return f"{owner.node}.{owner.agent}.{task_id}"
 
 
-async def connect(cfg: NatsConfig, name: str, *, reconnect: bool = True, connect_timeout: float = 5) -> NATS:
+async def connect(cfg: NatsConfig, name: str, *, reconnect: bool = True, connect_timeout: float = 5,
+                  initial_connect_attempts: int | None = None) -> NATS:
     options: dict[str, Any] = {
         "servers": cfg.servers,
         "name": name,
         "connect_timeout": connect_timeout,
         "allow_reconnect": reconnect,
         # nats-py treats 0 as "unlimited"; one attempt per server is what a CLI call wants.
-        "max_reconnect_attempts": -1 if reconnect else 1,
+        "max_reconnect_attempts": initial_connect_attempts if initial_connect_attempts is not None else
+                                  (-1 if reconnect else 1),
         "reconnect_time_wait": 1,
     }
     if cfg.user:
@@ -125,6 +127,8 @@ async def connect(cfg: NatsConfig, name: str, *, reconnect: bool = True, connect
     options.update(error_cb=_error_cb, disconnected_cb=_disconnected_cb, reconnected_cb=_reconnected_cb)
     try:
         holder["nc"] = await nats.connect(**options)
+        if reconnect and initial_connect_attempts is not None:
+            holder["nc"].options["max_reconnect_attempts"] = -1
         return holder["nc"]
     except Exception as e:  # nats raises a zoo of exception types for "cannot connect"
         raise BusUnavailable(f"cannot reach NATS at {cfg.servers}: {e}") from e
@@ -143,8 +147,9 @@ class Bus:
 
     @classmethod
     async def open(cls, cfg: NatsConfig, project: str, name: str, retention_days: float = 30,
-                   reconnect: bool = True) -> Bus:
-        bus = cls(await connect(cfg, name, reconnect=reconnect), project, retention_days)
+                   reconnect: bool = True, initial_connect_attempts: int | None = None) -> Bus:
+        bus = cls(await connect(cfg, name, reconnect=reconnect,
+                                initial_connect_attempts=initial_connect_attempts), project, retention_days)
         await bus.ensure_topology()
         return bus
 
