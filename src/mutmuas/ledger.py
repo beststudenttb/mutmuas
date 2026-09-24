@@ -89,6 +89,8 @@ class Ledger:
         self.db.execute("PRAGMA busy_timeout=30000")
         self._migrate_v1()
         self.db.executescript(SCHEMA)
+        if "quota_holds" not in [r["name"] for r in self.db.execute("PRAGMA table_info(tasks)")]:
+            self.db.execute("ALTER TABLE tasks ADD COLUMN quota_holds INTEGER NOT NULL DEFAULT 0")
 
     def _migrate_v1(self) -> None:
         """v1 keyed messages on message_id alone, which dropped same-node deliveries. Re-key in place."""
@@ -326,6 +328,12 @@ class Ledger:
     def active_pauses(self) -> list[dict[str, Any]]:
         keys = [r[0] for r in self.db.execute("SELECT local_agent FROM agent_pauses").fetchall()]
         return [p for p in (self.pause_of(k) for k in keys) if p]
+
+    def bump_quota_holds(self, task_id: str) -> int:
+        with self.tx() as db:
+            db.execute("UPDATE tasks SET quota_holds=quota_holds+1 WHERE task_id=? AND role='owner'", (task_id,))
+            return db.execute("SELECT quota_holds FROM tasks WHERE task_id=? AND role='owner'",
+                              (task_id,)).fetchone()[0]
 
     def unbump_attempts(self, task_id: str) -> None:
         """A run that ended because the vendor quota ran out does not count as an attempt."""

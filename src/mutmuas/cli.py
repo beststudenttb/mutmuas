@@ -306,7 +306,10 @@ def _parse_until(text: str | None) -> str | None:
         return None
     now = datetime.now().astimezone()
     if text.startswith("+"):
-        n, unit = float(text[1:-1]), text[-1]
+        n, unit = text[1:-1], text[-1]
+        if unit not in "mh" or not n.replace(".", "", 1).isdigit():
+            raise SystemExit(f"error: --until {text!r}: use +<n>m or +<n>h, e.g. +90m")
+        n = float(n)
         when = now + timedelta(minutes=n * (60 if unit == "h" else 1))
     elif ":" in text and len(text) <= 5:
         hh, mm = (int(x) for x in text.split(":"))

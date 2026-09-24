@@ -83,6 +83,9 @@ class RunOutcome:
 
 class SubprocessRuntime:
     name = "subprocess"
+    # Text by which this runtime's *vendor CLI* says "no quota / usage limit". Only the vendor's own wording:
+    # a task's own errors ("Disk quota exceeded", a third-party API's 429) must never pause an account.
+    quota_patterns: tuple[str, ...] = ()
 
     def __init__(self, agent: AgentConfig, node: NodeConfig):
         self.agent = agent
@@ -175,6 +178,8 @@ Rules:
 
 class ClaudeCodeRuntime(SubprocessRuntime):
     name = "claude-code"
+    quota_patterns = ("usage limit reached", "hit your session limit", "hit your weekly limit",
+                      "hit your usage limit", "credit balance is too low")
 
     def command(self, ctx: TaskContext) -> tuple[list[str], bytes | None]:
         cfg_path = self.node.data_path / "runs" / f"{ctx.task_id}.mcp.json"
@@ -200,6 +205,7 @@ class ClaudeCodeRuntime(SubprocessRuntime):
 
 class CodexRuntime(SubprocessRuntime):
     name = "codex"
+    quota_patterns = ("out of credits", "usage_limit_reached", "insufficient_quota", "hit your usage limit")
 
     def command(self, ctx: TaskContext) -> tuple[list[str], bytes | None]:
         spec = _mcp_server_spec(ctx)

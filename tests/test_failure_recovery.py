@@ -281,3 +281,34 @@ async def test_manual_pause_until(make_config, cluster):
 async def _card_state(hub, address, state):
     card = await hub.agent_card(address)
     return card if card and card.get("state") == state else None
+
+
+async def test_task_errors_mentioning_quota_do_not_pause_and_holds_are_capped(make_config, cluster, tmp_path,
+                                                                          monkeypatch):
+    """Review M2: a task's own 'Disk quota exceeded' is an ordinary failure. Review M1: a task held for quota
+    too often is failed instead of being re-queued forever."""
+    from mutmuas import node as node_mod
+    monkeypatch.setattr(node_mod, "MAX_QUOTA_HOLDS", 1)
+    a = make_config("A", [interactive("main")])
+    b = make_config("B", [worker("lab", "lab.py", account="acme")])
+    await cluster.start(a)
+    await cluster.start(b)
+    hub_a = await cluster.client(a)
+    hub_b = await cluster.client(b)
+
+    disk = await tools.wait_for_result(hub_a, await _request(hub_a, "B:lab", {"action": "diskquota"}), 30)
+    assert disk["status"] == "FAILED" and (await hub_a.agent_card("B:lab"))["state"] != "unavailable"
+
+    never = await _request(hub_a, "B:lab", {"action": "quota", "refilled": str(tmp_path / "never")})
+    await eventually(lambda: _card_state(hub_a, "B:lab", "unavailable"), what="first hold pauses")
+    await tools.resume(hub_b, "acme", account=True)
+    result = await tools.wait_for_result(hub_a, never, 30)       # second quota signal > MAX_QUOTA_HOLDS=1
+    assert result["status"] == "FAILED"
+    assert any("gave up" in x for x in result["result"]["limitations"])
+
+
+def test_until_requires_a_unit():
+    from mutmuas.cli import _parse_until
+    with pytest.raises(SystemExit):
+        _parse_until("+90")
+    assert _parse_until("+90m") and _parse_until("+2h") and _parse_until("22:40")

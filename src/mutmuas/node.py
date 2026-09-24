@@ -40,10 +40,9 @@ from .worktree import GitError, Worktree
 
 log = logging.getLogger(__name__)
 
-# Error text meaning "the vendor will not serve us right now" (not "the task is wrong"). Lower-cased substrings.
-QUOTA_PATTERNS = ("out of credits", "usage limit", "rate limit", "rate_limit", "insufficient_quota", "quota",
-                  "credit balance is too low", "429 too many requests", "overloaded")
 QUOTA_PAUSE_MIN = 60
+MAX_QUOTA_HOLDS = 3        # a task held this often for "quota" is failed normally (the signal may be wrong)
+QUOTA_SIGNAL = "MUTMUAS_QUOTA:"   # explicit marker any runtime/script may print: "<marker> <reason>"
 
 
 def _code_version() -> str:
@@ -413,7 +412,8 @@ class NodeDaemon:
         where = f", branch {wt.branch}" if wt else ""
         await hub.owner_transition(task_id, "RUNNING", f"started (attempt {attempt}, runtime {agent.runtime}{where})")
         try:
-            outcome = await asyncio.wait_for(make_runtime(agent, self.cfg).run(ctx), timeout)
+            runtime = make_runtime(agent, self.cfg)
+            outcome = await asyncio.wait_for(runtime.run(ctx), timeout)
         except asyncio.TimeoutError:
             await hub.finish(task_id, result_body("failed", f"timed out after {timeout:.0f}s",
                                                   limitations=["process was killed at the deadline"]))
@@ -435,8 +435,11 @@ class NodeDaemon:
         if current["status"] == "BLOCKED" and not current.get("result_draft"):
             return      # blocked and nothing to deliver: wait for the requester
         # A submitted result always wins over an earlier BLOCKED report.
-        quota = _quota_error(outcome)
-        if quota and not current.get("result_draft"):
+        quota = _quota_error(outcome, runtime.quota_patterns)
+        holds = hub.ledger.bump_quota_holds(task_id) if quota and not current.get("result_draft") else 0
+        if quota and holds > MAX_QUOTA_HOLDS:
+            log.warning("task %s: quota signal seen %d times, failing it normally", task_id, holds)
+        elif quota and not current.get("result_draft"):
             addr = current["owner"]
             until = (datetime.now(timezone.utc) + timedelta(minutes=QUOTA_PAUSE_MIN)).isoformat(timespec="milliseconds")
             acct = agent.quota_account
@@ -451,6 +454,9 @@ class NodeDaemon:
             log.warning("account %s paused until %s (seen by %s): %s", acct, until, addr, quota)
             return True
         body, refs = _result_from(current.get("result_draft"), outcome)
+        if quota and holds > MAX_QUOTA_HOLDS:
+            body.setdefault("limitations", []).append(
+                f"held {holds - 1} time(s) for a suspected vendor quota error ({quota[:120]}); gave up and failed it")
         if wt:
             await self._attach_git(wt, agent, task_id, body, refs)
         await hub.finish(task_id, body, refs)
@@ -568,14 +574,26 @@ class NodeDaemon:
         return next((a for a in self.cfg.agents if a.id == addr.agent and addr.node == self.cfg.node), None)
 
 
-def _quota_error(outcome) -> str | None:
-    """The first error line saying the vendor refused service (quota, rate limit, overload), if any."""
+def _quota_error(outcome, patterns: tuple[str, ...]) -> str | None:
+    """The vendor CLI's own "out of quota / usage limit" line, or an explicit QUOTA_SIGNAL line, if any."""
     if outcome.exit_code == 0:
         return None
-    for line in _error_lines(outcome.log_path, limit=50) + outcome.output_tail.splitlines()[-20:]:
-        if any(p in line.lower() for p in QUOTA_PATTERNS):
-            return line.strip()
+    for line in _log_tail(outcome.log_path, 200) + outcome.output_tail.splitlines()[-20:]:
+        text = line.strip()
+        if text.startswith(QUOTA_SIGNAL):
+            return text[len(QUOTA_SIGNAL):].strip() or "quota exhausted"
+        if any(p in text.lower() for p in patterns):
+            return text
     return None
+
+
+def _log_tail(log_path: str | None, lines: int) -> list[str]:
+    if not log_path:
+        return []
+    try:
+        return Path(log_path).read_text(errors="replace").splitlines()[1:][-lines:]
+    except OSError:
+        return []
 
 
 def _result_from(draft: dict[str, Any] | None, outcome) -> tuple[dict[str, Any], list[ArtifactRef]]:

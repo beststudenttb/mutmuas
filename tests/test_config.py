@@ -162,3 +162,21 @@ def test_code_task_sandbox_never_gets_the_main_repos_git_dir(tmp_path):
     ctx = TaskContext("T-1", req, agent, node, workdir=tmp_path / "wt", git_branch="mm/A-w/T-1")
     for runtime in (CodexRuntime, ClaudeCodeRuntime):
         assert "--add-dir" not in runtime(agent, node).command(ctx)[0]
+
+
+def test_quota_detection_uses_each_vendors_own_wording(tmp_path):
+    from mutmuas.node import _quota_error
+    from mutmuas.runtime import ClaudeCodeRuntime, CodexRuntime, RunOutcome, ScriptRuntime
+
+    def outcome(text):
+        log = tmp_path / "run.log"
+        log.write_text("$ cmd\n" + text + "\n")
+        return RunOutcome(exit_code=1, output_tail="", log_path=str(log))
+
+    codex_msg = outcome("ERROR: Your workspace is out of credits. Ask your workspace owner to refill.")
+    assert _quota_error(codex_msg, CodexRuntime.quota_patterns)
+    assert _quota_error(codex_msg, ScriptRuntime.quota_patterns) is None      # scripts need the explicit signal
+    assert _quota_error(outcome("Claude AI usage limit reached|1790000000"), ClaudeCodeRuntime.quota_patterns)
+    disk = outcome("OSError: [Errno 122] Disk quota exceeded")
+    assert all(_quota_error(disk, r.quota_patterns) is None for r in (CodexRuntime, ClaudeCodeRuntime, ScriptRuntime))
+    assert _quota_error(outcome("MUTMUAS_QUOTA: api credits gone"), ()) == "api credits gone"

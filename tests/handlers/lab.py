@@ -131,8 +131,14 @@ elif action == "quota":
     if Path(inputs["refilled"]).exists():
         print(json.dumps({"status": "complete", "summary": f"done after refill: {inputs.get('text', '')}"}))
     else:
-        print("ERROR: Your workspace is out of credits. Ask your workspace owner to refill.", file=sys.stderr)
+        # a script has no vendor CLI wording to recognise, so it uses the explicit signal
+        print("MUTMUAS_QUOTA: Your workspace is out of credits. Ask your workspace owner to refill.", file=sys.stderr)
         sys.exit(1)
+
+elif action == "diskquota":
+    # the *task's own* error mentions "quota": must fail normally, never pause the account (review M2)
+    print("OSError: [Errno 122] Disk quota exceeded", file=sys.stderr)
+    sys.exit(1)
 
 elif action == "delegate":
     # B worker delegates onward to another agent and waits: A -> B -> C chains.
