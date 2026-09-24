@@ -76,3 +76,46 @@ def test_adding_a_node_keeps_existing_credentials(tmp_path):
     second = generate("p", ["A", "B", "C"], tmp_path)
     assert {n: second[n].read_text() for n in ("A", "B", "admin")} == old
     assert "node_C" in second["server"].read_text()
+
+
+def test_service_units_do_not_clobber_other_nodes(tmp_path, monkeypatch):
+    """Two nodes on one Mac (A = Claude, C = Codex) get distinct launchd labels; a foreign unit is not overwritten."""
+    import sys
+
+    from mutmuas import cli
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(cli.Path, "home", lambda: tmp_path)
+    paths = {}
+    for node in ("A", "C"):
+        cfg = tmp_path / f"{node}.yaml"
+        cfg.write_text(yaml.safe_dump({"project": "p", "node": node, "agents": []}))
+        cli.agent_node(["service", "--write", "--config", str(cfg)])
+        paths[node] = tmp_path / f"Library/LaunchAgents/dev.mutmuas.p.{node}.plist"
+        assert str(cfg) in paths[node].read_text()
+    assert paths["A"] != paths["C"]
+
+    other = tmp_path / "other" / "A.yaml"          # a different config claiming node A of project p
+    other.parent.mkdir()
+    other.write_text(yaml.safe_dump({"project": "p", "node": "A", "agents": []}))
+    with pytest.raises(SystemExit):
+        cli.agent_node(["service", "--write", "--config", str(other)])
+    assert str(tmp_path / "A.yaml") in paths["A"].read_text()
+
+
+@pytest.mark.parametrize("kind, sandbox, claude_can_edit", [
+    ("query", "read-only", False), ("artifact", "read-only", False),
+    ("code", "workspace-write", True), ("experiment", "workspace-write", True)])
+def test_runtime_sandbox_follows_request_kind(tmp_path, kind, sandbox, claude_can_edit):
+    """A question never gets a writable sandbox, even on an agent that holds WRITE_WORKTREE."""
+    from mutmuas.config import AgentConfig, NodeConfig
+    from mutmuas.protocol import Envelope, request_body
+    from mutmuas.runtime import ClaudeCodeRuntime, CodexRuntime, TaskContext
+    node = NodeConfig(project="p", node="C", data_dir=str(tmp_path))
+    agent = AgentConfig(id="w", runtime="codex", workdir=str(tmp_path),
+                        permissions=["READ", "WRITE_WORKTREE", "RUN_EXPERIMENT", "PUBLISH_ARTIFACT"])
+    req = Envelope(type="REQUEST", sender="A:main", to="C:w", task_id="T-1", body=request_body("x", "y", kind=kind))
+    ctx = TaskContext("T-1", req, agent, node)
+    argv, _ = CodexRuntime(agent, node).command(ctx)
+    assert argv[argv.index("--sandbox") + 1] == sandbox
+    argv, _ = ClaudeCodeRuntime(agent, node).command(ctx)
+    assert ("Edit" in argv[argv.index("--allowedTools") + 1]) is claude_can_edit

@@ -422,7 +422,7 @@ def node_service(args):
     dirs += ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
     path_env = ":".join(dict.fromkeys(d for d in dirs if Path(d).is_dir()))
     if sys.platform == "darwin":
-        label = "dev.mutmuas.agent-node"
+        label = f"dev.mutmuas.{cfg.project}.{cfg.node}"   # unique per node: several nodes can share a Mac
         items = "\n".join(f"    <string>{a}</string>" for a in argv)
         log = cfg_path.parent / "agent-node.launchd.log"
         text = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -465,10 +465,14 @@ TimeoutStopSec=30
 [Install]
 WantedBy=default.target
 """
+        # Linux keeps one unit name for now (node B's rollout depends on it); the guard below still
+        # refuses to overwrite a unit that was written for a different config.
         target = Path.home() / ".config/systemd/user/mutmuas-agent-node.service"
         hint = ("systemctl --user daemon-reload\nsystemctl --user enable --now mutmuas-agent-node\n"
                 "loginctl enable-linger $USER   # keep running after logout")
     if args.write:
+        if target.exists() and cfg_path.as_posix() not in target.read_text() and not args.force:
+            raise SystemExit(f"error: {target} exists and belongs to another config; use --force to replace it")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text)
         print(f"wrote {target}\nthen run:\n{hint}")
@@ -647,6 +651,7 @@ def agent_node_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("service", help="launchd (macOS) / systemd (Linux) unit for the daemon")
     p.add_argument("--config")
     p.add_argument("--write", action="store_true", help="write the unit file instead of printing it")
+    p.add_argument("--force", action="store_true", help="replace a unit file written for a different config")
     p.add_argument("--after-nats", action="store_true",
                    help="Linux: order after mutmuas-nats-server.service (automatic when that unit exists "
                         "and the node connects to 127.0.0.1)")

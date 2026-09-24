@@ -45,6 +45,16 @@ class TaskContext:
     def cwd(self) -> Path:
         return self.workdir or self.agent.workdir_path
 
+    def allows(self, permission: str) -> bool:
+        """Least privilege per task: the agent's permission AND one this kind of request needs.
+
+        A query or artifact request runs read-only even on an agent that could write, so a question
+        can never modify the checkout the agent (or its node daemon) lives in.
+        """
+        kind = self.request.body.get("kind", "query")
+        needed = {"code": {"WRITE_WORKTREE", "RUN_EXPERIMENT"}, "experiment": {"RUN_EXPERIMENT", "WRITE_WORKTREE"}}
+        return permission in needed.get(kind, set()) and self.agent.has(permission)
+
     @property
     def address(self) -> str:
         return f"{self.node.node}:{self.agent.id}"
@@ -171,9 +181,9 @@ class ClaudeCodeRuntime(SubprocessRuntime):
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         cfg_path.write_text(json.dumps({"mcpServers": {"mutmuas": _mcp_server_spec(ctx)}}))
         tools = ["mcp__mutmuas", "Read", "Glob", "Grep"]
-        if self.agent.has("WRITE_WORKTREE"):
+        if ctx.allows("WRITE_WORKTREE"):
             tools += ["Edit", "Write", "Bash(git:*)"]
-        if self.agent.has("RUN_EXPERIMENT"):
+        if ctx.allows("RUN_EXPERIMENT"):
             tools += ["Bash"]
         argv = ["claude", "-p", "--output-format", "json", "--mcp-config", str(cfg_path), "--strict-mcp-config",
                 "--allowedTools", ",".join(tools)]
@@ -194,7 +204,7 @@ class CodexRuntime(SubprocessRuntime):
     def command(self, ctx: TaskContext) -> tuple[list[str], bytes | None]:
         spec = _mcp_server_spec(ctx)
         env_toml = "{" + ", ".join(f'{k} = {json.dumps(v)}' for k, v in spec["env"].items()) + "}"
-        writable = self.agent.has("WRITE_WORKTREE") or self.agent.has("RUN_EXPERIMENT")
+        writable = ctx.allows("WRITE_WORKTREE") or ctx.allows("RUN_EXPERIMENT")
         argv = ["codex", "exec", "--skip-git-repo-check", "-C", str(ctx.cwd),
                 *([] if self.agent.inherit_user_config else ["--ignore-user-config"]),
                 "--sandbox", "workspace-write" if writable else "read-only",
