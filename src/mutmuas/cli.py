@@ -243,6 +243,48 @@ async def cmd_inbox(args, hub: Hub):
         raise SystemExit(3)      # timed out: lets a watcher loop tell "nothing yet" from "new mail"
 
 
+async def cmd_watch(args, hub: Hub):
+    """Long-running notifier for an interactive agent: one desktop notification per new actionable message.
+
+    Never marks mail read (the agent's session does that), keeps a --since cursor on disk so nothing is
+    announced twice, and backs off instead of spinning on errors. Meant to run under launchd/systemd.
+    """
+    me = _me(args)
+    addr, _ = hub.local_agent(me)
+    cursor_file = hub.cfg.data_path / f"{addr.node}_{addr.agent}.notify-cursor"
+    if not cursor_file.exists():
+        cursor_file.write_text(datetime.now(timezone.utc).isoformat(timespec="milliseconds"))
+    while True:
+        try:
+            rows = await tools.inbox(hub, me, peek=True, wait_s=args.interval, types=tools.ACTIONABLE,
+                                     since=cursor_file.read_text().strip())
+        except Exception as e:
+            print(f"{datetime.now():%F %T} inbox failed: {e!r}", flush=True)
+            await asyncio.sleep(30)
+            continue
+        if not rows:
+            continue
+        first = rows[0]
+        body = first["body"]
+        note = body.get("objective") or body.get("summary") or body.get("question") or body.get("reason") or ""
+        text = f"{len(rows)} new: {first['type']} from {first['from']}: {str(note)[:120]}"
+        _desktop_notify(f"mutmuas → {addr}", text, dry_run=args.dry_run)
+        cursor_file.write_text(max(r["received_at"] for r in rows))
+
+
+def _desktop_notify(title: str, text: str, dry_run: bool = False) -> None:
+    print(f"{datetime.now():%F %T} notify: {title} — {text}", flush=True)
+    if dry_run:
+        return
+    # Message text comes from other agents: pass it as argv, never splice it into script source.
+    if shutil.which("osascript"):
+        subprocess.run(["osascript", "-e", "on run argv", "-e",
+                        'display notification (item 2 of argv) with title (item 1 of argv) sound name "Glass"',
+                        "-e", "end run", title, text], capture_output=True)
+    elif shutil.which("notify-send"):
+        subprocess.run(["notify-send", title, text], capture_output=True)
+
+
 async def cmd_cancel(args, hub: Hub):
     _print(await tools.cancel_task(hub, _me(args), args.task_id, args.reason or ""), args.json)
 
@@ -603,6 +645,9 @@ def agentctl_parser() -> argparse.ArgumentParser:
                                                    "a watcher using --wait --only actionable ignores ACKs/progress")
     p.add_argument("--wait", type=float, nargs="?", const=3600, metavar="SECONDS",
                    help="block until a message arrives (default up to 3600 s); exit code 3 on timeout")
+    p = add("watch", cmd_watch, "run forever: desktop notification per new actionable message (launchd/systemd)")
+    p.add_argument("--interval", type=float, default=3600, help="max seconds per wait cycle")
+    p.add_argument("--dry-run", action="store_true", help="log notifications instead of showing them")
     p = add("cancel", cmd_cancel, "cancel a task I requested", bus=False)
     p.add_argument("task_id")
     p.add_argument("--reason")

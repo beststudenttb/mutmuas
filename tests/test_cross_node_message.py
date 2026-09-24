@@ -199,9 +199,10 @@ async def test_watcher_ignores_acks_with_only_actionable(make_config, cluster):
 
 
 async def test_notifier_announces_each_new_message_once(make_config, cluster, tmp_path):
-    """examples/watchers/inbox-notify.sh: peek + --since cursor → one notification per new actionable message."""
+    """agentctl watch: peek + --since cursor → one notification per new actionable message."""
     import asyncio
     import subprocess
+    import sys
     from pathlib import Path
     a = make_config("A", [interactive("main")])
     b = make_config("B", [interactive("coder")])
@@ -209,9 +210,10 @@ async def test_notifier_announces_each_new_message_once(make_config, cluster, tm
     await cluster.start(b)
     hub_a = await cluster.client(a)
     hub_b = await cluster.client(b)
-    script = Path(__file__).resolve().parents[1] / "examples/watchers/inbox-notify.sh"
+    agentctl = Path(sys.executable).parent / "agentctl"
     log = open(tmp_path / "notify.log", "w")
-    proc = subprocess.Popen(["bash", str(script), str(b.path), "B:coder", "--dry-run"], stdout=log, stderr=log)
+    proc = subprocess.Popen([str(agentctl), "watch", "--dry-run", "--interval", "5", "--config", str(b.path),
+                             "--as", "B:coder"], stdout=log, stderr=log)
     try:
         await asyncio.sleep(2)
         first = await tools.send_request(hub_a, "A:main", "B:coder", "first question", "notifier test")
