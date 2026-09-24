@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Multi-process end-to-end check on one machine: a real nats-server with the generated per-node
-# auth config, two separate `agent-node start` daemons (node A and node B, separate data dirs),
+# auth + TLS config, two separate `agent-node start` daemons (node A and node B, separate data dirs),
 # and everything driven through `agentctl`, exactly as on two real machines.
 #
 #   TEST 1  A asks B for a file   -> B publishes artifact -> A downloads and verifies sha256
@@ -31,9 +31,9 @@ check() { "$BIN/python" -c "import json,sys; d=json.load(sys.stdin); assert $1, 
 
 rm -rf "$W" && mkdir -p "$W/B-disk/representation_exp082" "$W/A-disk"
 
-step "generate server config with per-node credentials"
+step "generate server config with per-node credentials and TLS (private CA)"
 "$BIN/agent-node" server-config --project demo --nodes A,B --out "$W/server" --listen 127.0.0.1 \
-  --port "$PORT" --store-dir "$W/jetstream" >/dev/null
+  --port "$PORT" --store-dir "$W/jetstream" --tls 127.0.0.1 >/dev/null
 sed -i.bak "s/^http: .*/http: 127.0.0.1:$((PORT + 1))/" "$W/server/nats-server.conf"
 "$NATS" -c "$W/server/nats-server.conf" >"$W/nats.log" 2>&1 &
 PIDS+=($!)
@@ -47,7 +47,7 @@ node: A
 description: "Mac / local main terminal"
 data_dir: ./data
 heartbeat_s: 1
-nats: {servers: ["nats://127.0.0.1:$PORT"], credentials_file: ../server/A.env}
+nats: {servers: ["nats://127.0.0.1:$PORT"], credentials_file: ../server/A.env, tls_ca: ../server/tls/ca.crt}
 agents:
   - id: main
     display: "A:a1"
@@ -63,7 +63,7 @@ description: "GPU server (simulated)"
 data_dir: ./data
 heartbeat_s: 1
 resources: {gpu: {type: RTX4090, count: 2}}
-nats: {servers: ["nats://127.0.0.1:$PORT"], credentials_file: ../server/B.env}
+nats: {servers: ["nats://127.0.0.1:$PORT"], credentials_file: ../server/B.env, tls_ca: ../server/tls/ca.crt}
 agents:
   - id: data
     display: "B:a1"

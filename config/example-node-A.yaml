@@ -9,7 +9,7 @@ heartbeat_s: 5
 nats:
   servers: ["nats://100.64.0.10:4222"]   # the NATS host's Tailscale/WireGuard IP — never a public IP
   credentials_file: ~/.mutmuas/A.env     # from `agent-node server-config` (user node_A + password)
-  # tls_ca: ~/.mutmuas/ca.crt            # when the server has a tls {} block
+  # tls_ca: ~/.mutmuas/ca.crt            # required when the server was generated with --tls (public IP)
 
 agents:
   # Your own Claude Code session. It does not run tasks by itself; it gets the network as MCP tools:

@@ -36,8 +36,10 @@ export PATH="$HOME/mutmuas/.venv/bin:$PATH"   # add to ~/.zshrc / ~/.bashrc
 | 8222/tcp | NATS monitoring | 127.0.0.1 only | local admin |
 
 Rules:
-- Never expose 4222 or 8222 on a public interface. If a public endpoint is unavoidable, generate
-  the config with `--tls`, install real certificates, and set `tls_ca` in each node config.
+- Never expose 4222 without TLS, and never expose 8222 at all. With a public IP (no overlay network),
+  generate the config with `--tls <public-ip-or-dns>[,127.0.0.1]`. This creates a private CA and a server
+  certificate for those names. Copy `tls/ca.crt` (public, not secret) to every node and set `nats.tls_ca`.
+  All traffic is then encrypted, and nodes verify the server's identity.
 - Each node has its own NATS user. The server enforces that node X can only send as X and
   only write its own registry and task entries.
 - `<NODE>.env` files are secrets (mode 600). Copy them over ssh/scp only.
@@ -45,6 +47,17 @@ Rules:
   nodes' mailboxes, so only add machines you trust (see ARCHITECTURE_V1 §5).
 
 ## 2. Server (central message bus)
+
+**Public IP instead of an overlay network** (e.g. a lab server at 150.89.170.193):
+
+```bash
+agent-node server-config --project visual_rl --nodes A,B --out ~/mutmuas-server \
+    --listen 0.0.0.0 --tls 150.89.170.193,127.0.0.1 --store-dir ~/mutmuas-server/jetstream
+# nodes: servers ["nats://150.89.170.193:4222"], credentials_file <NODE>.env, tls_ca ca.crt
+# a node on the server itself may use nats://127.0.0.1:4222 (127.0.0.1 is in the certificate)
+```
+
+**Private overlay network** (Tailscale/WireGuard):
 
 On the machine that hosts NATS (here B). Take its overlay IP, e.g. `100.64.0.10`.
 

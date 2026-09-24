@@ -385,11 +385,15 @@ def node_start(args):
 def node_server_config(args):
     from .server_config import generate
     nodes = [n.strip() for n in args.nodes.split(",") if n.strip()]
-    written = generate(args.project, nodes, Path(args.out), port=args.port, store_dir=args.store_dir,
-                       listen_host=args.listen, tls=args.tls)
+    tls_hosts = [h.strip() for h in args.tls.split(",") if h.strip()] if args.tls else None
+    written = generate(args.project, nodes, Path(args.out), tls_hosts=tls_hosts, port=args.port,
+                       store_dir=args.store_dir, listen_host=args.listen)
     for name, path in written.items():
         print(f"{name:>8}: {path}")
     print("copy <NODE>.env to each node and reference it as nats.credentials_file")
+    if tls_hosts:
+        print("copy tls/ca.crt (public, not secret) to each node and set nats.tls_ca; "
+              f"connect with nats://{tls_hosts[0]}:{args.port}")
 
 
 def node_service(args):
@@ -602,7 +606,9 @@ def agent_node_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, default=4222)
     p.add_argument("--listen", default="0.0.0.0")
     p.add_argument("--store-dir", default="/data/jetstream")
-    p.add_argument("--tls", action="store_true")
+    p.add_argument("--tls", metavar="HOSTS",
+                   help="enable TLS; comma separated IPs/DNS names clients use to reach the server "
+                        "(e.g. 150.89.170.193). Generates a private CA + server cert")
     p.set_defaults(sync=node_server_config)
     p = sub.add_parser("service", help="launchd (macOS) / systemd (Linux) unit for the daemon")
     p.add_argument("--config")

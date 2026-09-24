@@ -54,15 +54,20 @@ def test_relative_paths_resolve_against_config_file(tmp_path):
 
 
 def test_generated_server_config_is_valid(tmp_path):
-    written = generate("visual_rl", ["A", "B", "C"], tmp_path, store_dir=str(tmp_path / "js"), tls=True)
-    assert set(written) == {"server", "A", "B", "C", "admin"}
+    written = generate("visual_rl", ["A", "B", "C"], tmp_path, store_dir=str(tmp_path / "js"),
+                       tls_hosts=["127.0.0.1", "gpu.example.org"])
+    assert set(written) == {"server", "A", "B", "C", "admin", "ca"}
     assert oct(written["A"].stat().st_mode)[-3:] == "600"
     text = written["server"].read_text()
     assert '"mm.visual_rl.msg.*.*.A"' in text and '"mm.visual_rl.msg.*.*.B"' in text
-    # nats-server's own config checker (TLS files do not exist, so check the no-TLS variant for syntax)
-    plain = generate("visual_rl", ["A", "B"], tmp_path / "plain", store_dir=str(tmp_path / "js"))
-    out = subprocess.run([nats_binary(), "-c", str(plain["server"]), "-t"], capture_output=True, text=True)
-    assert out.returncode == 0, out.stderr
+    for conf in (written["server"], generate("p", ["A"], tmp_path / "plain")["server"]):
+        out = subprocess.run([nats_binary(), "-c", str(conf), "-t"], capture_output=True, text=True)
+        assert out.returncode == 0, out.stderr
+    san = subprocess.run(["openssl", "x509", "-in", str(tmp_path / "tls/server.crt"), "-noout", "-ext",
+                          "subjectAltName"], capture_output=True, text=True).stdout
+    assert "127.0.0.1" in san and "gpu.example.org" in san
+    ca_before = written["ca"].read_bytes()
+    assert generate("visual_rl", ["A", "B", "C", "D"], tmp_path, tls_hosts=["127.0.0.1"])["ca"].read_bytes() == ca_before
 
 
 def test_adding_a_node_keeps_existing_credentials(tmp_path):
