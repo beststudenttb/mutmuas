@@ -115,16 +115,19 @@ class Ledger:
     # ---- outbox -------------------------------------------------------
 
     def queue_outgoing(self, env: Envelope) -> None:
-        now = now_iso()
         with self.tx() as db:
-            db.execute(
-                "INSERT OR IGNORE INTO messages (message_id, direction, local_agent, peer, type, task_id,"
-                " conversation_id, envelope, state, seen, created_at, updated_at)"
-                " VALUES (?, 'out', ?, ?, ?, ?, ?, ?, 'queued', 1, ?, ?)",
-                (env.message_id, env.sender, env.to, env.type, env.task_id, env.conversation_id,
-                 env.to_json().decode(), now, now))
-            if env.type == "REQUEST":
-                self._insert_task(db, env, role="requester", local_agent=env.sender, status="PENDING")
+            self._queue(db, env)
+
+    def _queue(self, db: sqlite3.Connection, env: Envelope) -> None:
+        now = now_iso()
+        db.execute(
+            "INSERT OR IGNORE INTO messages (message_id, direction, local_agent, peer, type, task_id,"
+            " conversation_id, envelope, state, seen, created_at, updated_at)"
+            " VALUES (?, 'out', ?, ?, ?, ?, ?, ?, 'queued', 1, ?, ?)",
+            (env.message_id, env.sender, env.to, env.type, env.task_id, env.conversation_id,
+             env.to_json().decode(), now, now))
+        if env.type == "REQUEST":
+            self._insert_task(db, env, role="requester", local_agent=env.sender, status="PENDING")
 
     def outbox(self, limit: int = 100) -> list[Envelope]:
         rows = self.db.execute("SELECT envelope FROM messages WHERE direction='out' AND state='queued'"
@@ -177,10 +180,13 @@ class Ledger:
         """
         with self.tx() as db:
             type_sql = f" AND type IN ({','.join('?' * len(types))})" if types else ""
-            since_sql = " AND created_at > ?" if since else ""
+            # a digit-only `since` is a rowid cursor (monotonic; timestamps collide within a millisecond)
+            by_row = since is not None and str(since).isdigit()
+            since_sql = (" AND rowid > ?" if by_row else " AND created_at > ?") if since else ""
+            since_arg = ((int(since) if by_row else since),) if since else ()
             rows = db.execute("SELECT message_id, envelope FROM messages WHERE direction='in' AND seen=0"
                               f" AND state='handled' AND local_agent=?{type_sql}{since_sql} ORDER BY rowid LIMIT ?",
-                              (local_agent, *(types or ()), *((since,) if since else ()), limit)).fetchall()
+                              (local_agent, *(types or ()), *since_arg, limit)).fetchall()
             if mark and rows:
                 db.executemany("UPDATE messages SET seen=1 WHERE message_id=? AND direction='in'",
                                [(r["message_id"],) for r in rows])
@@ -193,8 +199,8 @@ class Ledger:
         sql = "SELECT COUNT(*) FROM messages WHERE direction='in' AND seen=0 AND state='handled' AND local_agent=?"
         args: list[Any] = [local_agent]
         if since:
-            sql += " AND created_at > ?"
-            args.append(since)
+            sql += " AND rowid > ?" if str(since).isdigit() else " AND created_at > ?"
+            args.append(int(since) if str(since).isdigit() else since)
         if types:
             sql += f" AND type IN ({','.join('?' * len(types))})"
             args.extend(types)
@@ -248,7 +254,7 @@ class Ledger:
         return _task_row(row) if row else None
 
     def tasks(self, role: str | None = None, statuses: tuple[str, ...] | None = None,
-              local_agent: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+              local_agent: str | None = None, limit: int | None = 200) -> list[dict[str, Any]]:
         sql, args = "SELECT * FROM tasks WHERE 1=1", []
         if role:
             sql += " AND role=?"
@@ -259,13 +265,19 @@ class Ledger:
         if statuses:
             sql += f" AND status IN ({','.join('?' * len(statuses))})"
             args.extend(statuses)
-        sql += " ORDER BY created_at DESC LIMIT ?"
-        args.append(limit)
+        sql += " ORDER BY created_at DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            args.append(limit)
         return [_task_row(r) for r in self.db.execute(sql, args).fetchall()]
 
     def update_task(self, task_id: str, role: str, *, status: str | None = None, force: bool = False,
-                    **fields: Any) -> bool:
-        """Apply a state transition. Terminal states are sticky unless ``force``. Returns False if refused."""
+                    queue: Envelope | None = None, **fields: Any) -> bool:
+        """Apply a state transition. Terminal states are sticky unless ``force``. Returns False if refused.
+
+        ``queue``: a message announcing this transition, put in the outbox in the *same* transaction, so a
+        crash can never leave a finished task whose RESULT was not queued (found by A:codex).
+        """
         with self.tx() as db:
             row = db.execute("SELECT status FROM tasks WHERE task_id=? AND role=?", (task_id, role)).fetchone()
             if row is None:
@@ -281,6 +293,8 @@ class Ledger:
                 args.append(json.dumps(value, ensure_ascii=False) if key in TASK_JSON_FIELDS else value)
             args.extend([task_id, role])
             db.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE task_id=? AND role=?", args)
+            if queue is not None:
+                self._queue(db, queue)
             return True
 
     def bump_attempts(self, task_id: str) -> int:

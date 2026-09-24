@@ -272,11 +272,15 @@ class Hub:
         task = self.ledger.task(task_id, "owner")
         if task is None:
             raise KeyError(f"task {task_id} is not owned by this node")
-        if not self.ledger.update_task(task_id, "owner", status=status):
-            return False
+        env = None
         if notify:
             payload = body if body is not None else {"state": status, "message": message}
-            await self.reply(task["owner"], task_id, msg_type, payload)
+            env = Envelope(type=msg_type, sender=task["owner"], to=task["requester"], body=payload, task_id=task_id,
+                           conversation_id=task["conversation_id"], reply_to=task.get("last_message")).validate()
+        if not self.ledger.update_task(task_id, "owner", status=status, queue=env):
+            return False
+        if env is not None:
+            await self.try_publish(env)
         await self.publish_task_record(task_id)
         log.info("task %s -> %s (%s)", task_id, status, message)
         return True
@@ -292,9 +296,9 @@ class Hub:
         env.validate()
         refs = [a.to_dict() for a in env.artifacts]
         if not self.ledger.update_task(task_id, "owner", status=task_state_for_result(result["status"]),
-                                       result=result, result_status=result["status"], output_refs=refs):
+                                       result=result, result_status=result["status"], output_refs=refs, queue=env):
             return False
-        await self.send(env)
+        await self.try_publish(env)
         await self.publish_task_record(task_id)
         log.info("task %s finished: %s", task_id, result["status"])
         return True

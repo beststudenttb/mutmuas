@@ -150,7 +150,8 @@ class NodeDaemon:
 
     async def recover(self) -> None:
         hub = self.hub
-        for task in hub.ledger.tasks(role="owner", statuses=("PENDING", "ACCEPTED", "RUNNING")):
+        # every open task, not just the newest page (A:codex: a backlog > 200 left old tasks stuck)
+        for task in hub.ledger.tasks(role="owner", statuses=("PENDING", "ACCEPTED", "RUNNING"), limit=None):
             agent = self._agent_cfg(task["owner"])
             if agent is None or agent.mode != "worker":
                 continue

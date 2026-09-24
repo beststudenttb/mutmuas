@@ -118,11 +118,12 @@ async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, 
         envs = [Envelope.from_json(r["envelope"]) for r in rows]
     else:
         envs = hub.ledger.unseen(str(addr), limit, mark=not peek, types=types, since=since)
-    received = dict(hub.ledger.db.execute(
-        f"SELECT message_id, created_at FROM messages WHERE direction='in' AND message_id IN "
-        f"({','.join('?' * len(envs))})", [e.message_id for e in envs]).fetchall()) if envs else {}
+    meta = {r[0]: (r[1], r[2]) for r in hub.ledger.db.execute(
+        f"SELECT message_id, created_at, rowid FROM messages WHERE direction='in' AND message_id IN "
+        f"({','.join('?' * len(envs))})", [e.message_id for e in envs]).fetchall()} if envs else {}
     return [{"message_id": e.message_id, "type": e.type, "from": e.sender, "task_id": e.task_id,
-             "timestamp": e.timestamp, "received_at": received.get(e.message_id), "body": e.body,
+             "timestamp": e.timestamp, "received_at": meta.get(e.message_id, (None, None))[0],
+             "seq": meta.get(e.message_id, (None, None))[1], "body": e.body,
              "artifacts": [a.to_dict() for a in e.artifacts]}
             for e in envs]
 
