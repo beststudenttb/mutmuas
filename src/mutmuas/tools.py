@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .hub import Hub
-from .protocol import (EVIDENCE_DOWNGRADE, TERMINAL_STATES, ArtifactRef, Envelope, enforce_evidence, request_body,
+from .protocol import (TERMINAL_STATES, ArtifactRef, Envelope, enforce_evidence, request_body,
                        result_body)
 
 
@@ -172,11 +172,14 @@ async def submit_result(hub: Hub, me: str, status: str, summary: str, *, task_id
     refs = [ArtifactRef.from_dict(a) for a in artifacts or []]
     checked = enforce_evidence(body, task.get("request"))
     out: dict[str, Any] = {"task_id": task_id}
+    need = (f"{status} -> {checked['status']}: this task needs at least one evidence item "
+            "{claim, how, verified: true}, where 'how' is a command/test/file the requester can re-check.")
+    if checked["status"] != status and task_id != _current_task():
+        # Sending now would close the task as partial with no way to add evidence afterwards: don't send.
+        return {**out, "sent": False, "error": f"{need} Nothing was sent: add evidence, or submit status "
+                                                "partial if you could not verify it."}
     if checked["status"] != status:
-        out["downgraded"] = (f"{status} -> {checked['status']}: this task needs at least one evidence item "
-                             "{claim, how, verified: true}, where 'how' is a command/test/file the requester "
-                             "can re-check. Call submit_result again with evidence to replace this result."
-                             if task_id == _current_task() else EVIDENCE_DOWNGRADE)
+        out["downgraded"] = f"{need} Call submit_result again with evidence to replace this result."
     if task_id == _current_task():
         # Inside a daemon-run task: store a draft; the daemon sends it when the process exits.
         hub.ledger.update_task(task_id, "owner", result_draft={**body, "artifacts": [r.to_dict() for r in refs]})

@@ -75,10 +75,14 @@ is downgraded to `partial` with the limitation `downgraded to partial: no verifi
 `evidence_required` defaults to true for `code`, `experiment` and `artifact` and false for `query`,
 and the REQUEST can set it either way. Both ends apply the check:
 
-- The owner's daemon applies it before sending. `submit_result` returns `downgraded` so the agent can resubmit with evidence.
+- The owner's side applies it before sending. For a daemon-run worker, `submit_result` returns `downgraded` and the agent can resubmit before the run ends.
+  For an interactive owner, nothing is sent (`sent: false`). The owner adds evidence, or submits an honest `partial`.
 - The requester's daemon applies it again on receipt, so an owner running an older version, or one that simply claims `complete`, gains nothing.
 
 The check can confirm that a claim comes with a way to verify it. It cannot confirm that the claim is true.
+A `query` is exempt by default, but reviews and verdicts are exactly where agreeing without checking happens.
+Send those with `evidence_required: true` (`agentctl ask --evidence`). For an exempt query, only
+convention keeps unverified hearsay out of the answer.
 
 ### Example REQUEST
 

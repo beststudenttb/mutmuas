@@ -67,7 +67,7 @@ async def test_owner_that_skips_the_check_gains_nothing(make_config, cluster, mo
     assert owner_side["result_status"] == "complete"          # proves the owner really skipped it
 
 
-async def test_interactive_owner_is_told_about_the_downgrade(make_config, cluster):
+async def test_interactive_owner_can_add_evidence_before_anything_is_sent(make_config, cluster):
     a = make_config("A", [interactive("main")])
     b = make_config("B", [interactive("helper", permissions=["READ", "RUN_EXPERIMENT"])])
     await cluster.start(a)
@@ -76,6 +76,22 @@ async def test_interactive_owner_is_told_about_the_downgrade(make_config, cluste
     sent = await tools.send_request(hub_a, "A:main", "B:helper", "measure", "evidence test", kind="experiment")
     await eventually(lambda: hub_b.ledger.task(sent["task_id"], "owner") is not None, what="request arrived")
     out = await tools.submit_result(hub_b, "B:helper", "complete", "done", task_id=sent["task_id"])
-    assert out["status"] == "partial" and out["downgraded"] == EVIDENCE_DOWNGRADE
+    assert out["sent"] is False and "Nothing was sent" in out["error"]
+    assert hub_b.ledger.task(sent["task_id"], "owner")["status"] not in ("COMPLETED", "FAILED")
+    out = await tools.submit_result(hub_b, "B:helper", "complete", "done", task_id=sent["task_id"], evidence=[GOOD])
+    assert out["delivered"] and out["status"] == "complete"
     result = await tools.wait_for_result(hub_a, sent["task_id"], 30)
-    assert result["result_status"] == "partial"
+    assert result["result_status"] == "complete" and result["result"]["evidence"] == [GOOD]
+
+
+async def test_interactive_owner_may_still_report_honest_partial(make_config, cluster):
+    a = make_config("A", [interactive("main")])
+    b = make_config("B", [interactive("helper", permissions=["READ", "RUN_EXPERIMENT"])])
+    await cluster.start(a)
+    await cluster.start(b)
+    hub_a, hub_b = await cluster.client(a), await cluster.client(b)
+    sent = await tools.send_request(hub_a, "A:main", "B:helper", "measure", "evidence test", kind="experiment")
+    await eventually(lambda: hub_b.ledger.task(sent["task_id"], "owner") is not None, what="request arrived")
+    out = await tools.submit_result(hub_b, "B:helper", "partial", "measured, could not re-check",
+                                    task_id=sent["task_id"])
+    assert out["delivered"] and out["status"] == "partial"
