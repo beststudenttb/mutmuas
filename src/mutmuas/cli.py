@@ -154,9 +154,14 @@ async def cmd_send(args, hub: Hub):
     msg_type = args.type.upper()
     if msg_type == "REQUEST":
         fields = ("kind", "inputs", "expected_outputs", "constraints", "acceptance_criteria", "timeout_s", "deadline")
+        unknown = sorted(set(body) - set(fields) - {"objective", "reason", "priority"})
+        if unknown:   # never drop content silently; free-form data belongs in inputs
+            raise SystemExit(f"error: unknown REQUEST field(s) {unknown}; put free-form data under 'inputs'. "
+                             f"Allowed: objective, reason, priority, {', '.join(fields)}")
         out = await tools.send_request(
             hub, _me(args), args.to, body.get("objective") or args.objective or "", body.get("reason") or "",
-            artifacts=artifacts, **{k: body[k] for k in fields if k in body})
+            artifacts=artifacts, priority=body.get("priority", "normal"),
+            **{k: body[k] for k in fields if k in body})
     else:
         if not args.task:
             raise SystemExit(f"{msg_type} needs --task")
