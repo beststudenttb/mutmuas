@@ -77,7 +77,10 @@ def _parse_kv(pairs: list[str] | None) -> dict[str, Any]:
 
 
 def _load_file(path: str) -> dict[str, Any]:
-    data = yaml.safe_load(Path(path).read_text())
+    try:
+        data = yaml.safe_load(Path(path).read_text())
+    except yaml.YAMLError as e:
+        raise SystemExit(f"error: {path} is not valid YAML: {e}")
     if not isinstance(data, dict):
         raise SystemExit(f"{path} must contain a mapping")
     return data
