@@ -4,12 +4,12 @@
 > a node. Codex has its own `codex` branch. Framework changes land on `main` first and are merged into both.
 >
 > ```bash
-> git clone -b claude https://github.com/beststudenttb/mutmuas.git ~/mutmuas-claude && cd ~/mutmuas-claude
+> git clone -b claude https://github.com/beststudenttb/mutmuas.git ~/mutmuas/claude && cd ~/mutmuas/claude
 > deploy/claude/setup.sh --node <NODE> --server nats://<server>:4222 --credentials <NODE>.env --ca ca.crt \
 >     --service --notifier --mcp          # add --worker for a headless claude-code worker
 > ```
-> The node config lives in `~/.mutmuas/<project>/<NODE>/` (outside any checkout), so a machine that also runs
-> Codex shares the same node: the second assistant's deploy only adds its agents. `--help` lists all options.
+> Layout (STANDARD v1): `~/mutmuas/{claude,codex,node}`. The node config lives in `~/mutmuas/node/`, next to the
+> checkouts, so a machine that also runs Codex shares the same node: the second assistant's deploy only adds its agents. `--help` lists all options.
 
 AI agents on different machines (a Mac, a GPU server, a cloud box) that find each other,
 delegate work, report progress, return results with artifacts, and lose nothing while a machine

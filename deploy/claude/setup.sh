@@ -29,7 +29,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$NODE" ] || { echo "--node is required" >&2; exit 2; }
-CONFIG="${CONFIG:-$HOME/.mutmuas/$PROJECT/$NODE/node.yaml}"
+# STANDARD v1: <ROOT>/mutmuas/{claude,codex,node[,server]}; the node config sits next to the checkouts.
+CONFIG="${CONFIG:-$(dirname "$REPO")/node/node.yaml}"
 DIR="$(dirname "$CONFIG")"
 BIN="$REPO/.venv/bin"
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
