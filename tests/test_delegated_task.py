@@ -83,3 +83,25 @@ async def test_sender_offline_after_sending(make_config, cluster):
 async def _status(hub, task_id, status):
     view = await hub.task_view(task_id)
     return view and view.get("status") == status
+
+
+async def test_node_lead_is_notified_of_worker_tasks(make_config, cluster):
+    """A worker with notify: [B:main] copies its node's lead when it takes and finishes a task (B's governance request)."""
+    a = make_config("A", [interactive("main")])
+    b = make_config("B", [interactive("main"), worker("ops", "lab.py", notify=["B:main"])])
+    await cluster.start(a)
+    await cluster.start(b)
+    hub_a = await cluster.client(a)
+    hub_b = await cluster.client(b)
+    sent = await tools.send_request(hub_a, "A:main", "B:ops", "change server config", "governance test",
+                                    inputs={"action": "echo", "text": "ok"})
+    await tools.wait_for_result(hub_a, sent["task_id"], 30)
+    fyi = await eventually(lambda: _two(tools.inbox(hub_b, "B:main", peek=True)), what="two FYIs at B:main")
+    assert all(m["type"] == "UPDATE" and m["body"]["fyi"] and m["task_id"] == sent["task_id"] for m in fyi)
+    assert "accepted" in fyi[0]["body"]["message"] and "from A:main" in fyi[0]["body"]["message"]
+    assert "finished" in fyi[1]["body"]["message"] and "(complete)" in fyi[1]["body"]["message"]
+
+
+async def _two(coro):
+    rows = await coro
+    return rows if len(rows) >= 2 else None

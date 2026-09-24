@@ -49,6 +49,8 @@ class AgentConfig:
     extra_args: list[str] = field(default_factory=list)             # appended to the runtime CLI call
     inherit_user_config: bool = False    # codex: also load ~/.codex/config.toml (model, other MCP servers)
     network: bool = False                # codex: allow network access inside the workspace-write sandbox
+    notify: list[str] = field(default_factory=list)   # e.g. ["B:main"]: told whenever this worker takes or
+                                                      # finishes a task, so a node's lead knows what runs there
     env: dict[str, str] = field(default_factory=dict)
 
     def validate(self) -> None:

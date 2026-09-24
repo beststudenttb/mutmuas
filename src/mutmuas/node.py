@@ -237,6 +237,9 @@ class NodeDaemon:
         if agent.mode == "worker":
             await self._accept(env.task_id)
             self._enqueue(env.to, env.task_id)
+            await self._notify(agent, env.to, env.task_id,
+                               f"FYI: {env.to} accepted a {env.body.get('kind', 'query')} task from {env.sender}: "
+                               f"{env.body.get('objective', '')[:300]}")
         else:
             # Interactive agents accept explicitly (accept_task). Tell the requester it arrived meanwhile,
             # so "delivered but not picked up yet" is distinguishable from "lost".
@@ -367,6 +370,18 @@ class NodeDaemon:
         if wt:
             await self._attach_git(wt, agent, task_id, body, refs)
         await hub.finish(task_id, body, refs)
+        await self._notify(agent, current["owner"], task_id,
+                           f"FYI: {current['owner']} finished {task_id} for {current['requester']} "
+                           f"({body['status']}): {body.get('summary', '')[:300]}")
+
+    async def _notify(self, agent: AgentConfig, sender: str, task_id: str, text: str) -> None:
+        """Copy a node's lead (agent.notify) on work its workers take on. Best effort, informational only."""
+        for target in agent.notify:
+            try:
+                await self.hub.send(Envelope(type="UPDATE", sender=sender, to=target, task_id=task_id,
+                                             body={"message": text, "fyi": True}))
+            except Exception as e:
+                log.warning("notify %s failed: %r", target, e)
 
     async def _attach_git(self, wt: Worktree, agent: AgentConfig, task_id: str, body: dict[str, Any],
                           refs: list[ArtifactRef]) -> None:
