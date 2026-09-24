@@ -198,3 +198,21 @@ async def test_generated_server_auth_enforces_node_identity(tmp_path, make_confi
 async def _status(hub, task_id, status):
     view = await hub.task_view(task_id)
     return view and view.get("status") == status
+
+
+async def test_blocked_then_result_is_delivered(make_config, cluster):
+    """A worker that reported BLOCKED but then submitted a result must not lose that result (bug from node B)."""
+    a = make_config("A", [interactive("main")])
+    b = make_config("B", [worker("lab", "lab.py")])
+    await cluster.start(a)
+    await cluster.start(b)
+    hub = await cluster.client(a)
+    result = await tools.wait_for_result(hub, await _request(hub, "B:lab", {"action": "block_then_result"}), 30)
+    assert result["status"] == "COMPLETED" and result["result_status"] == "partial"
+    assert "without a shell" in result["result"]["summary"]
+
+    # Blocked with no result stays BLOCKED (waiting for the requester), and the reason reaches A.
+    task_id = await _request(hub, "B:lab", {"action": "block_only"})
+    await eventually(lambda: (hub.ledger.task(task_id, "requester") or {}).get("status") == "BLOCKED",
+                     what="requester sees BLOCKED")
+    assert any(m["type"] == "BLOCKED" and "dataset path" in m["body"]["reason"] for m in hub.ledger.thread(task_id))

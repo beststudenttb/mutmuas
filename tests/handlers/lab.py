@@ -97,6 +97,21 @@ elif action == "commit":
         subprocess.run(cmd, check=True)
     print(json.dumps({"status": "complete", "summary": f"committed {inputs['file']} on {task['git_branch']}"}))
 
+elif action == "block_then_result":
+    # Reproduces node B's report: a worker reports BLOCKED, then still submits a (partial) result.
+    async def run(hub):
+        await tools.report_progress(hub, me, "cannot run shell commands here", state="BLOCKED")
+        await tools.submit_result(hub, me, "partial", "did what was possible without a shell",
+                                  limitations=["sandbox blocked shell commands"])
+
+    asyncio.run(with_hub(run))
+
+elif action == "block_only":
+    async def run(hub):
+        await tools.report_progress(hub, me, "need the dataset path from the requester", state="BLOCKED")
+
+    asyncio.run(with_hub(run))
+
 elif action == "delegate":
     # B worker delegates onward to another agent and waits: A -> B -> C chains.
     async def run(hub):

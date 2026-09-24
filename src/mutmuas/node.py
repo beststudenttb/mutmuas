@@ -354,8 +354,11 @@ class NodeDaemon:
             return
 
         current = hub.ledger.task(task_id, "owner")
-        if current["status"] in TERMINAL_STATES or current["status"] == "BLOCKED":
-            return      # the agent already closed or blocked the task through its tools
+        if current["status"] in TERMINAL_STATES:
+            return      # the agent already closed the task through its tools
+        if current["status"] == "BLOCKED" and not current.get("result_draft"):
+            return      # blocked and nothing to deliver: wait for the requester
+        # A submitted result always wins over an earlier BLOCKED report.
         body, refs = _result_from(current.get("result_draft"), outcome)
         if wt:
             await self._attach_git(wt, agent, task_id, body, refs)
