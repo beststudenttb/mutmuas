@@ -66,6 +66,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     PRIMARY KEY (task_id, role)
 );
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(role, status);
+
+CREATE TABLE IF NOT EXISTS agent_pauses (
+    local_agent     TEXT PRIMARY KEY,        -- NODE:agent on this node
+    until           TEXT,                    -- ISO time; NULL = until resumed by hand
+    reason          TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
 """
 
 TASK_JSON_FIELDS = ("request", "result", "result_draft", "input_refs", "output_refs")
@@ -296,6 +303,29 @@ class Ledger:
             if queue is not None:
                 self._queue(db, queue)
             return True
+
+    # ---- pauses (quota exhausted, vendor outage, or by hand) ------------
+
+    def pause(self, local_agent: str, reason: str, until: str | None = None) -> None:
+        self.db.execute("INSERT OR REPLACE INTO agent_pauses (local_agent, until, reason, created_at)"
+                        " VALUES (?, ?, ?, ?)", (local_agent, until, reason, now_iso()))
+
+    def resume(self, local_agent: str) -> bool:
+        return self.db.execute("DELETE FROM agent_pauses WHERE local_agent=?", (local_agent,)).rowcount == 1
+
+    def pause_of(self, local_agent: str) -> dict[str, Any] | None:
+        """The agent's active pause, if any. A pause whose `until` has passed is lifted automatically."""
+        row = self.db.execute("SELECT * FROM agent_pauses WHERE local_agent=?", (local_agent,)).fetchone()
+        if row is None:
+            return None
+        if row["until"] and row["until"] <= now_iso():
+            self.resume(local_agent)
+            return None
+        return dict(row)
+
+    def unbump_attempts(self, task_id: str) -> None:
+        """A run that ended because the vendor quota ran out does not count as an attempt."""
+        self.db.execute("UPDATE tasks SET attempts=MAX(attempts-1, 0) WHERE task_id=? AND role='owner'", (task_id,))
 
     def bump_attempts(self, task_id: str) -> int:
         with self.tx() as db:

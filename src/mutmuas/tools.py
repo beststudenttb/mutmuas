@@ -22,8 +22,8 @@ def _current_task() -> str | None:
 
 def card_summary(card: dict[str, Any]) -> dict[str, Any]:
     keys = ("address", "display", "role", "mode", "runtime", "provider", "model", "capabilities", "permissions",
-            "accept_from", "state", "online", "current_task", "queue", "inbox_unread", "last_heartbeat",
-            "description")
+            "accept_from", "state", "unavailable_reason", "unavailable_until", "online", "current_task", "queue",
+            "inbox_unread", "last_heartbeat", "description")
     return {k: card.get(k) for k in keys if card.get(k) not in (None, "", [])}
 
 
@@ -58,6 +58,9 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
         out["note"] = "target agent is not registered yet; the message is stored durably until it comes online"
     elif not target.get("online"):
         out["note"] = "target agent is offline; the message waits in its durable inbox"
+    elif target.get("state") == "unavailable":
+        out["note"] = (f"target agent is paused until {target.get('unavailable_until') or 'resumed'} "
+                       f"({target.get('unavailable_reason')}); the task waits in its queue")
     return out
 
 
@@ -210,6 +213,18 @@ async def publish_artifact(hub: Hub, me: str, path: str, *, key: str | None = No
     key = key or f"{addr.node}/{addr.agent}/{task_id or _current_task() or 'adhoc'}/{src.name}"
     ref = await hub.artifacts.publish(src, key, id=id, description=description, backend=backend)
     return ref.to_dict()
+
+
+async def pause(hub: Hub, agent: str, reason: str, until: str | None = None) -> dict[str, Any]:
+    """Mark a local agent unavailable: its queue is held (tasks wait, nothing fails) until resume or `until`."""
+    addr, _ = hub.local_agent(agent)
+    hub.ledger.pause(str(addr), reason, until)
+    return {"agent": str(addr), "paused": True, "until": until, "reason": reason}
+
+
+async def resume(hub: Hub, agent: str) -> dict[str, Any]:
+    addr, _ = hub.local_agent(agent)
+    return {"agent": str(addr), "resumed": hub.ledger.resume(str(addr))}
 
 
 async def fetch_artifact(hub: Hub, uri: str, dest_dir: str | None = None, sha256: str | None = None) -> dict:

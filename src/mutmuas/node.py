@@ -22,6 +22,7 @@ import json
 import logging
 import platform
 import socket
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,11 @@ from .runtime import TaskContext, make_runtime
 from .worktree import GitError, Worktree
 
 log = logging.getLogger(__name__)
+
+# Error text meaning "the vendor will not serve us right now" (not "the task is wrong"). Lower-cased substrings.
+QUOTA_PATTERNS = ("out of credits", "usage limit", "rate limit", "rate_limit", "insufficient_quota", "quota",
+                  "credit balance is too low", "429 too many requests", "overloaded")
+QUOTA_PAUSE_MIN = 60
 
 
 def _code_version() -> str:
@@ -335,11 +341,13 @@ class NodeDaemon:
         queue = self._queues[addr]
         while True:
             task_id = await queue.get()
+            requeue = False
+            await self._wait_while_paused(addr)
             try:
                 runner = asyncio.create_task(self._execute(agent, task_id), name=f"task:{task_id}")
                 self._running[task_id] = runner
                 try:
-                    await asyncio.shield(runner)
+                    requeue = bool(await asyncio.shield(runner))
                 except asyncio.CancelledError:
                     if not runner.done():       # daemon shutdown: stop the task, recover() resumes it later
                         runner.cancel()
@@ -348,8 +356,15 @@ class NodeDaemon:
             finally:
                 self._running.pop(task_id, None)
                 self._queued[addr].discard(task_id)
+            if requeue:                     # vendor quota: keep the task, run it again once the pause ends
+                self._enqueue(addr, task_id)
 
-    async def _execute(self, agent: AgentConfig, task_id: str) -> None:
+    async def _wait_while_paused(self, addr: str) -> None:
+        while self.hub.ledger.pause_of(addr):
+            await asyncio.sleep(1)
+
+    async def _execute(self, agent: AgentConfig, task_id: str) -> bool:
+        """Run one task. Returns True if it must be queued again (the agent was paused for vendor quota)."""
         hub = self.hub
         task = hub.ledger.task(task_id, "owner")
         if task is None or task["status"] in TERMINAL_STATES:
@@ -399,6 +414,17 @@ class NodeDaemon:
         if current["status"] == "BLOCKED" and not current.get("result_draft"):
             return      # blocked and nothing to deliver: wait for the requester
         # A submitted result always wins over an earlier BLOCKED report.
+        quota = _quota_error(outcome)
+        if quota and not current.get("result_draft"):
+            addr = current["owner"]
+            until = (datetime.now(timezone.utc) + timedelta(minutes=QUOTA_PAUSE_MIN)).isoformat(timespec="milliseconds")
+            hub.ledger.pause(addr, f"vendor quota/limit: {quota[:200]}", until)
+            hub.ledger.unbump_attempts(task_id)
+            await hub.owner_transition(task_id, "ACCEPTED", f"{addr} paused (vendor quota/limit: {quota[:160]}); "
+                                       f"task kept in its queue until {until} or `agentctl resume {addr}`")
+            await self._publish_cards()
+            log.warning("%s paused until %s: %s", addr, until, quota)
+            return True
         body, refs = _result_from(current.get("result_draft"), outcome)
         if wt:
             await self._attach_git(wt, agent, task_id, body, refs)
@@ -474,7 +500,8 @@ class NodeDaemon:
                                           statuses=("PENDING", "ACCEPTED", "RUNNING", "WAITING", "BLOCKED"))
             if agent.mode == "interactive":      # an accepted task is RUNNING until its result is submitted
                 running = [t["task_id"] for t in owned_open if t["status"] == "RUNNING"]
-            state = state_override or ("working" if running else "idle")
+            pause = hub.ledger.pause_of(addr)
+            state = state_override or ("unavailable" if pause else "working" if running else "idle")
             pending = None
             with contextlib.suppress(Exception):
                 pending = await bus.inbox_pending(Address(self.cfg.node, agent.id))
@@ -488,6 +515,8 @@ class NodeDaemon:
                 "open_tasks": len(owned_open), "queue": max(0, len(self._queued.get(addr, ())) - len(running)),
                 "inbox_unread": (hub.ledger.unseen_count(addr) if agent.mode == "interactive"
                                  else hub.ledger.count("in", "new", addr) + (pending or 0)),
+                "unavailable_reason": pause["reason"] if pause else None,
+                "unavailable_until": pause["until"] if pause else None,
                 "heartbeat_s": self.cfg.heartbeat_s, "last_heartbeat": now})
 
     # ---- outbox -------------------------------------------------------
@@ -507,6 +536,16 @@ class NodeDaemon:
     def _agent_cfg(self, address: str) -> AgentConfig | None:
         addr = Address.parse(address)
         return next((a for a in self.cfg.agents if a.id == addr.agent and addr.node == self.cfg.node), None)
+
+
+def _quota_error(outcome) -> str | None:
+    """The first error line saying the vendor refused service (quota, rate limit, overload), if any."""
+    if outcome.exit_code == 0:
+        return None
+    for line in _error_lines(outcome.log_path, limit=50) + outcome.output_tail.splitlines()[-20:]:
+        if any(p in line.lower() for p in QUOTA_PATTERNS):
+            return line.strip()
+    return None
 
 
 def _result_from(draft: dict[str, Any] | None, outcome) -> tuple[dict[str, Any], list[ArtifactRef]]:

@@ -89,7 +89,8 @@ class Hub:
         if online_only:
             cards = [c for c in cards if c["online"]]
         # Best candidates first: online, idle, short queue.
-        cards.sort(key=lambda c: (not c["online"], c.get("state") != "idle", c.get("queue", 0), c["address"]))
+        cards.sort(key=lambda c: (not c["online"], c.get("state") == "unavailable", c.get("state") != "idle",
+                                  c.get("queue", 0), c["address"]))
         return cards
 
     async def agent_card(self, address: str) -> dict[str, Any] | None:

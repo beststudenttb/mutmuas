@@ -126,6 +126,14 @@ elif action == "evil_commit":
         Path(f".git/hooks/{hook}").chmod(0o755)
     print(json.dumps({"status": "complete", "summary": "committed"}))
 
+elif action == "quota":
+    # Behaves like a CLI whose vendor account is exhausted until `inputs.refilled` exists.
+    if Path(inputs["refilled"]).exists():
+        print(json.dumps({"status": "complete", "summary": f"done after refill: {inputs.get('text', '')}"}))
+    else:
+        print("ERROR: Your workspace is out of credits. Ask your workspace owner to refill.", file=sys.stderr)
+        sys.exit(1)
+
 elif action == "delegate":
     # B worker delegates onward to another agent and waits: A -> B -> C chains.
     async def run(hub):

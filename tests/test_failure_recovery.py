@@ -219,3 +219,54 @@ async def test_blocked_then_result_is_delivered(make_config, cluster):
     await eventually(lambda: (hub.ledger.task(task_id, "requester") or {}).get("status") == "BLOCKED",
                      what="requester sees BLOCKED")
     assert any(m["type"] == "BLOCKED" and "dataset path" in m["body"]["reason"] for m in hub.ledger.thread(task_id))
+
+
+async def test_vendor_quota_pauses_the_worker_instead_of_failing_tasks(make_config, cluster, tmp_path):
+    """RSI round 1: Codex ran out of credits twice on 2026-09-24 and its tasks just failed.
+
+    Now: the quota error pauses the worker (registry shows it), its tasks stay queued, and they complete
+    after `resume` -- nothing is reported as failed.
+    """
+    a = make_config("A", [interactive("main")])
+    b = make_config("B", [worker("lab", "lab.py")])
+    await cluster.start(a)
+    await cluster.start(b)
+    hub_a = await cluster.client(a)
+    hub_b = await cluster.client(b)
+    refilled = tmp_path / "refilled"
+    first = await _request(hub_a, "B:lab", {"action": "quota", "refilled": str(refilled), "text": "one"})
+
+    card = await eventually(lambda: _card_state(hub_a, "B:lab", "unavailable"), what="worker paused")
+    assert "out of credits" in card["unavailable_reason"]
+    assert (await hub_a.task_view(first))["status"] not in ("FAILED", "COMPLETED")
+    assert any("paused" in (m["body"].get("message") or "") for m in hub_a.ledger.thread(first))
+
+    second = await tools.send_request(hub_a, "A:main", "B:lab", "do it", "sent while paused",
+                                      inputs={"action": "quota", "refilled": str(refilled), "text": "two"})
+    assert "paused" in second["note"]
+    await asyncio.sleep(2)
+    assert (await hub_a.task_view(second["task_id"]))["status"] in ("PENDING", "ACCEPTED")   # held, not run
+
+    refilled.touch()
+    assert (await tools.resume(hub_b, "B:lab"))["resumed"]
+    for task_id, text in ((first, "one"), (second["task_id"], "two")):
+        result = await tools.wait_for_result(hub_a, task_id, 30)
+        assert result["result_status"] == "complete" and text in result["result"]["summary"]
+    assert (await hub_a.task_view(first))["attempts"] == 1      # the quota failure did not count as an attempt
+    await eventually(lambda: _card_state(hub_a, "B:lab", "idle"), what="available again")
+
+
+async def test_manual_pause_until(make_config, cluster):
+    b = make_config("B", [worker("lab", "lab.py")])
+    hub = await cluster.client(b)
+    from mutmuas.cli import _parse_until
+    until = _parse_until("+1m")
+    await tools.pause(hub, "B:lab", "maintenance", until)
+    assert hub.ledger.pause_of("B:lab")["reason"] == "maintenance"
+    hub.ledger.pause("B:lab", "expired", "2000-01-01T00:00:00.000+00:00")
+    assert hub.ledger.pause_of("B:lab") is None                 # a past `until` lifts the pause by itself
+
+
+async def _card_state(hub, address, state):
+    card = await hub.agent_card(address)
+    return card if card and card.get("state") == state else None

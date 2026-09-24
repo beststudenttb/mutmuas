@@ -15,7 +15,7 @@ import shutil
 import signal
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -298,6 +298,32 @@ def _desktop_notify(title: str, text: str, dry_run: bool = False) -> None:
                         "-e", "end run", title, text], capture_output=True)
     elif shutil.which("notify-send"):
         subprocess.run(["notify-send", title, text], capture_output=True)
+
+
+def _parse_until(text: str | None) -> str | None:
+    """'22:40' (next such local time), '+90m' / '+2h', or an ISO timestamp -> ISO UTC."""
+    if not text:
+        return None
+    now = datetime.now().astimezone()
+    if text.startswith("+"):
+        n, unit = float(text[1:-1]), text[-1]
+        when = now + timedelta(minutes=n * (60 if unit == "h" else 1))
+    elif ":" in text and len(text) <= 5:
+        hh, mm = (int(x) for x in text.split(":"))
+        when = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if when <= now:
+            when += timedelta(days=1)
+    else:
+        when = datetime.fromisoformat(text)
+    return when.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+
+
+async def cmd_pause(args, hub: Hub):
+    _print(await tools.pause(hub, args.agent, args.reason, _parse_until(args.until)), args.json)
+
+
+async def cmd_resume(args, hub: Hub):
+    _print(await tools.resume(hub, args.agent), args.json)
 
 
 async def cmd_cancel(args, hub: Hub):
@@ -710,6 +736,12 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p = add("watch", cmd_watch, "run forever: desktop notification per new actionable message (launchd/systemd)")
     p.add_argument("--interval", type=float, default=3600, help="max seconds per wait cycle")
     p.add_argument("--dry-run", action="store_true", help="log notifications instead of showing them")
+    p = add("pause", cmd_pause, "hold a local agent's queue (e.g. vendor quota exhausted)", bus=False)
+    p.add_argument("agent")
+    p.add_argument("--reason", default="paused by hand")
+    p.add_argument("--until", help="'22:40', '+90m', '+2h' or ISO time; default: until resumed")
+    p = add("resume", cmd_resume, "release a paused local agent", bus=False)
+    p.add_argument("agent")
     p = add("cancel", cmd_cancel, "cancel a task I requested", bus=False)
     p.add_argument("task_id")
     p.add_argument("--reason")
