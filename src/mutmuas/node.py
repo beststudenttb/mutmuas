@@ -304,8 +304,10 @@ class NodeDaemon:
         """A message about a task *we* requested."""
         ledger = self.hub.ledger
         task = ledger.task(env.task_id, "requester")
-        if task is None:
-            log.info("reply for unknown task %s (%s) kept in inbox only", env.task_id, env.type)
+        if task is None or task["local_agent"] != env.to or env.body.get("fyi"):
+            # Not a reply to this agent's own request: e.g. an FYI copy to a node lead about a task that
+            # another agent on the same node requested. It stays in the recipient's inbox only.
+            log.info("message about task %s (%s) kept in inbox only", env.task_id, env.type)
             return
         fields: dict[str, Any] = {"last_message": env.message_id}
         status = REQUESTER_TRANSITIONS.get(env.type)

@@ -105,3 +105,20 @@ async def test_node_lead_is_notified_of_worker_tasks(make_config, cluster):
 async def _two(coro):
     rows = await coro
     return rows if len(rows) >= 2 else None
+
+
+async def test_fyi_to_same_node_lead_does_not_touch_the_requesters_task(make_config, cluster):
+    """A:claude asks A:codex-worker (notify: [A:codex]): the FYI to A:codex must not update A:claude's task."""
+    a = make_config("A", [interactive("claude"), interactive("codex"), worker("codex-worker", "lab.py",
+                                                                               notify=["A:codex"])])
+    await cluster.start(a)
+    hub = await cluster.client(a)
+    sent = await tools.send_request(hub, "A:claude", "A:codex-worker", "echo", "same-node fyi",
+                                    inputs={"action": "echo", "text": "x"})
+    result = await tools.wait_for_result(hub, sent["task_id"], 30)
+    assert result["status"] == "COMPLETED"
+    fyi = await eventually(lambda: _two(tools.inbox(hub, "A:codex", peek=True)), what="FYIs at A:codex")
+    assert all(m["body"]["fyi"] for m in fyi)
+    assert not [m for m in await tools.inbox(hub, "A:claude") if m["body"].get("fyi")]
+    task = hub.ledger.task(sent["task_id"], "requester")
+    assert task["status"] == "COMPLETED" and task["result"]["summary"] == "echo: x"
