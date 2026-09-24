@@ -373,7 +373,7 @@ def node_init(args):
         "data_dir": args.data_dir or str(Path(path).parent / "data"),
         "nats": {"servers": [args.server]},
         "resources": {},
-        "agents": [
+        "agents": [] if args.bare else [
             {"id": "main", "display": f"{args.node}:a1", "mode": "interactive", "role": "lead",
              "provider": "anthropic", "workdir": str(Path.cwd()),
              "permissions": ["READ", "REQUEST_TASK", "PUBLISH_ARTIFACT"]},
@@ -385,8 +385,43 @@ def node_init(args):
     }
     if args.credentials:
         data["nats"]["credentials_file"] = str(Path(args.credentials).expanduser().resolve())
+    if args.ca:
+        data["nats"]["tls_ca"] = str(Path(args.ca).expanduser().resolve())
     dump_config(data, path)
-    print(f"wrote {path}\nedit the agents section, then: agent-node join --server ... && agent-node start")
+    nxt = "agent-node add-agent ..." if args.bare else "edit the agents section"
+    print(f"wrote {path}\nnext: {nxt}, then agent-node doctor && agent-node start")
+
+
+def node_add_agent(args):
+    """Add one agent to an existing node config, idempotently (several assistants can share one node)."""
+    path = find_config(args.config).resolve()
+    data = yaml.safe_load(path.read_text()) or {}
+    agents = data.setdefault("agents", []) or []
+    data["agents"] = agents
+    existing = next((a for a in agents if a.get("id") == args.id), None)
+    if existing and not args.replace:
+        print(f"{data.get('node')}:{args.id} already configured in {path}; unchanged (use --replace to overwrite)")
+        return
+    agent: dict[str, Any] = {"id": args.id, "mode": args.mode}
+    for key in ("runtime", "role", "provider", "model", "display", "workdir", "repo"):
+        if getattr(args, key) is not None:
+            agent[key] = getattr(args, key)
+    for key, values in (("capabilities", args.capability), ("permissions", args.permission),
+                        ("accept_from", args.accept_from), ("notify", args.notify)):
+        if values:
+            agent[key] = values
+    if existing:
+        agents[agents.index(existing)] = agent
+    else:
+        agents.append(agent)
+    backup = path.read_text()
+    dump_config(data, path)
+    try:
+        load_config(path)                      # never leave an invalid config behind
+    except (ConfigError, ValueError) as e:
+        path.write_text(backup)
+        raise SystemExit(f"error: {e}; {path} left unchanged")
+    print(f"{'replaced' if existing else 'added'} {data.get('node')}:{args.id} in {path}; restart the node to apply")
 
 
 def node_join(args):
@@ -463,15 +498,25 @@ def node_service(args):
     exe = venv_bin / "agent-node"
     argv = ([str(exe)] if exe.exists() else [sys.executable, "-m", "mutmuas.cli", "node"]) + [
         "start", "--config", str(cfg_path)]
+    suffix, what = "", "agent-node"
+    if args.watch:          # the desktop notifier of one interactive agent, instead of the node daemon
+        watched = Address.parse(args.watch if ":" in args.watch else f"{cfg.node}:{args.watch}")
+        if watched.node != cfg.node:
+            raise SystemExit(f"error: {watched} is not on node {cfg.node}")
+        cfg.agent(watched.agent)                                    # must be configured on this node
+        ctl = venv_bin / "agentctl"
+        argv = ([str(ctl)] if ctl.exists() else [sys.executable, "-m", "mutmuas.cli"]) + [
+            "watch", "--config", str(cfg_path), "--as", str(watched)]
+        suffix, what = f".watch-{watched.agent}", f"notifier for {watched}"
     # A minimal PATH: the venv, wherever the agent CLIs live, and system dirs. Copying the caller's PATH
     # would leak e.g. an activated conda env into every worker.
     dirs = [str(venv_bin)] + [str(Path(p).parent) for p in (shutil.which("claude"), shutil.which("codex")) if p]
     dirs += ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
     path_env = ":".join(dict.fromkeys(d for d in dirs if Path(d).is_dir()))
     if sys.platform == "darwin":
-        label = f"dev.mutmuas.{cfg.project}.{cfg.node}"   # unique per node: several nodes can share a Mac
+        label = f"dev.mutmuas.{cfg.project}.{cfg.node}{suffix}"   # unique per node: several nodes can share a Mac
         items = "\n".join(f"    <string>{a}</string>" for a in argv)
-        log = cfg_path.parent / "agent-node.launchd.log"
+        log = cfg_path.parent / f"{cfg.node}{suffix or '-agent-node'}.launchd.log"
         text = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -499,7 +544,7 @@ def node_service(args):
         order = ("After=mutmuas-nats-server.service\nWants=mutmuas-nats-server.service\n"
                  if local_server and (nats_unit.exists() or args.after_nats) else "")
         text = f"""[Unit]
-Description=mutmuas agent-node ({cfg_path})
+Description=mutmuas {what} ({cfg_path})
 {order}
 [Service]
 ExecStart={' '.join(argv)}
@@ -514,8 +559,9 @@ WantedBy=default.target
 """
         # Linux keeps one unit name for now (node B's rollout depends on it); the guard below still
         # refuses to overwrite a unit that was written for a different config.
-        target = Path.home() / ".config/systemd/user/mutmuas-agent-node.service"
-        hint = ("systemctl --user daemon-reload\nsystemctl --user enable --now mutmuas-agent-node\n"
+        unit = "mutmuas-agent-node" + (f"-{cfg.node}{suffix}" if suffix else "")
+        target = Path.home() / f".config/systemd/user/{unit}.service"
+        hint = (f"systemctl --user daemon-reload\nsystemctl --user enable --now {unit}\n"
                 "loginctl enable-linger $USER   # keep running after logout")
     if args.write:
         if target.exists() and cfg_path.as_posix() not in target.read_text() and not args.force:
@@ -702,7 +748,26 @@ def agent_node_parser() -> argparse.ArgumentParser:
     p.add_argument("--data-dir")
     p.add_argument("--description")
     p.add_argument("--force", action="store_true")
+    p.add_argument("--ca", help="server CA certificate (TLS)")
+    p.add_argument("--bare", action="store_true", help="no agents yet (add them with add-agent)")
     p.set_defaults(sync=node_init)
+    p = sub.add_parser("add-agent", help="add an agent to this node's config (idempotent)")
+    p.add_argument("--config")
+    p.add_argument("--id", required=True)
+    p.add_argument("--mode", default="interactive", choices=["interactive", "worker"])
+    p.add_argument("--runtime", choices=["claude-code", "codex", "script"])
+    p.add_argument("--role")
+    p.add_argument("--provider")
+    p.add_argument("--model")
+    p.add_argument("--display")
+    p.add_argument("--workdir")
+    p.add_argument("--repo")
+    p.add_argument("--capability", action="append")
+    p.add_argument("--permission", action="append")
+    p.add_argument("--accept-from", dest="accept_from", action="append")
+    p.add_argument("--notify", action="append")
+    p.add_argument("--replace", action="store_true")
+    p.set_defaults(sync=node_add_agent)
     p = sub.add_parser("join", help="point this node at a server and verify connectivity")
     p.add_argument("--config")
     p.add_argument("--server")
@@ -729,6 +794,8 @@ def agent_node_parser() -> argparse.ArgumentParser:
     p.add_argument("--config")
     p.add_argument("--write", action="store_true", help="write the unit file instead of printing it")
     p.add_argument("--force", action="store_true", help="replace a unit file written for a different config")
+    p.add_argument("--watch", metavar="AGENT", help="unit for the desktop notifier of this interactive agent "
+                                                    "(agentctl watch) instead of the node daemon")
     p.add_argument("--after-nats", action="store_true",
                    help="Linux: order after mutmuas-nats-server.service (automatic when that unit exists "
                         "and the node connects to 127.0.0.1)")

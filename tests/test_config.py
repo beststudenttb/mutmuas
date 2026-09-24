@@ -119,3 +119,32 @@ def test_runtime_sandbox_follows_request_kind(tmp_path, kind, sandbox, claude_ca
     assert argv[argv.index("--sandbox") + 1] == sandbox
     argv, _ = ClaudeCodeRuntime(agent, node).command(ctx)
     assert ("Edit" in argv[argv.index("--allowedTools") + 1]) is claude_can_edit
+
+
+def test_bare_init_add_agent_and_watch_unit(tmp_path, monkeypatch):
+    """Two assistants share one node: init --bare, then each deploy adds its own agent; notifier units are distinct."""
+    import sys
+
+    from mutmuas import cli
+    cfg = tmp_path / "A.yaml"
+    cli.agent_node(["init", "--bare", "--config", str(cfg), "--project", "p", "--node", "A"])
+    cli.agent_node(["add-agent", "--config", str(cfg), "--id", "claude", "--provider", "anthropic"])
+    cli.agent_node(["add-agent", "--config", str(cfg), "--id", "codex", "--provider", "openai"])
+    cli.agent_node(["add-agent", "--config", str(cfg), "--id", "codex-worker", "--mode", "worker",
+                    "--runtime", "codex", "--notify", "A:codex"])
+    cli.agent_node(["add-agent", "--config", str(cfg), "--id", "claude", "--role", "ignored"])   # idempotent
+    loaded = load_config(cfg)
+    assert [a.id for a in loaded.agents] == ["claude", "codex", "codex-worker"]
+    assert loaded.agent("claude").role == "" and loaded.agent("codex-worker").notify == ["A:codex"]
+    with pytest.raises(SystemExit):                     # an invalid agent never corrupts the config
+        cli.agent_node(["add-agent", "--config", str(cfg), "--id", "bad", "--mode", "worker"])
+    assert [a.id for a in load_config(cfg).agents] == ["claude", "codex", "codex-worker"]
+
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(cli.Path, "home", lambda: tmp_path)
+    for who in ("claude", "codex"):
+        cli.agent_node(["service", "--write", "--watch", who, "--config", str(cfg)])
+        plist = (tmp_path / f"Library/LaunchAgents/dev.mutmuas.p.A.watch-{who}.plist").read_text()
+        assert "<string>watch</string>" in plist and f"<string>A:{who}</string>" in plist
+    with pytest.raises(SystemExit):
+        cli.agent_node(["service", "--watch", "B:main", "--config", str(cfg)])
