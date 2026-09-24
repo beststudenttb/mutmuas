@@ -265,8 +265,10 @@ async def cmd_watch(args, hub: Hub):
     me = _me(args)
     addr, _ = hub.local_agent(me)
     cursor_file = hub.cfg.data_path / f"{addr.node}_{addr.agent}.notify-cursor"
-    if not cursor_file.exists():
-        cursor_file.write_text(datetime.now(timezone.utc).isoformat(timespec="milliseconds"))
+    # Cursor = ledger rowid (monotonic). An old timestamp cursor (A:codex: ms collisions lost mail) is reset
+    # to the current end of the ledger.
+    if not cursor_file.exists() or not cursor_file.read_text().strip().isdigit():
+        cursor_file.write_text(str(hub.ledger.db.execute("SELECT COALESCE(MAX(rowid), 0) FROM messages").fetchone()[0]))
     while True:
         try:
             rows = await tools.inbox(hub, me, peek=True, wait_s=args.interval, types=tools.ACTIONABLE,
@@ -282,7 +284,7 @@ async def cmd_watch(args, hub: Hub):
         note = body.get("objective") or body.get("summary") or body.get("question") or body.get("reason") or ""
         text = f"{len(rows)} new: {first['type']} from {first['from']}: {str(note)[:120]}"
         _desktop_notify(f"mutmuas → {addr}", text, dry_run=args.dry_run)
-        cursor_file.write_text(max(r["received_at"] for r in rows))
+        cursor_file.write_text(str(max(r["seq"] for r in rows)))
 
 
 def _desktop_notify(title: str, text: str, dry_run: bool = False) -> None:

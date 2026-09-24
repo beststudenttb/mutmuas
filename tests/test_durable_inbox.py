@@ -134,3 +134,50 @@ async def test_renamed_and_retired_agents_leave_no_ghosts(make_config, cluster, 
     await asyncio.to_thread(cli.agent_node, ["retire", "--config", str(c.path), "--force"])
     assert not [x for x in await tools.list_agents(hub) if x["address"].startswith("C:")]
     assert "C" not in {n["node"] for n in await hub.nodes()}
+
+
+async def test_finishing_a_task_queues_its_result_atomically(tmp_path):
+    """A:codex bug-hunt finding 2: the terminal state and its RESULT/REJECT are written in one transaction."""
+    from mutmuas.config import AgentConfig, NodeConfig
+    from mutmuas.hub import Hub
+    from mutmuas.ledger import Ledger
+    cfg = NodeConfig(project="p", node="B", data_dir=str(tmp_path), agents=[AgentConfig(id="lab", mode="interactive")])
+    hub = Hub(cfg, None, Ledger(cfg.db_path))                    # no bus at all: nothing can be published
+    for task_id, how in (("T-ok", "finish"), ("T-no", "reject")):
+        req = Envelope(type="REQUEST", sender="A:main", to="B:lab", task_id=task_id, body=request_body("x", "y"))
+        hub.ledger.ingest(req)
+        hub.ledger.create_owned_task(req)
+        if how == "finish":
+            await hub.finish(task_id, {"status": "complete", "summary": "done"})
+        else:
+            await hub.owner_transition(task_id, "FAILED", "no", msg_type="REJECT", body={"reason": "no"})
+    queued = {(e.task_id, e.type) for e in hub.ledger.outbox()}
+    assert queued == {("T-ok", "RESULT"), ("T-no", "REJECT")}
+    assert hub.ledger.task("T-ok", "owner")["status"] == "COMPLETED"
+    # a refused transition (task already terminal) queues nothing
+    await hub.finish("T-ok", {"status": "failed", "summary": "again"})
+    assert len(hub.ledger.outbox()) == 2
+    hub.ledger.close()
+
+
+def test_recover_sees_every_open_task_and_rowid_cursor_misses_nothing(tmp_path):
+    """A:codex findings 3 and 4: >200 open tasks, and 51 messages within one millisecond."""
+    from mutmuas.ledger import Ledger
+    ledger = Ledger(tmp_path / "l.sqlite3")
+    for i in range(201):
+        req = Envelope(type="REQUEST", sender="A:main", to="B:lab", task_id=f"T-{i}", body=request_body("x", "y"))
+        ledger.create_owned_task(req)
+    assert len(ledger.tasks(role="owner", statuses=("PENDING",), limit=None)) == 201
+
+    same_ms = "2026-09-24T12:00:00.000+00:00"
+    for i in range(51):
+        env = Envelope(type="REQUEST", sender="A:main", to="B:lab", task_id=f"Q-{i}", body=request_body("x", "y"))
+        ledger.ingest(env)
+        ledger.db.execute("UPDATE messages SET state='handled', created_at=? WHERE message_id=?",
+                          (same_ms, env.message_id))
+    first = ledger.unseen("B:lab", limit=50, mark=False, since="0")
+    cursor = ledger.db.execute("SELECT rowid FROM messages WHERE message_id=?",
+                               (first[-1].message_id,)).fetchone()[0]
+    rest = ledger.unseen("B:lab", limit=50, mark=False, since=str(cursor))
+    assert len(first) == 50 and len(rest) == 1                 # the 51st is not lost
+    ledger.close()

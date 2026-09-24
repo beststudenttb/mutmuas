@@ -45,17 +45,6 @@ class TaskContext:
     def cwd(self) -> Path:
         return self.workdir or self.agent.workdir_path
 
-    def git_dir(self) -> str | None:
-        """For a code task in a git worktree: the main repo's .git, where commits are written.
-
-        The worktree's own directory holds only a pointer; objects and refs live in <repo>/.git, which is
-        outside the task's working directory, so sandboxed CLIs must be allowed to write there to commit.
-        """
-        if not (self.git_branch and self.agent.repo):
-            return None
-        git_dir = Path(self.agent.repo).expanduser().resolve() / ".git"
-        return str(git_dir) if git_dir.is_dir() else None
-
     def allows(self, permission: str) -> bool:
         """Least privilege per task: the agent's permission AND one this kind of request needs.
 
@@ -198,8 +187,6 @@ class ClaudeCodeRuntime(SubprocessRuntime):
             tools += ["Bash"]
         argv = ["claude", "-p", "--output-format", "json", "--mcp-config", str(cfg_path), "--strict-mcp-config",
                 "--allowedTools", ",".join(tools)]
-        if ctx.git_dir():
-            argv += ["--add-dir", ctx.git_dir()]
         if self.agent.model:
             argv += ["--model", self.agent.model]
         return argv + list(self.agent.extra_args), worker_prompt(ctx).encode()
@@ -227,9 +214,7 @@ class CodexRuntime(SubprocessRuntime):
                 "-c", f"mcp_servers.mutmuas.env={env_toml}",
                 # exec mode cannot prompt; pre-approve only our own server's tools
                 "-c", 'mcp_servers.mutmuas.default_tools_approval_mode="approve"',
-                *(["-c", "sandbox_workspace_write.network_access=true"] if writable and self.agent.network else []),
-                # found by A:codex-worker: without this the sandbox blocks `git commit` in the task's worktree
-                *(["--add-dir", ctx.git_dir()] if writable and ctx.git_dir() else [])]
+                *(["-c", "sandbox_workspace_write.network_access=true"] if writable and self.agent.network else [])]
         if self.agent.model:
             argv += ["-m", self.agent.model]
         return argv + list(self.agent.extra_args) + ["-"], worker_prompt(ctx).encode()
