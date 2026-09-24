@@ -3,13 +3,14 @@
 #
 #   deploy/codex/setup.sh --node A --server nats://150.89.170.193:4222 --credentials A.env --ca ca.crt \
 #       [--project mutmuas] [--config PATH] [--agent codex] [--worker] [--workdir DIR] \
-#       [--service] [--notifier] [--mcp] [--skip-install]
+#       [--service] [--notifier] [--wake-thread UUID] [--mcp] [--skip-install]
 #
 # One machine = one node; several assistants can live on it. This script never overwrites what another
 # assistant set up: it creates the node config only if missing, adds its own agents idempotently, and
 # restarts an existing node service without rewriting it. Changes outside this checkout require a flag:
 #   --service   install/restart the node daemon as a launchd (macOS) / systemd --user (Linux) service
 #   --notifier  install/restart desktop notifications for the interactive Codex agent
+#   --wake-thread queue a message to this Codex thread whenever the notifier sees new mail (macOS)
 #   --mcp       register the global Codex MCP entry named "mutmuas" for this node and identity
 set -euo pipefail
 
@@ -25,6 +26,7 @@ WORKER=0
 WORKDIR="$REPO"
 SERVICE=0
 NOTIFIER=0
+WAKE_THREAD=""
 MCP=0
 FORCE_MCP=0
 INSTALL=1
@@ -42,6 +44,8 @@ Configuration:
 Explicit host changes:
   --service     install/restart the shared node daemon
   --notifier    install/restart this Codex agent's desktop notifier
+  --wake-thread UUID
+                with --notifier, wake this existing Codex thread for new mail (macOS)
   --mcp         register Codex's global "mutmuas" MCP entry
   --force-mcp   allow --mcp to replace an entry belonging to another identity
 USAGE
@@ -60,6 +64,7 @@ while [ $# -gt 0 ]; do
     --worker) WORKER=1; shift ;;
     --service) SERVICE=1; shift ;;
     --notifier) NOTIFIER=1; shift ;;
+    --wake-thread) WAKE_THREAD="$2"; shift 2 ;;
     --mcp) MCP=1; shift ;;
     --force-mcp) FORCE_MCP=1; shift ;;
     --skip-install) INSTALL=0; shift ;;
@@ -198,6 +203,48 @@ load_unit() { # $1 is empty for the node daemon, or the agent id for a notifier
   fi
 }
 
+enable_codex_wake() {
+  [ "$(uname -s)" = Darwin ] || {
+    echo "--wake-thread currently requires macOS" >&2
+    exit 2
+  }
+  command -v codex >/dev/null 2>&1 || { echo "codex CLI is required for --wake-thread" >&2; exit 2; }
+
+  local label plist shared_agentctl codex_bin bridge
+  label="dev.mutmuas.$PROJECT.$NODE.watch-$AGENT"
+  plist="$HOME/Library/LaunchAgents/$label.plist"
+  shared_agentctl="$(node_service_agentctl)"
+  codex_bin="$(command -v codex)"
+  bridge="$REPO/deploy/codex/watch-and-wake.sh"
+  [ -x "$bridge" ] || chmod +x "$bridge"
+
+  "$BIN/python" - "$plist" "$bridge" "$shared_agentctl" "$CONFIG" "$NODE:$AGENT" \
+    "$codex_bin" "$WAKE_THREAD" <<'PY'
+import plistlib
+import sys
+
+plist, bridge, agentctl, config, agent, codex, thread = sys.argv[1:]
+with open(plist, "rb") as source:
+    data = plistlib.load(source)
+data["ProgramArguments"] = [bridge]
+environment = data.setdefault("EnvironmentVariables", {})
+environment.update(
+    MUTMUAS_AGENTCTL=agentctl,
+    MUTMUAS_CONFIG=config,
+    MUTMUAS_AGENT=agent,
+    CODEX_BIN=codex,
+    CODEX_THREAD=thread,
+)
+with open(plist, "wb") as target:
+    plistlib.dump(data, target)
+PY
+
+  launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$(id -u)" "$plist"
+  launchctl kickstart -k "gui/$(id -u)/$label"
+  echo "$label now wakes Codex thread $WAKE_THREAD"
+}
+
 if [ "$SERVICE" -eq 1 ]; then
   say "node service"
   load_unit ""
@@ -205,6 +252,11 @@ fi
 if [ "$NOTIFIER" -eq 1 ]; then
   say "notifier for $NODE:$AGENT"
   load_unit "$AGENT"
+fi
+if [ -n "$WAKE_THREAD" ]; then
+  [ "$NOTIFIER" -eq 1 ] || { echo "--wake-thread requires --notifier" >&2; exit 2; }
+  say "Codex inbox wake bridge"
+  enable_codex_wake
 fi
 
 if [ "$MCP" -eq 1 ]; then
