@@ -34,7 +34,7 @@ delegates, gets the result back and carries on.
 | Hub | `hub.py` | Node-local service layer shared by daemon/CLI/MCP: registry, send, task views, owner transitions |
 | Node daemon | `node.py` | Mailbox pulling, dispatch, task execution, heartbeats, outbox retry, crash recovery |
 | Runtimes | `runtime.py` | `script`, `claude-code` (`claude -p`), `codex` (`codex exec`). All subprocesses with timeout/cancel |
-| Worktrees | `worktree.py` | `kind: code` tasks run in a per-task git worktree; results come back as branch ref + patch |
+| Worktrees | `worktree.py` | `kind: code` tasks run in a per-task git worktree; results come back as branch ref + patch; the sandboxed CLI may write <repo>/.git so it can commit |
 | Artifacts | `artifacts.py` | `artifact://` (object store), `file://NODE/path`, `http(s)://`, `git://` refs; sha256 checks |
 | Agent tools | `tools.py`, `mcp_server.py` | find/list agents, send_request, wait/check, inbox, accept/reject, progress, submit_result, publish/fetch artifact |
 | CLI | `cli.py` | `agentctl` (use/inspect), `agent-node` (init/join/start/service/server-config/doctor) |
