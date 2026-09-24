@@ -237,7 +237,11 @@ class NodeDaemon:
         if agent.mode == "worker":
             await self._accept(env.task_id)
             self._enqueue(env.to, env.task_id)
-        # interactive agents accept explicitly through their inbox (accept_task)
+        else:
+            # Interactive agents accept explicitly (accept_task). Tell the requester it arrived meanwhile,
+            # so "delivered but not picked up yet" is distinguishable from "lost".
+            await hub.reply(env.to, env.task_id, "UPDATE", {
+                "state": "PENDING", "message": f"delivered to the inbox of {env.to}; waiting to be accepted"})
 
     def _check_policy(self, agent: AgentConfig, env: Envelope) -> str | None:
         if not agent.accepts(env.sender):
@@ -416,8 +420,9 @@ class NodeDaemon:
             running = [t for t in self._running if t in self._queued.get(addr, set())]
             owned_open = hub.ledger.tasks(role="owner", local_agent=addr,
                                           statuses=("PENDING", "ACCEPTED", "RUNNING", "WAITING", "BLOCKED"))
-            state = state_override or ("working" if running or (agent.mode == "interactive" and any(
-                t["status"] == "RUNNING" for t in owned_open)) else "idle")
+            if agent.mode == "interactive":      # an accepted task is RUNNING until its result is submitted
+                running = [t["task_id"] for t in owned_open if t["status"] == "RUNNING"]
+            state = state_override or ("working" if running else "idle")
             pending = None
             with contextlib.suppress(Exception):
                 pending = await bus.inbox_pending(Address(self.cfg.node, agent.id))
@@ -429,7 +434,8 @@ class NodeDaemon:
                 "accept_from": agent.accept_from, "resources": self.cfg.resources,
                 "state": state, "current_task": running[0] if running else None,
                 "open_tasks": len(owned_open), "queue": max(0, len(self._queued.get(addr, ())) - len(running)),
-                "inbox_unread": hub.ledger.count("in", "new", addr) + (pending or 0),
+                "inbox_unread": (hub.ledger.unseen_count(addr) if agent.mode == "interactive"
+                                 else hub.ledger.count("in", "new", addr) + (pending or 0)),
                 "heartbeat_s": self.cfg.heartbeat_s, "last_heartbeat": now})
 
     # ---- outbox -------------------------------------------------------

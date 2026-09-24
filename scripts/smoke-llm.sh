@@ -68,5 +68,10 @@ print('outputs:', r.get('outputs'))
 print('artifacts:', [a['uri'] for a in d.get('output_refs', [])])
 ok = (d.get('result_status') == 'complete' and d.get('output_refs')
       and 'answer is 42' in json.dumps(r.get('outputs', {})))
+if not ok:
+    for m in reversed(d.get('recent_messages', [])):
+        if m.get('type') in ('BLOCKED', 'ERROR', 'REJECT'):
+            print(f\"last {m['type']}: {m.get('note')}\")
+            break
 print('PASS' if ok else 'FAIL (see $W/B/data/runs/*.log)')
 sys.exit(0 if ok else 1)"

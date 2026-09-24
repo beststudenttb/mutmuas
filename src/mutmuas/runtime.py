@@ -203,7 +203,8 @@ class CodexRuntime(SubprocessRuntime):
                 "-c", f"mcp_servers.mutmuas.args={json.dumps(spec['args'])}",
                 "-c", f"mcp_servers.mutmuas.env={env_toml}",
                 # exec mode cannot prompt; pre-approve only our own server's tools
-                "-c", 'mcp_servers.mutmuas.default_tools_approval_mode="approve"']
+                "-c", 'mcp_servers.mutmuas.default_tools_approval_mode="approve"',
+                *(["-c", "sandbox_workspace_write.network_access=true"] if writable and self.agent.network else [])]
         if self.agent.model:
             argv += ["-m", self.agent.model]
         return argv + list(self.agent.extra_args) + ["-"], worker_prompt(ctx).encode()

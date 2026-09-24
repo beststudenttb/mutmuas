@@ -27,7 +27,11 @@ human to relay messages:
 - inbox shows requests and questions addressed to you. accept_task / reject_task / report_progress /
   submit_result are for tasks you own.
 - Large data never goes into messages: publish_artifact and send the reference.
-- RESULT status must be honest: complete, partial or failed."""
+- RESULT status must be honest: complete, partial or failed.
+- Accept a task (accept_task) before working on it, so others see you as WORKING on it.
+- Handle new messages at safe points (between steps), never by interrupting running work.
+  Priority high: handle at the next safe point. CANCEL/ANSWER for your current task: next safe point.
+  A new REQUEST while busy: it waits in your inbox; the requester already sees it as delivered."""
 
 
 def build_server(cfg: NodeConfig, me: str | None) -> MCPServer:
@@ -97,9 +101,16 @@ def build_server(cfg: NodeConfig, me: str | None) -> MCPServer:
         return dump(await tools.cancel_task(hub(), state["me"], task_id, reason))
 
     @server.tool()
-    async def inbox(include_seen: bool = False) -> str:
-        """Messages addressed to you (new requests, questions, answers, results)."""
-        return dump(await tools.inbox(hub(), state["me"], include_seen))
+    async def inbox(include_seen: bool = False, peek: bool = False) -> str:
+        """Messages addressed to you (new requests, questions, answers, results).
+        peek=True leaves them unread (for a watcher that only decides whether to wake you)."""
+        return dump(await tools.inbox(hub(), state["me"], include_seen, peek=peek))
+
+    @server.tool()
+    async def wait_for_message(timeout_s: float = 600, peek: bool = False) -> str:
+        """Block until at least one unread message arrives for you (or timeout_s passes), then return them.
+        Returns [] on timeout. Use it instead of polling inbox in a loop."""
+        return dump(await tools.inbox(hub(), state["me"], peek=peek, wait_s=timeout_s))
 
     @server.tool()
     async def accept_task(task_id: str) -> str:
@@ -138,11 +149,13 @@ def build_server(cfg: NodeConfig, me: str | None) -> MCPServer:
         return dump(await tools.answer(hub(), state["me"], task_id, answer))
 
     @server.tool()
-    async def publish_artifact(path: str, description: str = "", backend: str = "object") -> str:
+    async def publish_artifact(path: str, description: str = "", backend: str = "object",
+                               task_id: str | None = None) -> str:
         """Upload a file or directory and get a reference to put in messages.
-        backend='object' copies it into the shared store; backend='file' only references a local path."""
+        backend='object' copies it into the shared store; backend='file' only references a local path.
+        task_id files it under that task (defaults to the task you are running, if any)."""
         return dump(await tools.publish_artifact(hub(), state["me"], path, description=description,
-                                                 backend=backend))
+                                                 backend=backend, task_id=task_id))
 
     @server.tool()
     async def fetch_artifact(uri: str, dest_dir: str | None = None, sha256: str | None = None) -> str:

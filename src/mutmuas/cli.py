@@ -13,6 +13,7 @@ import logging
 import os
 import shutil
 import signal
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -140,7 +141,7 @@ async def cmd_ask(args, hub: Hub):
     out = await tools.send_request(
         hub, _me(args), args.to, args.objective, args.reason or "requested via agentctl", kind=args.kind,
         inputs=_parse_kv(args.input) or None, expected_outputs=args.expect, acceptance_criteria=args.accept,
-        constraints=args.constraint, timeout_s=args.timeout)
+        constraints=args.constraint, timeout_s=args.timeout, priority=args.priority)
     if args.wait is not None:
         out = await tools.wait_for_result(hub, out["task_id"], args.wait)
     _print(out, args.json)
@@ -219,14 +220,17 @@ async def cmd_result(args, hub: Hub):
 
 
 async def cmd_inbox(args, hub: Hub):
-    rows = await tools.inbox(hub, _me(args), include_seen=args.all)
+    rows = await tools.inbox(hub, _me(args), include_seen=args.all, peek=args.peek, wait_s=args.wait)
     if args.json:
-        return _print(rows, True)
-    if not rows:
+        _print(rows, True)
+    elif not rows:
         print("inbox empty")
     for m in rows:
-        print(f"{m['timestamp']}  {m['type']:<8} from {m['from']:<24} task {m['task_id']}  "
-              f"{tools._note({'body': m['body']})[:80]}")
+        if not args.json:
+            print(f"{m['timestamp']}  {m['type']:<8} from {m['from']:<24} task {m['task_id']}  "
+                  f"{tools._note({'body': m['body']})[:80]}")
+    if args.wait is not None and not rows:
+        raise SystemExit(3)      # timed out: lets a watcher loop tell "nothing yet" from "new mail"
 
 
 async def cmd_cancel(args, hub: Hub):
@@ -268,7 +272,7 @@ async def cmd_answer(args, hub: Hub):
 async def cmd_artifact(args, hub: Hub):
     if args.action == "publish":
         out = await tools.publish_artifact(hub, _me(args), args.target, key=args.key, description=args.description,
-                                           backend=args.backend)
+                                           backend=args.backend, task_id=args.task)
     elif args.action == "fetch":
         out = await tools.fetch_artifact(hub, args.target, args.dest)
     else:
@@ -402,8 +406,16 @@ def node_server_config(args):
 def node_service(args):
     """Print (or write) a launchd plist / systemd unit that runs `agent-node start`."""
     cfg_path = find_config(args.config).resolve()
-    exe = shutil.which("agent-node") or f"{sys.executable} -m mutmuas.cli node"
-    argv = exe.split() + ["start", "--config", str(cfg_path)]
+    cfg = load_config(cfg_path)
+    venv_bin = Path(sys.executable).parent
+    exe = venv_bin / "agent-node"
+    argv = ([str(exe)] if exe.exists() else [sys.executable, "-m", "mutmuas.cli", "node"]) + [
+        "start", "--config", str(cfg_path)]
+    # A minimal PATH: the venv, wherever the agent CLIs live, and system dirs. Copying the caller's PATH
+    # would leak e.g. an activated conda env into every worker.
+    dirs = [str(venv_bin)] + [str(Path(p).parent) for p in (shutil.which("claude"), shutil.which("codex")) if p]
+    dirs += ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    path_env = ":".join(dict.fromkeys(d for d in dirs if Path(d).is_dir()))
     if sys.platform == "darwin":
         label = "dev.mutmuas.agent-node"
         items = "\n".join(f"    <string>{a}</string>" for a in argv)
@@ -418,7 +430,7 @@ def node_service(args):
 {items}
   </array>
   <key>EnvironmentVariables</key>
-  <dict><key>PATH</key><string>{os.environ.get('PATH', '/usr/bin:/bin')}</string></dict>
+  <dict><key>PATH</key><string>{path_env}</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>
@@ -430,16 +442,18 @@ def node_service(args):
         target = Path.home() / "Library/LaunchAgents" / f"{label}.plist"
         hint = f"launchctl bootstrap gui/$(id -u) {target}\nlaunchctl kickstart -k gui/$(id -u)/{label}"
     else:
+        nats_unit = Path.home() / ".config/systemd/user/mutmuas-nats-server.service"
+        local_server = any(h in srv for srv in cfg.nats.servers for h in ("127.0.0.1", "localhost", "[::1]"))
+        order = ("After=mutmuas-nats-server.service\nWants=mutmuas-nats-server.service\n"
+                 if local_server and (nats_unit.exists() or args.after_nats) else "")
         text = f"""[Unit]
 Description=mutmuas agent-node ({cfg_path})
-After=network-online.target
-Wants=network-online.target
-
+{order}
 [Service]
 ExecStart={' '.join(argv)}
 Restart=always
 RestartSec=5
-Environment=PATH={os.environ.get('PATH', '/usr/bin:/bin')}
+Environment=PATH={path_env}
 KillMode=mixed
 TimeoutStopSec=30
 
@@ -466,6 +480,12 @@ def node_doctor(args):
         found = shutil.which(tool) if tool else "-"
         print(f"agent     {cfg.node}:{agent.id}  mode={agent.mode} runtime={agent.runtime} "
               f"cli={'ok' if found else 'MISSING ' + str(tool)}  workdir={agent.workdir_path}")
+        if agent.runtime == "codex" and sys.platform.startswith("linux"):
+            ok = subprocess.run(["unshare", "-Ur", "true"], capture_output=True).returncode == 0
+            if not ok:
+                print("          WARNING: unprivileged user namespaces are blocked (unshare -Ur fails), so Codex's "
+                      "bubblewrap sandbox cannot run shell commands. Run Codex workers on macOS, or ask root "
+                      "for an AppArmor profile for bwrap (see docs/DEPLOYMENT.md)")
 
     async def check():
         hub = await Hub.open(cfg, "doctor", reconnect=False)
@@ -519,6 +539,7 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--expect", action="append", help="expected output (repeatable)")
     p.add_argument("--accept", action="append", help="acceptance criterion (repeatable)")
     p.add_argument("--constraint", action="append", help="constraint on how to do it (repeatable)")
+    p.add_argument("--priority", default="normal", choices=["low", "normal", "high"])
     p.add_argument("--timeout", type=float, help="task timeout on the owner side (s)")
     p.add_argument("--wait", type=float, nargs="?", const=600, help="wait for the result (s)")
     p = add("send", cmd_send, "send a message from a YAML file", bus=False)
@@ -538,6 +559,9 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--fetch", metavar="DIR", help="download result artifacts into DIR")
     p = add("inbox", cmd_inbox, "messages addressed to me", bus=False)
     p.add_argument("--all", action="store_true", help="include already seen messages")
+    p.add_argument("--peek", action="store_true", help="do not mark messages as read")
+    p.add_argument("--wait", type=float, nargs="?", const=3600, metavar="SECONDS",
+                   help="block until a message arrives (default up to 3600 s); exit code 3 on timeout")
     p = add("cancel", cmd_cancel, "cancel a task I requested", bus=False)
     p.add_argument("task_id")
     p.add_argument("--reason")
@@ -568,6 +592,7 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--key")
     p.add_argument("--description", default="")
     p.add_argument("--backend", default="object", choices=["object", "file"])
+    p.add_argument("--task", help="file the artifact under this task id")
     p.add_argument("--dest")
     p = add("history", cmd_history, "raw audit trail from the message stream")
     p.add_argument("--task")
@@ -617,6 +642,9 @@ def agent_node_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("service", help="launchd (macOS) / systemd (Linux) unit for the daemon")
     p.add_argument("--config")
     p.add_argument("--write", action="store_true", help="write the unit file instead of printing it")
+    p.add_argument("--after-nats", action="store_true",
+                   help="Linux: order after mutmuas-nats-server.service (automatic when that unit exists "
+                        "and the node connects to 127.0.0.1)")
     p.set_defaults(sync=node_service)
     p = sub.add_parser("doctor", help="check config, CLIs and connectivity")
     p.add_argument("--config")

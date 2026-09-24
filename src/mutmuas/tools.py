@@ -7,6 +7,7 @@ Codex (via MCP) and from scripts/humans (via ``agentctl``).
 
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 from typing import Any
@@ -20,8 +21,9 @@ def _current_task() -> str | None:
 
 
 def card_summary(card: dict[str, Any]) -> dict[str, Any]:
-    keys = ("address", "display", "role", "mode", "runtime", "provider", "model", "capabilities", "state",
-            "online", "current_task", "queue", "inbox_unread", "last_heartbeat", "description")
+    keys = ("address", "display", "role", "mode", "runtime", "provider", "model", "capabilities", "permissions",
+            "accept_from", "state", "online", "current_task", "queue", "inbox_unread", "last_heartbeat",
+            "description")
     return {k: card.get(k) for k in keys if card.get(k) not in (None, "", [])}
 
 
@@ -89,14 +91,22 @@ async def wait_for_result(hub: Hub, task_id: str, timeout_s: float = 600) -> dic
     return _brief(await hub.wait_result(task_id, timeout_s))
 
 
-async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50) -> list[dict[str, Any]]:
+async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, peek: bool = False,
+                wait_s: float | None = None) -> list[dict[str, Any]]:
+    """Unread messages for ``me``. peek: do not mark them read. wait_s: block until one arrives (or timeout)."""
     addr, _ = hub.local_agent(me)
+    if wait_s and not include_seen:
+        # Messages reach this node's ledger through the daemon, so waiting on the ledger is enough
+        # (a second JetStream consumer on the same mailbox would split the messages).
+        deadline = asyncio.get_running_loop().time() + wait_s
+        while hub.ledger.unseen_count(str(addr)) == 0 and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.5)
     if include_seen:
         rows = hub.ledger.db.execute("SELECT envelope FROM messages WHERE direction='in' AND local_agent=?"
                                      " ORDER BY rowid DESC LIMIT ?", (str(addr), limit)).fetchall()
         envs = [Envelope.from_json(r["envelope"]) for r in rows]
     else:
-        envs = hub.ledger.unseen(str(addr), limit)
+        envs = hub.ledger.unseen(str(addr), limit, mark=not peek)
     return [{"message_id": e.message_id, "type": e.type, "from": e.sender, "task_id": e.task_id,
              "timestamp": e.timestamp, "body": e.body, "artifacts": [a.to_dict() for a in e.artifacts]}
             for e in envs]
@@ -173,14 +183,15 @@ async def cancel_task(hub: Hub, me: str, task_id: str, reason: str = "") -> dict
 
 
 async def publish_artifact(hub: Hub, me: str, path: str, *, key: str | None = None, id: str = "",
-                           description: str = "", backend: str = "object") -> dict[str, Any]:
+                           description: str = "", backend: str = "object",
+                           task_id: str | None = None) -> dict[str, Any]:
     addr, agent = hub.local_agent(me)
     if not agent.has("PUBLISH_ARTIFACT"):
         raise PermissionError(f"{addr} lacks PUBLISH_ARTIFACT permission")
     src = Path(path).expanduser()
     if not src.is_absolute():
         src = (Path.cwd() / src)
-    key = key or f"{addr.node}/{addr.agent}/{_current_task() or 'adhoc'}/{src.name}"
+    key = key or f"{addr.node}/{addr.agent}/{task_id or _current_task() or 'adhoc'}/{src.name}"
     ref = await hub.artifacts.publish(src, key, id=id, description=description, backend=backend)
     return ref.to_dict()
 

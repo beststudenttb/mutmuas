@@ -66,7 +66,9 @@ async def test_request_to_interactive_agent_roundtrip(make_config, cluster):
     result = await tools.wait_for_result(hub_a, task_id, 10)
     assert result["status"] == "COMPLETED" and result["result_status"] == "complete"
     assert result["result"]["outputs"] == {"lr": 3e-4}
-    assert thread_types(hub_a, task_id) == ["REQUEST", "ACK", "QUESTION", "ANSWER", "RESULT"]
+    assert thread_types(hub_a, task_id) == ["REQUEST", "UPDATE", "ACK", "QUESTION", "ANSWER", "RESULT"]
+    delivered = [m for m in hub_a.ledger.thread(task_id) if m["type"] == "UPDATE"][0]
+    assert delivered["body"]["state"] == "PENDING" and "waiting to be accepted" in delivered["body"]["message"]
 
     # Both sides and any third party see the same record in the shared task ledger.
     records = await hub_a.all_tasks()
@@ -128,3 +130,34 @@ async def test_inbox_only_shows_requests_that_can_be_accepted(make_config, clust
     denied = await tools.send_request(hub_a, "A:main", "B:private", "q", "should be rejected")
     await tools.wait_for_result(hub_a, denied["task_id"], 20)
     assert await tools.inbox(hub_b, "B:private") == []
+
+
+async def test_interactive_inbox_peek_wait_and_working_state(make_config, cluster):
+    """peek leaves mail unread; wait blocks until mail arrives; an accepted task shows the agent as WORKING."""
+    import asyncio
+    a = make_config("A", [interactive("main")])
+    b = make_config("B", [interactive("coder")])
+    await cluster.start(a)
+    await cluster.start(b)
+    hub_a = await cluster.client(a)
+    hub_b = await cluster.client(b)
+
+    assert await tools.inbox(hub_b, "B:coder", wait_s=0.5) == []            # times out empty
+    waiter = asyncio.create_task(tools.inbox(hub_b, "B:coder", peek=True, wait_s=20))
+    await asyncio.sleep(0.3)
+    sent = await tools.send_request(hub_a, "A:main", "B:coder", "q", "wait test")
+    peeked = await waiter
+    assert [m["task_id"] for m in peeked] == [sent["task_id"]]
+    assert [m["task_id"] for m in await tools.inbox(hub_b, "B:coder")] == [sent["task_id"]]   # still unread
+    assert await tools.inbox(hub_b, "B:coder") == []                                         # now read
+
+    await tools.accept_task(hub_b, "B:coder", sent["task_id"])
+    card = await eventually(lambda: _card_if(hub_a, "B:coder", "working"), what="WORKING in registry")
+    assert card["current_task"] == sent["task_id"]
+    await tools.submit_result(hub_b, "B:coder", "complete", "done", task_id=sent["task_id"])
+    await eventually(lambda: _card_if(hub_a, "B:coder", "idle"), what="back to IDLE")
+
+
+async def _card_if(hub, address, state):
+    card = await hub.agent_card(address)
+    return card if card and card.get("state") == state else None

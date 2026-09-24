@@ -183,6 +183,10 @@ class Ledger:
                                [(r["message_id"],) for r in rows])
         return [Envelope.from_json(r["envelope"]) for r in rows]
 
+    def unseen_count(self, local_agent: str) -> int:
+        return self.db.execute("SELECT COUNT(*) FROM messages WHERE direction='in' AND seen=0 AND state='handled'"
+                               " AND local_agent=?", (local_agent,)).fetchone()[0]
+
     def count(self, direction: str, state: str, local_agent: str | None = None) -> int:
         sql = "SELECT COUNT(*) FROM messages WHERE direction=? AND state=?"
         args: list[Any] = [direction, state]
