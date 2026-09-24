@@ -22,7 +22,9 @@ such as "run `agentctl status`" in place of "B:main is the research agent".
 - open tasks X owns, with their state and last update;
 - open tasks X requested, and who is on each one;
 - results and FYIs received since the cursor;
-- the leader's messages since the cursor, verbatim;
+- instructions the secretary relayed from the leader since the cursor, verbatim. The leader talks to sessions
+  directly, not over mutmuas, so the leader's words reach the ledger only when they are relayed. For F1 the
+  secretary relays them with an `outputs.leader_quote` field;
 - active pauses, and which peers are offline;
 - whether this agent's watcher is running, plus the exact command to re-arm it.
 
