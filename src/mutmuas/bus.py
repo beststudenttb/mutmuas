@@ -19,6 +19,7 @@ The sender's node id is part of the subject so the server can enforce
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import ssl
@@ -213,6 +214,18 @@ class Bus:
                 description=f"mailbox of {agent}",
             ))
         return await self.js.pull_subscribe_bind(durable=durable, stream=self.names.stream)
+
+    async def remove_agent(self, agent: Address, force: bool = False) -> str:
+        """Forget an agent that no longer exists: its registry card, and its mailbox if nothing is waiting in it."""
+        with contextlib.suppress(Exception):
+            await self.kv_delete(self.names.agents_kv, f"{agent.node}.{agent.agent}")
+        pending = await self.inbox_pending(agent)
+        if pending is None:
+            return "card removed"
+        if pending and not force:
+            return f"card removed; mailbox kept: {pending} message(s) still waiting"
+        await self.js.delete_consumer(self.names.stream, self.names.consumer(agent))
+        return "card and mailbox removed"
 
     async def inbox_pending(self, agent: Address) -> int | None:
         try:

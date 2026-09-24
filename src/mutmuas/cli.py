@@ -25,7 +25,7 @@ from . import __version__, tools
 from .bus import Bus, BusUnavailable
 from .config import ConfigError, NodeConfig, dump_config, find_config, load_config
 from .hub import Hub, is_online
-from .ids import parse_iso
+from .ids import Address, parse_iso
 from .protocol import ArtifactRef, Envelope, ProtocolError
 
 # --------------------------------------------------------------------------- helpers
@@ -486,6 +486,29 @@ WantedBy=default.target
         print(f"# save to {target} (or re-run with --write), then:\n# " + hint.replace("\n", "\n# "))
 
 
+def node_retire(args):
+    """Take a whole node out of the network: remove its agents' cards, its node card and empty mailboxes."""
+    cfg = _cfg(args)
+
+    async def run():
+        bus = await Bus.open(cfg.nats, cfg.project, f"mutmuas:{cfg.node}:retire", reconnect=False)
+        try:
+            node = await bus.kv_get(bus.names.nodes_kv, cfg.node)
+            if node and is_online(node) and not args.force:
+                raise SystemExit(f"error: node {cfg.node} is still online; stop its daemon first (or --force)")
+            keys = await bus.kv_keys(bus.names.agents_kv, [f"{cfg.node}.*"])
+            for key in keys:
+                agent = Address(cfg.node, key.split(".", 1)[1])
+                print(f"{agent}: {await bus.remove_agent(agent, force=args.force)}")
+            await bus.kv_delete(bus.names.nodes_kv, cfg.node)
+            print(f"node {cfg.node}: card removed. Ask the server admin to remove user node_{cfg.node} "
+                  "(server-config without this node, then reload) so its credentials stop working.")
+        finally:
+            await bus.close()
+
+    asyncio.run(run())
+
+
 def node_doctor(args):
     cfg = _cfg(args)
     print(f"config    {cfg.path}\nproject   {cfg.project}\nnode      {cfg.node}\ndata      {cfg.data_path}")
@@ -665,6 +688,10 @@ def agent_node_parser() -> argparse.ArgumentParser:
                    help="Linux: order after mutmuas-nats-server.service (automatic when that unit exists "
                         "and the node connects to 127.0.0.1)")
     p.set_defaults(sync=node_service)
+    p = sub.add_parser("retire", help="take this node out of the network (cards + empty mailboxes)")
+    p.add_argument("--config")
+    p.add_argument("--force", action="store_true", help="also while online / drop waiting messages")
+    p.set_defaults(sync=node_retire)
     p = sub.add_parser("doctor", help="check config, CLIs and connectivity")
     p.add_argument("--config")
     p.set_defaults(sync=node_doctor)

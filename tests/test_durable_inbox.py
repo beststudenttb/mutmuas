@@ -5,6 +5,7 @@ import asyncio
 from conftest import eventually, interactive, worker
 
 from mutmuas import tools
+from mutmuas.ids import Address
 from mutmuas.protocol import Envelope, request_body
 
 
@@ -100,3 +101,36 @@ def test_ledger_migrates_v1_schema(tmp_path):
     assert ledger.ingest(env) is False           # but real duplicates still are
     ledger.close()
     Ledger(tmp_path / "ledger.sqlite3").close()  # idempotent on the migrated schema
+
+
+async def test_renamed_and_retired_agents_leave_no_ghosts(make_config, cluster, tmp_path):
+    """Renaming an agent (A:main -> A:claude) or retiring a node removes stale cards and empty mailboxes."""
+    import yaml as _yaml
+
+    from mutmuas import cli
+    a = make_config("A", [interactive("main")])
+    c = make_config("C", [interactive("main"), interactive("load")])
+    await cluster.start(a)
+    await cluster.start(c)
+    hub = await cluster.client(a)
+    names = {x["address"] for x in await tools.list_agents(hub)}
+    assert {"A:main", "C:main", "C:load"} <= names
+
+    # rename A:main -> A:claude (keeping the old name as display alias)
+    await cluster.stop("A")
+    raw = _yaml.safe_load(a.path.read_text())
+    raw["agents"][0].update(id="claude", display="A:main")
+    a.path.write_text(_yaml.safe_dump(raw))
+    from mutmuas.config import load_config
+    await cluster.start(load_config(a.path))
+    names = {x["address"] for x in await tools.list_agents(hub)}
+    assert "A:main" not in names and "A:claude" in names
+    assert await hub.resolve("A:main") == "A:claude"               # old name still reaches the agent
+    assert await hub.bus.inbox_pending(Address("A", "main")) is None  # empty mailbox removed
+
+    # retire node C entirely
+    await cluster.stop("C")
+    import asyncio
+    await asyncio.to_thread(cli.agent_node, ["retire", "--config", str(c.path), "--force"])
+    assert not [x for x in await tools.list_agents(hub) if x["address"].startswith("C:")]
+    assert "C" not in {n["node"] for n in await hub.nodes()}

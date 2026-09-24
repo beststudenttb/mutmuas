@@ -90,6 +90,7 @@ class NodeDaemon:
         self._spawn(self._outbox_loop(), "outbox")
         await self.recover()
         await self._publish_cards()
+        await self._forget_removed_agents()
         self.started.set()
         log.info("node %s up: project=%s agents=%s", self.cfg.node, self.cfg.project,
                  [a.id for a in self.cfg.agents])
@@ -134,6 +135,16 @@ class NodeDaemon:
             return
         if task.exception():
             log.error("loop %s crashed: %r", task.get_name(), task.exception())
+
+    async def _forget_removed_agents(self) -> None:
+        """Agents deleted from the config (e.g. renamed) must not linger in the registry as ghosts."""
+        bus = self.hub.bus
+        configured = {a.id for a in self.cfg.agents}
+        for key in await bus.kv_keys(bus.names.agents_kv, [f"{self.cfg.node}.*"]):
+            agent_id = key.split(".", 1)[1]
+            if agent_id not in configured:
+                outcome = await bus.remove_agent(Address(self.cfg.node, agent_id))
+                log.warning("agent %s:%s is no longer configured: %s", self.cfg.node, agent_id, outcome)
 
     # ---- recovery -----------------------------------------------------
 
