@@ -39,6 +39,17 @@ from .worktree import GitError, Worktree
 
 log = logging.getLogger(__name__)
 
+
+def _code_version() -> str:
+    """The git commit this daemon runs from (what 'same version on every node' is checked against)."""
+    import subprocess
+    try:
+        out = subprocess.run(["git", "-C", str(Path(__file__).resolve().parent), "describe", "--always", "--dirty"],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() or __version__
+    except Exception:
+        return __version__
+
 # How a reply received by the *requester* moves its local task state.
 REQUESTER_TRANSITIONS = {"ACK": "ACCEPTED", "BLOCKED": "BLOCKED", "QUESTION": "WAITING", "REJECT": "FAILED",
                          "ERROR": "FAILED"}
@@ -56,6 +67,7 @@ class NodeDaemon:
         self._cancel_requested: set[str] = set()
         self._outbox_wake = asyncio.Event()
         self.started = asyncio.Event()
+        self.code_version = _code_version()
         self._stopping = False
 
     # ---- lifecycle ----------------------------------------------------
@@ -434,7 +446,8 @@ class NodeDaemon:
             "node": self.cfg.node, "project": self.cfg.project, "description": self.cfg.description,
             "hostname": socket.gethostname(), "platform": f"{platform.system()} {platform.machine()}",
             "resources": self.cfg.resources, "agents": [a.id for a in self.cfg.agents],
-            "version": __version__, "heartbeat_s": self.cfg.heartbeat_s, "last_heartbeat": now,
+            "version": __version__, "code": self.code_version, "heartbeat_s": self.cfg.heartbeat_s,
+            "last_heartbeat": now,
             "state": state_override or "online",
             "outbox_queued": hub.ledger.count("out", "queued")})
         for agent in self.cfg.agents:
