@@ -1,0 +1,22 @@
+# systemd *user* unit for the NATS server — no sudo needed (Linux).
+# Assumes the repo at ~/mutmuas (nats-server from scripts/install.sh) and the config from
+#   agent-node server-config ... --out ~/mutmuas-server --store-dir ~/mutmuas-server/jetstream
+# Adjust the two paths below if yours differ (%h = your home directory).
+#
+#   mkdir -p ~/.config/systemd/user && cp deploy/nats-server.user.service ~/.config/systemd/user/mutmuas-nats-server.service
+#   systemctl --user daemon-reload && systemctl --user enable --now mutmuas-nats-server
+#   loginctl enable-linger "$USER"      # keep user services running with nobody logged in, and start them at boot
+[Unit]
+Description=NATS server (mutmuas message bus, user service)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/mutmuas/.local/bin/nats-server -c %h/mutmuas-server/nats-server.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target

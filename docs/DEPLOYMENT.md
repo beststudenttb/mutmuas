@@ -79,6 +79,22 @@ sudo systemctl daemon-reload && sudo systemctl enable --now nats-server
 systemctl status nats-server --no-pager
 ```
 
+**Linux, native + systemd user service (no sudo):** the same server as a user service. Needs only
+`loginctl enable-linger`, which Ubuntu lets a user run for themselves (check with
+`pkaction --action-id org.freedesktop.login1.set-self-linger --verbose`: `implicit any: yes`).
+Keep `--store-dir` under your home, e.g. `~/mutmuas-server/jetstream`.
+```bash
+mkdir -p ~/.config/systemd/user
+cp deploy/nats-server.user.service ~/.config/systemd/user/mutmuas-nats-server.service   # edit paths if not ~/mutmuas, ~/mutmuas-server
+systemctl --user daemon-reload && systemctl --user enable --now mutmuas-nats-server
+loginctl enable-linger "$USER"          # run with nobody logged in, start at boot
+systemctl --user status mutmuas-nats-server --no-pager
+journalctl --user -u mutmuas-nats-server -f
+```
+If the node daemon runs on the same machine, order it after the server with the drop-in
+`deploy/agent-node-after-nats.conf` (see section 3). Reload after adding a node: `systemctl --user reload mutmuas-nats-server`.
+Processes started earlier with `nohup` must be stopped first (by PID), or the service cannot bind 4222.
+
 **Docker Compose** (generate with `--store-dir /data/jetstream --listen 0.0.0.0`, and publish the port
 only on the overlay IP):
 ```bash
@@ -113,6 +129,23 @@ systemctl --user daemon-reload && systemctl --user enable --now mutmuas-agent-no
 loginctl enable-linger "$USER"
 journalctl --user -u mutmuas-agent-node -f      # or: tail -f ~/.mutmuas/visual_rl/B/node.log
 ```
+
+On the machine that also runs NATS as a user service, start the node after it:
+```bash
+mkdir -p ~/.config/systemd/user/mutmuas-agent-node.service.d
+cp deploy/agent-node-after-nats.conf ~/.config/systemd/user/mutmuas-agent-node.service.d/after-nats.conf
+systemctl --user daemon-reload
+```
+Check the generated unit before enabling it: `ExecStart` falls back to `python -m mutmuas.cli node` when
+`agent-node` is not on `PATH`, and `Environment=PATH=` is copied from the shell you ran it in (for example an
+activated conda env would leak into every worker). Run `agent-node service --write` from a clean shell with
+`~/mutmuas/.venv/bin` on `PATH`.
+
+**Linux: Codex workers need unprivileged user namespaces.** Codex sandboxes shell commands with bubblewrap.
+Ubuntu 24.04 blocks this by default (`sysctl kernel.apparmor_restrict_unprivileged_userns` = 1), so every shell
+command of a `runtime: codex` worker fails with `bwrap: setting up uid map: Permission denied`. Check with
+`unshare -Ur true`. Without root, run Codex workers on macOS nodes and Claude Code workers on Linux. With root,
+allow user namespaces for `/usr/bin/bwrap` through an AppArmor profile.
 
 ## 4. Join a macOS node (A)
 
