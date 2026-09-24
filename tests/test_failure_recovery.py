@@ -50,6 +50,9 @@ async def test_agent_process_crash_is_reported_failed(make_config, cluster):
     result = await tools.wait_for_result(hub, await _request(hub, "B:lab", {"action": "crash"}), 30)
     assert result["status"] == "FAILED" and result["result_status"] == "failed"
     assert "exit code 3" in result["result"]["summary"]
+    # the reason from the process's stderr reaches the requester (e.g. a CLI out of credits)
+    assert "about to crash" in result["result"]["summary"]
+    assert "about to crash" in " ".join(result["result"]["outputs"]["error_lines"])
 
 
 async def test_unstructured_or_dishonest_results_are_not_complete(make_config, cluster):

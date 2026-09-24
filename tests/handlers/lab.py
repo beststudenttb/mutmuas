@@ -79,7 +79,7 @@ elif action == "sleep":
     print(json.dumps({"status": "complete", "summary": "slept"}))
 
 elif action == "crash":
-    print("about to crash", file=sys.stderr)
+    print("fatal error: about to crash", file=sys.stderr)
     sys.exit(3)
 
 elif action == "noresult":
