@@ -56,8 +56,20 @@ def _ago(ts: str | None) -> str:
     return f"{secs:.0f}s ago"
 
 
-async def _with_hub(args, fn, *, require_bus: bool = True):
-    hub = await Hub.open(_cfg(args), "cli", require_bus=require_bus, reconnect=False)
+async def _with_hub(args, fn, *, require_bus: bool = True, watch: bool = False):
+    cfg = _cfg(args)
+    delay = 1
+    while True:
+        try:
+            hub = await Hub.open(cfg, "cli", require_bus=require_bus, reconnect=watch,
+                                 initial_connect_attempts=1 if watch else None)
+            break
+        except BusUnavailable as e:
+            if not watch:
+                raise
+            print(f"{datetime.now():%F %T} watch: NATS unavailable: {e}; retrying in {delay} s", flush=True)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30)
     try:
         return await fn(hub)
     finally:
@@ -817,7 +829,8 @@ def _run(parser: argparse.ArgumentParser, argv: list[str] | None) -> None:
     try:
         if getattr(args, "sync", None):
             return args.sync(args)
-        asyncio.run(_with_hub(args, lambda hub: args.fn(args, hub), require_bus=args.bus))
+        asyncio.run(_with_hub(args, lambda hub: args.fn(args, hub), require_bus=args.bus,
+                              watch=args.fn is cmd_watch))
     except (ConfigError, BusUnavailable, PermissionError, ProtocolError, KeyError, ValueError) as e:
         raise SystemExit(f"error: {e}")
 
@@ -835,4 +848,3 @@ if __name__ == "__main__":   # python -m mutmuas.cli [node] ...
         agent_node(sys.argv[2:])
     else:
         agentctl()
-

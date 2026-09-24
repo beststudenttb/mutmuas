@@ -36,11 +36,12 @@ class Hub:
 
     @classmethod
     async def open(cls, cfg: NodeConfig, client_name: str, *, require_bus: bool = True,
-                   reconnect: bool = True) -> Hub:
+                   reconnect: bool = True, initial_connect_attempts: int | None = None) -> Hub:
         ledger = Ledger(cfg.db_path)
         try:
             bus = await Bus.open(cfg.nats, cfg.project, f"mutmuas:{cfg.node}:{client_name}",
-                                 cfg.message_retention_days, reconnect=reconnect)
+                                 cfg.message_retention_days, reconnect=reconnect,
+                                 initial_connect_attempts=initial_connect_attempts)
         except BusUnavailable:
             if require_bus:
                 ledger.close()
@@ -315,4 +316,3 @@ def _note(m: dict[str, Any]) -> str:
         if body.get(key):
             return str(body[key])[:200]
     return ""
-

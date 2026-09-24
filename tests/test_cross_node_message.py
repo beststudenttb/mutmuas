@@ -1,6 +1,6 @@
 """Two nodes find each other through the registry and exchange structured messages."""
 
-from conftest import eventually, interactive, thread_types, worker
+from conftest import NatsServer, eventually, interactive, thread_types, worker
 
 from mutmuas import tools
 from mutmuas.protocol import Envelope
@@ -230,6 +230,49 @@ async def test_notifier_announces_each_new_message_once(make_config, cluster, tm
         proc.terminate()
         proc.wait(5)
         log.close()
+
+
+async def test_notifier_waits_for_nats_at_startup(make_config, cluster, tmp_path):
+    """watch stays alive until NATS starts, then announces a new request."""
+    import asyncio
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    import yaml
+
+    from mutmuas.config import load_config
+
+    server = NatsServer(tmp_path / "late-jetstream")
+    cfg = make_config("A", [interactive("main"), interactive("coder")])
+    data = yaml.safe_load(cfg.path.read_text())
+    data["nats"]["servers"] = [server.url]
+    cfg.path.write_text(yaml.safe_dump(data))
+    cfg = load_config(cfg.path)
+
+    agentctl = Path(sys.executable).parent / "agentctl"
+    log_path = tmp_path / "late-notify.log"
+    with log_path.open("w") as log:
+        proc = subprocess.Popen([str(agentctl), "watch", "--dry-run", "--interval", "5",
+                                 "--config", str(cfg.path), "--as", "A:coder"], stdout=log, stderr=log)
+        try:
+            await eventually(lambda: "watch: NATS unavailable" in log_path.read_text(),
+                             what="startup connection failure")
+            assert proc.poll() is None
+            server.start()
+            await cluster.start(cfg)
+            cursor = cfg.data_path / "A_coder.notify-cursor"
+            await eventually(cursor.exists, what="watch cursor after NATS recovery")
+            hub = await cluster.client(cfg)
+            await tools.send_request(hub, "A:main", "A:coder", "request after recovery", "watcher test")
+            await eventually(lambda: "notify:" in log_path.read_text() and
+                             "request after recovery" in log_path.read_text(), what="notification after recovery")
+            assert proc.poll() is None
+        finally:
+            proc.terminate()
+            await asyncio.to_thread(proc.wait, 5)
+            await cluster.stop("A")
+            server.stop()
 
 
 async def test_wake_filter_ignores_results_of_my_own_requests(make_config, cluster):
