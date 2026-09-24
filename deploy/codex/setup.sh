@@ -10,7 +10,7 @@
 # restarts an existing node service without rewriting it. Changes outside this checkout require a flag:
 #   --service   install/restart the node daemon as a launchd (macOS) / systemd --user (Linux) service
 #   --notifier  install/restart desktop notifications for the interactive Codex agent
-#   --mcp       replace the global Codex MCP entry named "mutmuas" with this node and identity
+#   --mcp       register the global Codex MCP entry named "mutmuas" for this node and identity
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -26,6 +26,7 @@ WORKDIR="$REPO"
 SERVICE=0
 NOTIFIER=0
 MCP=0
+FORCE_MCP=0
 INSTALL=1
 
 usage() {
@@ -41,7 +42,8 @@ Configuration:
 Explicit host changes:
   --service     install/restart the shared node daemon
   --notifier    install/restart this Codex agent's desktop notifier
-  --mcp         replace Codex's global "mutmuas" MCP entry
+  --mcp         register Codex's global "mutmuas" MCP entry
+  --force-mcp   allow --mcp to replace an entry belonging to another identity
 USAGE
 }
 
@@ -59,6 +61,7 @@ while [ $# -gt 0 ]; do
     --service) SERVICE=1; shift ;;
     --notifier) NOTIFIER=1; shift ;;
     --mcp) MCP=1; shift ;;
+    --force-mcp) FORCE_MCP=1; shift ;;
     --skip-install) INSTALL=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
@@ -66,13 +69,36 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$NODE" ] || { echo "--node is required" >&2; exit 2; }
-CONFIG="${CONFIG:-$HOME/.mutmuas/$PROJECT/$NODE/node.yaml}"
+CONFIG="${CONFIG:-$(dirname "$REPO")/node/node.yaml}"
 case "$CONFIG" in /*) ;; *) CONFIG="$PWD/$CONFIG" ;; esac
 case "$WORKDIR" in /*) ;; *) WORKDIR="$PWD/$WORKDIR" ;; esac
 DIR="$(dirname "$CONFIG")"
 BIN="$REPO/.venv/bin"
 
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
+
+node_service_agentctl() {
+  local agent_node="" candidate=""
+  if [ "$(uname -s)" = Darwin ]; then
+    local plist="$HOME/Library/LaunchAgents/dev.mutmuas.$PROJECT.$NODE.plist"
+    if [ -f "$plist" ]; then
+      agent_node="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$plist" 2>/dev/null || true)"
+    fi
+  else
+    local unit="$HOME/.config/systemd/user/mutmuas-agent-node.service"
+    if [ -f "$unit" ]; then
+      agent_node="$(sed -n 's/^ExecStart=\([^ ]*\).*/\1/p' "$unit" | head -1)"
+    fi
+  fi
+  if [ -n "$agent_node" ]; then
+    candidate="$(dirname "$agent_node")/agentctl"
+  fi
+  if [ -x "$candidate" ]; then
+    printf '%s\n' "$candidate"
+  else
+    printf '%s\n' "$BIN/agentctl"
+  fi
+}
 
 if [ "$INSTALL" -eq 1 ]; then
   say "install ($REPO)"
@@ -184,11 +210,34 @@ fi
 if [ "$MCP" -eq 1 ]; then
   say "Codex MCP"
   command -v codex >/dev/null 2>&1 || { echo "codex CLI is required for --mcp" >&2; exit 2; }
-  if codex mcp get mutmuas >/dev/null 2>&1; then
+  mcp_agentctl="$(node_service_agentctl)"
+  existing="$(codex mcp get mutmuas 2>/dev/null || true)"
+  if [ -n "$existing" ]; then
+    existing_args="$(printf '%s\n' "$existing" | sed -n 's/^  args: //p')"
+    case " $existing_args " in
+      *" --as $NODE:$AGENT "*) ;;
+      *)
+        if [ "$FORCE_MCP" -ne 1 ]; then
+          echo "Codex MCP server mutmuas belongs to another identity; inspect it with 'codex mcp get mutmuas'" >&2
+          echo "re-run with --mcp --force-mcp to replace it" >&2
+          exit 2
+        fi
+        ;;
+    esac
+    codex_config_root="${CODEX_HOME:-$HOME/.codex}"
+    if [ -f "$codex_config_root/config.toml" ]; then
+      cp -p "$codex_config_root/config.toml" "$codex_config_root/config.toml.bak-before-mutmuas"
+    fi
     echo "replacing existing Codex MCP server named mutmuas"
     codex mcp remove mutmuas >/dev/null
   fi
-  codex mcp add mutmuas -- "$BIN/agentctl" mcp --config "$CONFIG" --as "$NODE:$AGENT" >/dev/null
+  if ! codex mcp add mutmuas -- "$mcp_agentctl" mcp --config "$CONFIG" --as "$NODE:$AGENT" >/dev/null; then
+    if [ -n "${codex_config_root:-}" ] && [ -f "$codex_config_root/config.toml.bak-before-mutmuas" ]; then
+      cp -p "$codex_config_root/config.toml.bak-before-mutmuas" "$codex_config_root/config.toml"
+      echo "restored $codex_config_root/config.toml after MCP registration failed" >&2
+    fi
+    exit 1
+  fi
   codex mcp get mutmuas
 fi
 
