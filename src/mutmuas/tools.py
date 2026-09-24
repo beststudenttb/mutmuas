@@ -93,6 +93,9 @@ async def wait_for_result(hub: Hub, task_id: str, timeout_s: float = 600) -> dic
 
 # Messages that need a decision from the recipient; ACKs and progress UPDATEs are informational.
 ACTIONABLE = ("REQUEST", "QUESTION", "ANSWER", "RESULT", "BLOCKED", "REJECT", "CANCEL", "ERROR")
+# What should interrupt an interactive session right away: someone needs *me* to act. RESULTs of my own
+# requests are not in it: they are read when I next look, or when I explicitly wait on that task.
+WAKE = ("REQUEST", "QUESTION", "ANSWER", "BLOCKED", "REJECT", "CANCEL", "ERROR")
 
 
 async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, peek: bool = False,
