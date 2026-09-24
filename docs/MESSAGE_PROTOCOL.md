@@ -27,7 +27,7 @@ Addresses and ids used in subjects allow `[A-Za-z0-9_-]` only.
 
 | type | direction | required body | optional body | effect on task |
 |---|---|---|---|---|
-| `REQUEST` | requester → owner | `objective`, `reason` | `kind`, `inputs`, `expected_outputs`, `constraints`, `acceptance_criteria`, `deadline`, `timeout_s`, `parent_task` | creates task (PENDING) |
+| `REQUEST` | requester → owner | `objective`, `reason` | `kind`, `inputs`, `expected_outputs`, `constraints`, `acceptance_criteria`, `deadline`, `timeout_s`, `parent_task`, `evidence_required` | creates task (PENDING) |
 | `ACK` | owner → requester | – | `state`, `message` | ACCEPTED (or RUNNING when an interactive agent accepts) |
 | `UPDATE` | owner → requester | `message` | `state` (task state), `progress` | `state` if given |
 | `QUESTION` | either | `question` | – | requester side: WAITING |
@@ -59,6 +59,27 @@ The daemon never upgrades a status. If the agent process exits non-zero while cl
 `complete`, the result is downgraded to `partial` and a limitation is added. If there is no
 structured result at all, the result is `partial` (exit 0) or `failed` (non-zero).
 
+### Evidence rule (experimental, branch `exp/evidence`)
+
+`evidence` is a list of items `{claim, how, verified, source?}`:
+
+- `claim` is what is asserted.
+- `how` is what was run or read to check it, such as a command, a test name or `file:line`. Someone else must be able to repeat it.
+- `verified: true` means the owner did check it. Use `false` for things it only believes.
+- A bare string is kept, but it counts as an unverified claim.
+
+An item counts as verified only if it has `verified: true` and a non-empty `how`. A verified flag on its own is just another assertion.
+
+A `complete` RESULT on a task whose `evidence_required` is true, and that has no verified item,
+is downgraded to `partial` with the limitation `downgraded to partial: no verified evidence item …`.
+`evidence_required` defaults to true for `code`, `experiment` and `artifact` and false for `query`,
+and the REQUEST can set it either way. Both ends apply the check:
+
+- The owner's daemon applies it before sending. `submit_result` returns `downgraded` so the agent can resubmit with evidence.
+- The requester's daemon applies it again on receipt, so an owner running an older version, or one that simply claims `complete`, gains nothing.
+
+The check can confirm that a claim comes with a way to verify it. It cannot confirm that the claim is true.
+
 ### Example REQUEST
 
 ```yaml
@@ -86,7 +107,8 @@ body:
   status: partial
   summary: Found latents for 4200/5000 samples; shard 7 is missing on disk
   outputs: {samples: 4200}
-  evidence: [ls /data/exp082/latents shows shards 0-6, 8-9]
+  evidence:
+    - {claim: shards 0-6 and 8-9 exist, how: ls /data/exp082/latents, verified: true}
   limitations: [shard 7 missing]
   follow_up: [re-run encoder on shard 7 (≈20 min GPU)]
 artifacts:

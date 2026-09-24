@@ -17,7 +17,7 @@ from .bus import Bus, BusUnavailable
 from .config import AgentConfig, NodeConfig
 from .ids import Address, new_task_id, parse_iso
 from .ledger import Ledger
-from .protocol import (REQUEST_KINDS, TERMINAL_STATES, ArtifactRef, Envelope, ProtocolError,
+from .protocol import (REQUEST_KINDS, TERMINAL_STATES, ArtifactRef, Envelope, ProtocolError, enforce_evidence,
                        task_state_for_result)
 
 log = logging.getLogger(__name__)
@@ -290,6 +290,7 @@ class Hub:
         task = self.ledger.task(task_id, "owner")
         if task is None:
             raise KeyError(f"task {task_id} is not owned by this node")
+        result = enforce_evidence(result, task.get("request"))
         env = Envelope(type="RESULT", sender=task["owner"], to=task["requester"], body=result, task_id=task_id,
                        conversation_id=task["conversation_id"], artifacts=artifacts or [],
                        reply_to=task.get("last_message"))

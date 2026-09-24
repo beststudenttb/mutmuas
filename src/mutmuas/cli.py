@@ -154,7 +154,8 @@ async def cmd_ask(args, hub: Hub):
     out = await tools.send_request(
         hub, _me(args), args.to, args.objective, args.reason or "requested via agentctl", kind=args.kind,
         inputs=_parse_kv(args.input) or None, expected_outputs=args.expect, acceptance_criteria=args.accept,
-        constraints=args.constraint, timeout_s=args.timeout, priority=args.priority)
+        constraints=args.constraint, timeout_s=args.timeout, priority=args.priority,
+        evidence_required=args.evidence)
     if args.wait is not None:
         out = await tools.wait_for_result(hub, out["task_id"], args.wait)
     _print(out, args.json)
@@ -166,7 +167,8 @@ async def cmd_send(args, hub: Hub):
     artifacts = data.get("artifacts", []) if "body" in data else body.pop("artifacts", [])
     msg_type = args.type.upper()
     if msg_type == "REQUEST":
-        fields = ("kind", "inputs", "expected_outputs", "constraints", "acceptance_criteria", "timeout_s", "deadline")
+        fields = ("kind", "inputs", "expected_outputs", "constraints", "acceptance_criteria", "timeout_s", "deadline",
+                  "evidence_required")
         unknown = sorted(set(body) - set(fields) - {"objective", "reason", "priority"})
         if unknown:   # never drop content silently; free-form data belongs in inputs
             raise SystemExit(f"error: unknown REQUEST field(s) {unknown}; put free-form data under 'inputs'. "
@@ -681,6 +683,8 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--constraint", action="append", help="constraint on how to do it (repeatable)")
     p.add_argument("--priority", default="normal", choices=["low", "normal", "high"])
     p.add_argument("--timeout", type=float, help="task timeout on the owner side (s)")
+    p.add_argument("--evidence", action=argparse.BooleanOptionalAction, default=None,
+                   help="require a verified evidence item for 'complete' (default: yes for code/experiment/artifact)")
     p.add_argument("--wait", type=float, nargs="?", const=600, help="wait for the result (s)")
     p = add("send", cmd_send, "send a message from a YAML file", bus=False)
     p.add_argument("to")

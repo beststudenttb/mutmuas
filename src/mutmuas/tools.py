@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Any
 
 from .hub import Hub
-from .protocol import TERMINAL_STATES, ArtifactRef, Envelope, request_body, result_body
+from .protocol import (EVIDENCE_DOWNGRADE, TERMINAL_STATES, ArtifactRef, Envelope, enforce_evidence, request_body,
+                       result_body)
 
 
 def _current_task() -> str | None:
@@ -43,10 +44,11 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                        inputs: Any = None, expected_outputs: Any = None, constraints: Any = None,
                        acceptance_criteria: Any = None, timeout_s: float | None = None,
                        deadline: str | None = None, artifacts: list[dict] | None = None,
-                       parent_task: str | None = None, priority: str = "normal") -> dict[str, Any]:
+                       parent_task: str | None = None, priority: str = "normal",
+                       evidence_required: bool | None = None) -> dict[str, Any]:
     body = request_body(objective, reason, kind=kind, inputs=inputs, expected_outputs=expected_outputs,
                         constraints=constraints, acceptance_criteria=acceptance_criteria,
-                        deadline=deadline, timeout_s=timeout_s)
+                        deadline=deadline, timeout_s=timeout_s, evidence_required=evidence_required)
     target = await hub.card_or_none(to)
     task_id, delivery = await hub.request(
         me, to, body, artifacts=[ArtifactRef.from_dict(a) for a in artifacts or []],
@@ -168,13 +170,20 @@ async def submit_result(hub: Hub, me: str, status: str, summary: str, *, task_id
     body = result_body(status, summary, outputs=outputs, evidence=evidence, limitations=limitations,
                        follow_up=follow_up)
     refs = [ArtifactRef.from_dict(a) for a in artifacts or []]
+    checked = enforce_evidence(body, task.get("request"))
+    out: dict[str, Any] = {"task_id": task_id}
+    if checked["status"] != status:
+        out["downgraded"] = (f"{status} -> {checked['status']}: this task needs at least one evidence item "
+                             "{claim, how, verified: true}, where 'how' is a command/test/file the requester "
+                             "can re-check. Call submit_result again with evidence to replace this result."
+                             if task_id == _current_task() else EVIDENCE_DOWNGRADE)
     if task_id == _current_task():
         # Inside a daemon-run task: store a draft; the daemon sends it when the process exits.
         hub.ledger.update_task(task_id, "owner", result_draft={**body, "artifacts": [r.to_dict() for r in refs]})
-        return {"task_id": task_id, "recorded": True, "status": status,
+        return {**out, "recorded": True, "status": checked["status"],
                 "note": "result will be delivered when this run ends"}
     await hub.finish(task_id, body, refs)
-    return {"task_id": task_id, "delivered": True, "status": status}
+    return {**out, "delivered": True, "status": checked["status"]}
 
 
 async def ask_question(hub: Hub, me: str, task_id: str, question: str) -> dict[str, Any]:

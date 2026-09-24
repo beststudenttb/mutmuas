@@ -77,13 +77,14 @@ def build_server(cfg: NodeConfig, me: str | None) -> MCPServer:
                            inputs: dict[str, Any] | None = None, expected_outputs: list[str] | None = None,
                            constraints: list[str] | None = None, acceptance_criteria: list[str] | None = None,
                            timeout_s: float | None = None, artifacts: list[dict[str, Any]] | None = None,
-                           priority: str = "normal") -> str:
+                           priority: str = "normal", evidence_required: bool | None = None) -> str:
         """Delegate a task to another agent. kind: query | artifact | experiment | code.
+        evidence_required: whether 'complete' must carry a verified evidence item (default: yes except query).
         Returns a task_id; the message is durable even if the target is offline."""
         return dump(await tools.send_request(
             hub(), state["me"], to, objective, reason, kind=kind, inputs=inputs, expected_outputs=expected_outputs,
             constraints=constraints, acceptance_criteria=acceptance_criteria, timeout_s=timeout_s,
-            artifacts=artifacts, priority=priority))
+            artifacts=artifacts, priority=priority, evidence_required=evidence_required))
 
     @server.tool()
     async def check_task(task_id: str) -> str:
@@ -131,10 +132,13 @@ def build_server(cfg: NodeConfig, me: str | None) -> MCPServer:
     @server.tool()
     async def submit_result(status: str, summary: str, task_id: str | None = None,
                             outputs: dict[str, Any] | None = None, artifacts: list[dict[str, Any]] | None = None,
-                            evidence: list[str] | None = None, limitations: list[str] | None = None,
+                            evidence: list[dict[str, Any] | str] | None = None, limitations: list[str] | None = None,
                             follow_up: list[str] | None = None) -> str:
         """Finish a task you own. status: complete | partial | failed — be honest; never call partial complete.
-        artifacts: references returned by publish_artifact."""
+        artifacts: references returned by publish_artifact.
+        evidence: [{claim, how, verified, source?}] — 'how' is what you ran or read to check the claim
+        (command, test name, file:line), so the requester can repeat it; verified=false for things you only
+        believe. code/experiment/artifact tasks need at least one verified item to stay 'complete'."""
         return dump(await tools.submit_result(
             hub(), state["me"], status, summary, task_id=task_id, outputs=outputs, artifacts=artifacts,
             evidence=evidence, limitations=limitations, follow_up=follow_up))

@@ -233,12 +233,15 @@ class Envelope:
 
 def request_body(objective: str, reason: str, *, kind: str = "query", inputs: Any = None,
                  expected_outputs: Any = None, constraints: Any = None, acceptance_criteria: Any = None,
-                 deadline: str | None = None, timeout_s: float | None = None) -> dict[str, Any]:
+                 deadline: str | None = None, timeout_s: float | None = None,
+                 evidence_required: bool | None = None) -> dict[str, Any]:
     body: dict[str, Any] = {"objective": objective, "reason": reason, "kind": kind}
     for key, value in (("inputs", inputs), ("expected_outputs", expected_outputs), ("constraints", constraints),
                        ("acceptance_criteria", acceptance_criteria), ("deadline", deadline), ("timeout_s", timeout_s)):
         if value not in (None, "", [], {}):
             body[key] = value
+    if evidence_required is not None:
+        body["evidence_required"] = bool(evidence_required)
     return body
 
 
@@ -252,6 +255,57 @@ def result_body(status: str, summary: str, *, outputs: Any = None, evidence: Any
         if value not in (None, "", [], {}):
             body[key] = value
     return body
+
+
+# Kinds whose "complete" must be backed by at least one verified evidence item unless the request
+# says evidence_required: false. A query answer is usually its own evidence, so it is exempt by default.
+EVIDENCE_KINDS = ("code", "experiment", "artifact")
+EVIDENCE_DOWNGRADE = "downgraded to partial: no verified evidence item ({claim, how, verified: true})"
+
+
+def evidence_items(evidence: Any) -> list[dict[str, Any]]:
+    """Normalize evidence to [{claim, how, verified, source}]. A bare string is an unverified claim:
+    the reader has nothing to re-run."""
+    if evidence in (None, "", [], {}):
+        return []
+    items = evidence if isinstance(evidence, list) else [evidence]
+    out = []
+    for item in items:
+        if isinstance(item, dict):
+            e = {"claim": str(item.get("claim") or ""), "how": str(item.get("how") or ""),
+                 "verified": item.get("verified") is True}
+            if item.get("source"):
+                e["source"] = str(item["source"])
+        else:
+            e = {"claim": str(item), "how": "", "verified": False}
+        out.append(e)
+    return out
+
+
+def is_verified(item: dict[str, Any]) -> bool:
+    """verified alone is just an assertion; it counts only with a 'how' someone else can repeat."""
+    return item.get("verified") is True and bool(item.get("how", "").strip()) and bool(item.get("claim"))
+
+
+def evidence_required(request: dict[str, Any] | None) -> bool:
+    request = request or {}
+    if "evidence_required" in request:
+        return request["evidence_required"] is not False
+    return request.get("kind", "query") in EVIDENCE_KINDS
+
+
+def enforce_evidence(result: dict[str, Any], request: dict[str, Any] | None) -> dict[str, Any]:
+    """complete without a verified evidence item becomes partial. Idempotent, so the owner and the
+    requester can both apply it and an owner that skips it (old version, or lying) gains nothing."""
+    if result.get("status") != "complete" or not evidence_required(request):
+        return result
+    if any(is_verified(e) for e in evidence_items(result.get("evidence"))):
+        return result
+    limitations = result.get("limitations") or []
+    limitations = list(limitations) if isinstance(limitations, list) else [limitations]
+    if EVIDENCE_DOWNGRADE not in limitations:
+        limitations.append(EVIDENCE_DOWNGRADE)
+    return {**result, "status": "partial", "limitations": limitations}
 
 
 def task_state_for_result(status: str) -> str:

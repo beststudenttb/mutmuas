@@ -53,7 +53,8 @@ elif action == "fetch_file":
     agentctl("update", f"found {path.name}, publishing")
     ref = agentctl("artifact", "publish", str(path), "--description", "requested file")
     print(json.dumps({"status": "complete", "summary": f"published {path.name}", "artifacts": [ref],
-                      "evidence": [f"sha256={ref['sha256']}"]}))
+                      "evidence": [{"claim": f"artifact matches {path}", "how": f"sha256 {ref['sha256']}",
+                                    "verified": True, "source": str(path)}]}))
 
 elif action == "experiment":
     steps = int(inputs.get("steps", 3))
@@ -70,13 +71,19 @@ elif action == "experiment":
         out.write_text(json.dumps({"losses": losses, "seed": inputs.get("seed", 0)}))
         ref = await tools.publish_artifact(hub, me, str(out), id="METRICS")
         await tools.submit_result(hub, me, "complete", f"ran {steps} steps", outputs={"final_loss": losses[-1]},
-                                  artifacts=[ref], evidence=[f"{len(losses)} loss values recorded"])
+                                  artifacts=[ref], evidence=[{"claim": f"{len(losses)} loss values recorded",
+                                                                   "how": f"read back {out.name}", "verified": True}])
 
     asyncio.run(with_hub(run))
 
 elif action == "sleep":
     time.sleep(float(inputs.get("seconds", 5)))
-    print(json.dumps({"status": "complete", "summary": "slept"}))
+    print(json.dumps({"status": "complete", "summary": "slept",
+                      "evidence": [{"claim": "slept", "how": "time.sleep returned", "verified": True}]}))
+
+elif action == "claim":
+    # Reports whatever the requester scripted, to exercise the evidence rules.
+    print(json.dumps({"status": "complete", "summary": "claimed", "evidence": inputs.get("evidence") or []}))
 
 elif action == "crash":
     print("fatal error: about to crash", file=sys.stderr)
@@ -95,7 +102,10 @@ elif action == "commit":
     for cmd in (["git", "add", inputs["file"]], ["git", "-c", "user.name=lab", "-c", "user.email=lab@example.invalid",
                                                  "commit", "-qm", inputs["message"]]):
         subprocess.run(cmd, check=True)
-    print(json.dumps({"status": "complete", "summary": f"committed {inputs['file']} on {task['git_branch']}"}))
+    head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    print(json.dumps({"status": "complete", "summary": f"committed {inputs['file']} on {task['git_branch']}",
+                      "evidence": [{"claim": f"{inputs['file']} committed", "how": f"git rev-parse HEAD = {head}",
+                                    "verified": True}]}))
 
 elif action == "block_then_result":
     # Reproduces node B's report: a worker reports BLOCKED, then still submits a (partial) result.

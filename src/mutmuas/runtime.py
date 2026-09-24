@@ -169,6 +169,9 @@ Rules:
 4. Finish by calling submit_result exactly once. status must be honest:
    complete = every acceptance criterion met; partial = some output but not all criteria;
    failed = nothing usable. Never report partial work as complete. List limitations.
+   Back your claims with evidence items {{claim, how, verified, source}}: 'how' is the command, test or
+   file:line you checked, so the requester can repeat it; set verified=false for what you did not check.
+   A complete code/experiment/artifact result without a verified item is downgraded to partial.
 5. If you need something only the requester can provide, say so in follow_up and use status partial or failed.
 """
 

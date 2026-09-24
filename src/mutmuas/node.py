@@ -32,8 +32,8 @@ from .bus import Names
 from .config import AgentConfig, NodeConfig
 from .hub import Hub
 from .ids import Address, now_iso
-from .protocol import (REQUEST_KINDS, TERMINAL_STATES, ArtifactRef, Envelope, ProtocolError, result_body,
-                       task_state_for_result)
+from .protocol import (REQUEST_KINDS, TERMINAL_STATES, ArtifactRef, Envelope, ProtocolError, enforce_evidence,
+                       result_body, task_state_for_result)
 from .runtime import TaskContext, make_runtime
 from .worktree import GitError, Worktree
 
@@ -315,8 +315,10 @@ class NodeDaemon:
         if env.type == "UPDATE":
             status = env.body.get("state")
         elif env.type == "RESULT":
-            status = task_state_for_result(env.body["status"])
-            fields.update(result=env.body, result_status=env.body["status"],
+            # Re-check here too: the owner may run an older version, or simply claim complete.
+            result = enforce_evidence(env.body, task.get("request"))
+            status = task_state_for_result(result["status"])
+            fields.update(result=result, result_status=result["status"],
                           output_refs=[a.to_dict() for a in env.artifacts])
         elif env.type in ("REJECT", "ERROR"):
             summary = env.body.get("reason") or env.body.get("message")
