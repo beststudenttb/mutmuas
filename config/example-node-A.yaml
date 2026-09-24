@@ -1,0 +1,39 @@
+# Node A — macOS (Apple Silicon): the terminal you sit at.
+# Copy to ~/.mutmuas/node.yaml (or pass --config) and adjust paths / server address.
+project: visual_rl                 # namespace: all subjects/buckets are per project
+node: A                            # machine id; part of every agent address (A:<agent>)
+description: "MacBook, main terminal"
+data_dir: ~/.mutmuas/visual_rl/A   # local ledger (SQLite), logs, run logs
+heartbeat_s: 5
+
+nats:
+  servers: ["nats://100.64.0.10:4222"]   # the NATS host's Tailscale/WireGuard IP — never a public IP
+  credentials_file: ~/.mutmuas/A.env     # from `agent-node server-config` (user node_A + password)
+  # tls_ca: ~/.mutmuas/ca.crt            # when the server has a tls {} block
+
+agents:
+  # Your own Claude Code session. It does not run tasks by itself; it gets the network as MCP tools:
+  #   claude mcp add mutmuas -- <repo>/.venv/bin/agentctl mcp --config ~/.mutmuas/node.yaml --as A:lead
+  - id: lead
+    display: "A:a1"
+    mode: interactive
+    role: lead-researcher
+    provider: anthropic
+    workdir: ~/work/visual_rl
+    permissions: [READ, REQUEST_TASK, PUBLISH_ARTIFACT]
+
+  # A headless Codex worker on the same Mac. Code tasks run in their own git worktree of `repo`.
+  - id: implementer
+    display: "A:b1"
+    mode: worker
+    runtime: codex
+    provider: openai
+    model: ""                      # empty = Codex default for your account
+    role: implementation
+    workdir: ~/work/visual_rl
+    repo: ~/work/visual_rl
+    capabilities: [python, refactoring, unit_tests]
+    permissions: [READ, WRITE_WORKTREE, PUBLISH_ARTIFACT]
+    accept_from: ["A:*", "B:*"]    # who may send it work
+    max_concurrent: 1
+    task_timeout_s: 3600

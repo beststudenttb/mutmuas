@@ -1,0 +1,14 @@
+.venv/
+.local/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+server/
+*.env
+!config/*.env.example
+mutmuas_artifacts/
+.DS_Store
+
+# machine-local configuration: keep real node configs here, never committed
+config/local/
+*.local.yaml

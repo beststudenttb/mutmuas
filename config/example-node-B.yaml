@@ -1,0 +1,42 @@
+# Node B — Linux x86_64 GPU server (Isaac Lab, long experiments). Also hosts the NATS server here.
+project: visual_rl
+node: B
+description: "Linux GPU server"
+data_dir: ~/.mutmuas/visual_rl/B
+heartbeat_s: 5
+resources:                          # advertised in the registry; informational in Phase 1
+  gpu: {type: RTX4090, count: 2}
+  os: ubuntu-22.04
+
+nats:
+  servers: ["nats://127.0.0.1:4222"]   # server runs on this machine
+  credentials_file: ~/.mutmuas/B.env
+
+agents:
+  # Claude Code worker: receives experiment/data requests and runs them headless (claude -p).
+  - id: representation
+    display: "B:a1"
+    mode: worker
+    runtime: claude-code
+    provider: anthropic
+    model: opus
+    role: representation-researcher
+    workdir: ~/work/visual_rl
+    capabilities: [isaac_lab, pytorch, ppo, representation_analysis, gpu_training, representation_data]
+    permissions: [READ, RUN_EXPERIMENT, PUBLISH_ARTIFACT, REQUEST_TASK]
+    accept_from: ["A:*", "B:*"]
+    task_timeout_s: 14400          # 4h; a REQUEST may ask for less via timeout_s
+    max_attempts: 2                # re-run once if the node restarts mid-task
+
+  # Codex worker for code changes in module B (isolated worktree per task, results as patches).
+  - id: implementation
+    display: "B:b1"
+    mode: worker
+    runtime: codex
+    provider: openai
+    role: module-b-implementation
+    workdir: ~/work/visual_rl
+    repo: ~/work/visual_rl
+    capabilities: [python, module_b]
+    permissions: [READ, WRITE_WORKTREE, PUBLISH_ARTIFACT]
+    accept_from: ["A:*", "B:*"]

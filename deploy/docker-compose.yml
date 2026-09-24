@@ -1,0 +1,16 @@
+# Central NATS JetStream server (optional; the native binary + systemd works just as well).
+#   agent-node server-config --project visual_rl --nodes A,B --out ./server --store-dir /data/jetstream
+#   docker compose -f deploy/docker-compose.yml up -d
+# Bind to the overlay (Tailscale) address only: set NATS_BIND=100.x.y.z (default loopback).
+services:
+  nats:
+    image: nats:2.12-alpine
+    command: ["-c", "/etc/nats/nats-server.conf"]
+    restart: unless-stopped
+    ports:
+      - "${NATS_BIND:-127.0.0.1}:4222:4222"
+    volumes:
+      - ../server/nats-server.conf:/etc/nats/nats-server.conf:ro
+      - nats-data:/data/jetstream
+volumes:
+  nats-data:

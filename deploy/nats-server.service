@@ -1,0 +1,19 @@
+# systemd unit for the central NATS server (native binary).
+#   sudo install -m 755 .local/bin/nats-server /usr/local/bin/
+#   sudo mkdir -p /etc/nats /var/lib/nats && sudo cp server/nats-server.conf /etc/nats/
+#   (generate the conf with --store-dir /var/lib/nats/jetstream)
+#   sudo cp deploy/nats-server.service /etc/systemd/system/ && sudo systemctl enable --now nats-server
+[Unit]
+Description=NATS server (mutmuas message bus)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/nats-server -c /etc/nats/nats-server.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
