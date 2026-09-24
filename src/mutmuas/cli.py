@@ -137,7 +137,7 @@ async def cmd_ask(args, hub: Hub):
     out = await tools.send_request(
         hub, _me(args), args.to, args.objective, args.reason or "requested via agentctl", kind=args.kind,
         inputs=_parse_kv(args.input) or None, expected_outputs=args.expect, acceptance_criteria=args.accept,
-        timeout_s=args.timeout)
+        constraints=args.constraint, timeout_s=args.timeout)
     if args.wait is not None:
         out = await tools.wait_for_result(hub, out["task_id"], args.wait)
     _print(out, args.json)
@@ -515,6 +515,7 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--input", action="append", help="key=value (value may be JSON)")
     p.add_argument("--expect", action="append", help="expected output (repeatable)")
     p.add_argument("--accept", action="append", help="acceptance criterion (repeatable)")
+    p.add_argument("--constraint", action="append", help="constraint on how to do it (repeatable)")
     p.add_argument("--timeout", type=float, help="task timeout on the owner side (s)")
     p.add_argument("--wait", type=float, nargs="?", const=600, help="wait for the result (s)")
     p = add("send", cmd_send, "send a message from a YAML file", bus=False)
