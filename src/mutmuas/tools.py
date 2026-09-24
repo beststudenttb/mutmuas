@@ -91,22 +91,27 @@ async def wait_for_result(hub: Hub, task_id: str, timeout_s: float = 600) -> dic
     return _brief(await hub.wait_result(task_id, timeout_s))
 
 
+# Messages that need a decision from the recipient; ACKs and progress UPDATEs are informational.
+ACTIONABLE = ("REQUEST", "QUESTION", "ANSWER", "RESULT", "BLOCKED", "REJECT", "CANCEL", "ERROR")
+
+
 async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, peek: bool = False,
-                wait_s: float | None = None) -> list[dict[str, Any]]:
-    """Unread messages for ``me``. peek: do not mark them read. wait_s: block until one arrives (or timeout)."""
+                wait_s: float | None = None, types: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
+    """Unread messages for ``me``. peek: do not mark them read. wait_s: block until one arrives (or timeout).
+    types: only these message types (e.g. ACTIONABLE), for both waiting and listing."""
     addr, _ = hub.local_agent(me)
     if wait_s and not include_seen:
         # Messages reach this node's ledger through the daemon, so waiting on the ledger is enough
         # (a second JetStream consumer on the same mailbox would split the messages).
         deadline = asyncio.get_running_loop().time() + wait_s
-        while hub.ledger.unseen_count(str(addr)) == 0 and asyncio.get_running_loop().time() < deadline:
+        while hub.ledger.unseen_count(str(addr), types) == 0 and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.5)
     if include_seen:
         rows = hub.ledger.db.execute("SELECT envelope FROM messages WHERE direction='in' AND local_agent=?"
                                      " ORDER BY rowid DESC LIMIT ?", (str(addr), limit)).fetchall()
         envs = [Envelope.from_json(r["envelope"]) for r in rows]
     else:
-        envs = hub.ledger.unseen(str(addr), limit, mark=not peek)
+        envs = hub.ledger.unseen(str(addr), limit, mark=not peek, types=types)
     return [{"message_id": e.message_id, "type": e.type, "from": e.sender, "task_id": e.task_id,
              "timestamp": e.timestamp, "body": e.body, "artifacts": [a.to_dict() for a in e.artifacts]}
             for e in envs]

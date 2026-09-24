@@ -225,7 +225,10 @@ async def cmd_result(args, hub: Hub):
 
 
 async def cmd_inbox(args, hub: Hub):
-    rows = await tools.inbox(hub, _me(args), include_seen=args.all, peek=args.peek, wait_s=args.wait)
+    types = None
+    if args.only:
+        types = tools.ACTIONABLE if args.only == "actionable" else tuple(t.strip().upper() for t in args.only.split(","))
+    rows = await tools.inbox(hub, _me(args), include_seen=args.all, peek=args.peek, wait_s=args.wait, types=types)
     if args.json:
         _print(rows, True)
     elif not rows:
@@ -569,6 +572,8 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p = add("inbox", cmd_inbox, "messages addressed to me", bus=False)
     p.add_argument("--all", action="store_true", help="include already seen messages")
     p.add_argument("--peek", action="store_true", help="do not mark messages as read")
+    p.add_argument("--only", metavar="TYPES", help="'actionable' or comma separated types, e.g. REQUEST,RESULT; "
+                                                   "a watcher using --wait --only actionable ignores ACKs/progress")
     p.add_argument("--wait", type=float, nargs="?", const=3600, metavar="SECONDS",
                    help="block until a message arrives (default up to 3600 s); exit code 3 on timeout")
     p = add("cancel", cmd_cancel, "cancel a task I requested", bus=False)

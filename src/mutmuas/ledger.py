@@ -168,16 +168,18 @@ class Ledger:
         self.db.execute("UPDATE messages SET state=?, last_error=?, updated_at=? WHERE message_id=? AND direction='in'",
                         (state, error, now_iso(), message_id))
 
-    def unseen(self, local_agent: str, limit: int = 50, mark: bool = True) -> list[Envelope]:
+    def unseen(self, local_agent: str, limit: int = 50, mark: bool = True,
+               types: tuple[str, ...] | None = None) -> list[Envelope]:
         """Inbound messages an interactive agent has not looked at yet.
 
         Only messages the dispatcher has fully handled: a REQUEST shows up once its task exists
         (so accept_task always works), and requests rejected by policy never show up.
         """
         with self.tx() as db:
+            type_sql = f" AND type IN ({','.join('?' * len(types))})" if types else ""
             rows = db.execute("SELECT message_id, envelope FROM messages WHERE direction='in' AND seen=0"
-                              " AND state='handled' AND local_agent=? ORDER BY rowid LIMIT ?",
-                              (local_agent, limit)).fetchall()
+                              f" AND state='handled' AND local_agent=?{type_sql} ORDER BY rowid LIMIT ?",
+                              (local_agent, *(types or ()), limit)).fetchall()
             if mark and rows:
                 db.executemany("UPDATE messages SET seen=1 WHERE message_id=? AND direction='in'",
                                [(r["message_id"],) for r in rows])
@@ -186,9 +188,13 @@ class Ledger:
     def mark_seen(self, task_id: str) -> None:
         self.db.execute("UPDATE messages SET seen=1 WHERE direction='in' AND task_id=?", (task_id,))
 
-    def unseen_count(self, local_agent: str) -> int:
-        return self.db.execute("SELECT COUNT(*) FROM messages WHERE direction='in' AND seen=0 AND state='handled'"
-                               " AND local_agent=?", (local_agent,)).fetchone()[0]
+    def unseen_count(self, local_agent: str, types: tuple[str, ...] | None = None) -> int:
+        sql = "SELECT COUNT(*) FROM messages WHERE direction='in' AND seen=0 AND state='handled' AND local_agent=?"
+        args: list[Any] = [local_agent]
+        if types:
+            sql += f" AND type IN ({','.join('?' * len(types))})"
+            args.extend(types)
+        return self.db.execute(sql, args).fetchone()[0]
 
     def count(self, direction: str, state: str, local_agent: str | None = None) -> int:
         sql = "SELECT COUNT(*) FROM messages WHERE direction=? AND state=?"

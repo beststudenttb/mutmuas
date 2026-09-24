@@ -181,3 +181,18 @@ async def test_request_withdrawn_before_seen_stays_out_of_inbox(make_config, clu
                      what="all withdrawn tasks cancelled on the owner side")
     inbox = await eventually(lambda: tools.inbox(hub_b, "B:coder"), what="the real question")
     assert [m["task_id"] for m in inbox] == [kept["task_id"]]
+
+
+async def test_watcher_ignores_acks_with_only_actionable(make_config, cluster):
+    import asyncio
+    a = make_config("A", [interactive("main")])
+    b = make_config("B", [worker("lab", "lab.py")])
+    await cluster.start(a)
+    await cluster.start(b)
+    hub = await cluster.client(a)
+    sent = await tools.send_request(hub, "A:main", "B:lab", "sleep", "watcher test",
+                                    inputs={"action": "sleep", "seconds": 1.5})
+    start = asyncio.get_running_loop().time()
+    rows = await tools.inbox(hub, "A:main", peek=True, wait_s=20, types=tools.ACTIONABLE)
+    assert [m["type"] for m in rows] == ["RESULT"] and rows[0]["task_id"] == sent["task_id"]
+    assert asyncio.get_running_loop().time() - start > 1.0      # did not wake on the ACK / UPDATEs
