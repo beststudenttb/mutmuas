@@ -103,7 +103,7 @@ async def cmd_status(args, hub: Hub):
         n = known.get(node, {})
         online = "ONLINE" if n.get("online") else "OFFLINE"
         extra = f"  outbox={n['outbox_queued']}" if n.get("outbox_queued") else ""
-        code = f"  code {n['code']}" if n.get("code") else ""
+        code = (f"  code {n['code']}" if n.get("code") else "") + (f"  py {n['python']}" if n.get("python") else "")
         print(f"NODE {node}  {online}  {n.get('platform', '')}{code}  heartbeat {_ago(n.get('last_heartbeat'))}{extra}")
         for c in by_node.get(node, []):
             state = "OFFLINE" if not c["online"] else c.get("state", "?").upper()

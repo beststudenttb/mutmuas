@@ -12,3 +12,7 @@ mutmuas_artifacts/
 # machine-local configuration: keep real node configs here, never committed
 config/local/
 *.local.yaml
+
+# build artifacts from non-editable pip installs
+build/
+dist/
