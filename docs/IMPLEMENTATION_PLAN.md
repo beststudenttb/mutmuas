@@ -28,7 +28,8 @@ Status as of 2026-09-24. ✅ done and tested · 🟡 partial · ⬜ not started.
 
 | # | Item | Why | Status |
 |---|---|---|---|
-| 1 | **Real two-machine deployment** (Mac A + Linux B over Tailscale) | Everything so far ran on one Mac: multi-process and multi-node, but one host | ⬜ |
+| 1 | **Real two-machine deployment** (Mac A + Linux GPU B) | Public IP + TLS; both directions verified; B found 2 bugs (same-node delegation, inbox race), fixed in 5e330b7 | ✅ |
+| 1b | Run nodes as services (launchd on A, systemd on B) and decide 4222 exposure (TLS+auth / allowlist / Tailscale-only) | Nodes currently run as background processes | ⬜ |
 | 2 | **Push new inbox items into interactive sessions** (Claude Code `UserPromptSubmit` hook that runs `agentctl inbox`) | Today an interactive agent sees requests only when it calls `inbox` | ⬜ |
 | 3 | **Deliver ANSWER/QUESTION to running workers**: resume the worker session with the answer (`claude --resume`, `codex exec resume`) | Workers cannot yet hold a conversation mid-task; they finish partial and state the question in `follow_up` | ⬜ |
 | 4 | Resume a crashed task *from its session* instead of restarting it | Long experiments restart from scratch today (attempt 2) | 🟡 attempts tracked, no session resume |

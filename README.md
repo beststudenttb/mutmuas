@@ -75,7 +75,10 @@ docs/            CURRENT_ARCHITECTURE · ARCHITECTURE_V1 · MESSAGE_PROTOCOL · 
 
 ## Status
 
-- Verified on one macOS machine (Apple Silicon, Python 3.14, nats-server 2.15): the unit tests,
-  in-process multi-node tests, multi-process E2E with per-node auth, and real Claude Code and Codex workers.
-- **Not yet run on two physical machines or on Linux.** The Linux paths (systemd unit, install script
-  branch) are written but untested. See the P1 list in `docs/IMPLEMENTATION_PLAN.md`.
+- **Running between two real machines** (2026-09-24): node A = macOS arm64 (Python 3.14), node B = Ubuntu
+  24.04 x86_64 with 2x RTX 4070 Ti (Python 3.11), over the public internet with TLS and per-node auth. Both
+  directions verified: durable messages that B sent while A was offline were delivered when A joined, and A
+  delegated a task to B's headless Claude Code worker (ACK in 20 ms, RESULT in 15 s).
+- Test suite (49 tests) passes on both machines. The multi-process E2E runs over TLS.
+- Not yet exercised on real hardware: launchd/systemd service units (nodes currently run as background
+  processes), Codex workers on Linux.
