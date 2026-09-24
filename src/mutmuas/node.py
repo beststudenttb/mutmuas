@@ -200,17 +200,17 @@ class NodeDaemon:
             wake.clear()
             for env in self.hub.ledger.unhandled(addr):
                 try:
-                    await self._handle(agent, env)
-                    self.hub.ledger.mark_handled(env.message_id)
+                    state = await self._handle(agent, env)
+                    self.hub.ledger.mark_handled(env.message_id, state or "handled")
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
                     log.exception("handling %s failed", env.short())
                     self.hub.ledger.mark_handled(env.message_id, "dropped", repr(e))
 
-    async def _handle(self, agent: AgentConfig, env: Envelope) -> None:
+    async def _handle(self, agent: AgentConfig, env: Envelope) -> str | None:
         if env.type == "REQUEST":
-            await self._on_request(agent, env)
+            return await self._on_request(agent, env)
         elif env.type == "CANCEL":
             await self._on_cancel(env)
         elif env.type == "ANSWER":
@@ -218,7 +218,7 @@ class NodeDaemon:
         else:
             await self._on_reply(env)
 
-    async def _on_request(self, agent: AgentConfig, env: Envelope) -> None:
+    async def _on_request(self, agent: AgentConfig, env: Envelope) -> str | None:
         hub = self.hub
         existing = hub.ledger.task(env.task_id, "owner")
         if existing:
@@ -232,7 +232,7 @@ class NodeDaemon:
         if denial:
             await hub.owner_transition(env.task_id, "FAILED", denial, msg_type="REJECT",
                                        body={"reason": denial})
-            return
+            return "rejected"
         await hub.publish_task_record(env.task_id)
         if agent.mode == "worker":
             await self._accept(env.task_id)

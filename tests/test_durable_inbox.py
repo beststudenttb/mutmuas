@@ -73,3 +73,30 @@ async def test_duplicate_delivery_executes_once(make_config, cluster, tmp_path):
     assert marker.read_text().count("T-dup-1") == 1
     results = [m for m in hub.ledger.thread("T-dup-1") if m["type"] == "RESULT"]
     assert results[0]["body"] == results[1]["body"]
+
+
+def test_ledger_migrates_v1_schema(tmp_path):
+    """v1 ledgers (messages keyed on message_id only) are re-keyed in place without losing rows."""
+    import sqlite3
+
+    from mutmuas.ledger import Ledger
+    db = sqlite3.connect(tmp_path / "ledger.sqlite3")
+    db.executescript("""
+        CREATE TABLE messages (message_id TEXT PRIMARY KEY, direction TEXT NOT NULL, local_agent TEXT NOT NULL,
+            peer TEXT NOT NULL, type TEXT NOT NULL, task_id TEXT, conversation_id TEXT, envelope TEXT NOT NULL,
+            state TEXT NOT NULL, seen INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE INDEX messages_state ON messages(direction, state);
+        CREATE INDEX messages_task ON messages(task_id);""")
+    env = Envelope(type="REQUEST", sender="B:main", to="B:ops", task_id="T-1", body=request_body("x", "y"))
+    db.execute("INSERT INTO messages VALUES (?, 'out', 'B:main', 'B:ops', 'REQUEST', 'T-1', 'c', ?, 'sent',"
+               " 1, 1, NULL, 'now', 'now')", (env.message_id, env.to_json().decode()))
+    db.commit()
+    db.close()
+
+    ledger = Ledger(tmp_path / "ledger.sqlite3")
+    assert ledger.count("out", "sent") == 1
+    assert ledger.ingest(env) is True            # the same-node inbound copy is no longer swallowed
+    assert ledger.ingest(env) is False           # but real duplicates still are
+    ledger.close()
+    Ledger(tmp_path / "ledger.sqlite3").close()  # idempotent on the migrated schema

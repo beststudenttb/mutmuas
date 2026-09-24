@@ -35,6 +35,17 @@ from .protocol import Envelope
 
 log = logging.getLogger(__name__)
 
+
+class _SslEofNoise(logging.Filter):
+    """nats-py + TLS makes asyncio warn "returning true from eof_received() has no effect when using ssl"
+    on every connection close. Harmless; drop it."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "eof_received()" not in record.getMessage()
+
+
+logging.getLogger("asyncio").addFilter(_SslEofNoise())
+
 DUPLICATE_WINDOW_S = 600       # resend of the same message_id within this window is dropped server-side
 ACK_WAIT_S = 30                # node must commit a message to its local ledger within this time
 

@@ -166,6 +166,9 @@ async def cancel_task(hub: Hub, me: str, task_id: str, reason: str = "") -> dict
     if task is None:
         raise KeyError(f"{task_id} was not requested from this node")
     delivery = await hub.reply(me, task_id, "CANCEL", {"reason": reason} if reason else {})
+    # The requester has withdrawn; don't keep waiting on an owner that may never answer
+    # (offline for good, or never received the REQUEST).
+    hub.ledger.update_task(task_id, "requester", status="CANCELLED")
     return {"task_id": task_id, "delivery": delivery}
 
 

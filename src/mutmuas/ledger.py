@@ -25,20 +25,21 @@ from .protocol import TERMINAL_STATES, Envelope
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
-    message_id      TEXT PRIMARY KEY,
-    direction       TEXT NOT NULL,           -- in | out
+    message_id      TEXT NOT NULL,
+    direction       TEXT NOT NULL,           -- in | out  (same-node messages have one row of each)
     local_agent     TEXT NOT NULL,           -- NODE:agent on this node
     peer            TEXT NOT NULL,
     type            TEXT NOT NULL,
     task_id         TEXT,
     conversation_id TEXT,
     envelope        TEXT NOT NULL,
-    state           TEXT NOT NULL,           -- out: queued|sent|dead   in: new|handled|dropped
+    state           TEXT NOT NULL,           -- out: queued|sent   in: new|handled|rejected|dropped
     seen            INTEGER NOT NULL DEFAULT 0,   -- surfaced to an interactive agent
     attempts        INTEGER NOT NULL DEFAULT 0,
     last_error      TEXT,
     created_at      TEXT NOT NULL,
-    updated_at      TEXT NOT NULL
+    updated_at      TEXT NOT NULL,
+    PRIMARY KEY (message_id, direction)
 );
 CREATE INDEX IF NOT EXISTS messages_state ON messages(direction, state);
 CREATE INDEX IF NOT EXISTS messages_task ON messages(task_id);
@@ -79,7 +80,23 @@ class Ledger:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=30000")
+        self._migrate_v1()
         self.db.executescript(SCHEMA)
+
+    def _migrate_v1(self) -> None:
+        """v1 keyed messages on message_id alone, which dropped same-node deliveries. Re-key in place."""
+        pk = [r["name"] for r in self.db.execute("PRAGMA table_info(messages)") if r["pk"]]
+        if pk != ["message_id"]:
+            return
+        with self.tx() as db:
+            db.execute("ALTER TABLE messages RENAME TO messages_v1")
+            db.execute("DROP INDEX IF EXISTS messages_state")
+            db.execute("DROP INDEX IF EXISTS messages_task")
+            for stmt in SCHEMA.split("CREATE TABLE IF NOT EXISTS tasks")[0].split(";"):
+                if stmt.strip():        # executescript would commit implicitly; stay inside this transaction
+                    db.execute(stmt)
+            db.execute("INSERT INTO messages SELECT * FROM messages_v1")
+            db.execute("DROP TABLE messages_v1")
 
     def close(self) -> None:
         self.db.close()
@@ -116,11 +133,11 @@ class Ledger:
 
     def mark_sent(self, message_id: str) -> None:
         self.db.execute("UPDATE messages SET state='sent', attempts=attempts+1, last_error=NULL, updated_at=?"
-                        " WHERE message_id=?", (now_iso(), message_id))
+                        " WHERE message_id=? AND direction='out'", (now_iso(), message_id))
 
     def mark_send_error(self, message_id: str, error: str) -> None:
-        self.db.execute("UPDATE messages SET attempts=attempts+1, last_error=?, updated_at=? WHERE message_id=?",
-                        (error[:500], now_iso(), message_id))
+        self.db.execute("UPDATE messages SET attempts=attempts+1, last_error=?, updated_at=?"
+                        " WHERE message_id=? AND direction='out'", (error[:500], now_iso(), message_id))
 
     # ---- inbox --------------------------------------------------------
 
@@ -142,23 +159,28 @@ class Ledger:
 
     def request_envelope(self, task_id: str) -> Envelope:
         row = self.db.execute("SELECT envelope FROM messages WHERE task_id=? AND type='REQUEST'"
-                              " ORDER BY rowid LIMIT 1", (task_id,)).fetchone()
+                              " ORDER BY direction='in' DESC, rowid LIMIT 1", (task_id,)).fetchone()
         if row is None:
             raise KeyError(f"no REQUEST recorded for task {task_id}")
         return Envelope.from_json(row["envelope"])
 
     def mark_handled(self, message_id: str, state: str = "handled", error: str | None = None) -> None:
-        self.db.execute("UPDATE messages SET state=?, last_error=?, updated_at=? WHERE message_id=?",
+        self.db.execute("UPDATE messages SET state=?, last_error=?, updated_at=? WHERE message_id=? AND direction='in'",
                         (state, error, now_iso(), message_id))
 
     def unseen(self, local_agent: str, limit: int = 50, mark: bool = True) -> list[Envelope]:
-        """Inbound messages an interactive agent has not looked at yet."""
+        """Inbound messages an interactive agent has not looked at yet.
+
+        Only messages the dispatcher has fully handled: a REQUEST shows up once its task exists
+        (so accept_task always works), and requests rejected by policy never show up.
+        """
         with self.tx() as db:
             rows = db.execute("SELECT message_id, envelope FROM messages WHERE direction='in' AND seen=0"
-                              " AND state!='dropped' AND local_agent=? ORDER BY rowid LIMIT ?",
+                              " AND state='handled' AND local_agent=? ORDER BY rowid LIMIT ?",
                               (local_agent, limit)).fetchall()
             if mark and rows:
-                db.executemany("UPDATE messages SET seen=1 WHERE message_id=?", [(r["message_id"],) for r in rows])
+                db.executemany("UPDATE messages SET seen=1 WHERE message_id=? AND direction='in'",
+                               [(r["message_id"],) for r in rows])
         return [Envelope.from_json(r["envelope"]) for r in rows]
 
     def count(self, direction: str, state: str, local_agent: str | None = None) -> int:
@@ -172,9 +194,12 @@ class Ledger:
     def thread(self, task_id: str) -> list[dict[str, Any]]:
         rows = self.db.execute("SELECT direction, state, envelope, last_error FROM messages WHERE task_id=?"
                                " ORDER BY created_at, rowid", (task_id,)).fetchall()
-        out = []
-        for r in rows:
+        out, seen = [], set()
+        for r in rows:                      # a same-node message has an out and an in row: show it once
             env = json.loads(r["envelope"])
+            if env["message_id"] in seen:
+                continue
+            seen.add(env["message_id"])
             out.append({"direction": r["direction"], "delivery": r["state"], "error": r["last_error"], **env})
         out.sort(key=lambda m: m["timestamp"])
         return out

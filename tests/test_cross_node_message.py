@@ -90,3 +90,41 @@ async def test_spoofed_sender_is_dropped(make_config, cluster):
 
     await eventually(lambda: hub_b.ledger.task(honest["task_id"], "owner"), what="honest request")
     assert hub_b.ledger.task("T-forged") is None
+
+
+async def test_same_node_delegation(make_config, cluster):
+    """A:main -> A:lab on the same machine: the message leaves and re-enters the same ledger."""
+    a = make_config("A", [interactive("main"), worker("lab", "lab.py")])
+    await cluster.start(a)
+    hub = await cluster.client(a)
+    sent = await tools.send_request(hub, "A:main", "A:lab", "echo", "same-node test",
+                                    inputs={"action": "echo", "text": "local"})
+    result = await tools.wait_for_result(hub, sent["task_id"], 30)
+    assert result["status"] == "COMPLETED" and result["result"]["summary"] == "echo: local"
+
+    slow = await tools.send_request(hub, "A:main", "A:lab", "sleep", "same-node cancel",
+                                    inputs={"action": "sleep", "seconds": 30})
+    await eventually(lambda: (hub.ledger.task(slow["task_id"], "owner") or {}).get("status") == "RUNNING",
+                     what="running")
+    await tools.cancel_task(hub, "A:main", slow["task_id"])
+    await eventually(lambda: hub.ledger.task(slow["task_id"], "owner")["status"] == "CANCELLED",
+                     what="owner side cancelled")
+    assert [m["type"] for m in hub.ledger.thread(sent["task_id"])].count("REQUEST") == 1   # shown once
+
+
+async def test_inbox_only_shows_requests_that_can_be_accepted(make_config, cluster):
+    """A REQUEST appears in an interactive inbox only once its task exists; rejected ones never do."""
+    a = make_config("A", [interactive("main")])
+    b = make_config("B", [interactive("coder"), interactive("private", accept_from=["B:*"])])
+    await cluster.start(a)
+    await cluster.start(b)
+    hub_a = await cluster.client(a)
+    hub_b = await cluster.client(b)
+    for _ in range(5):
+        sent = await tools.send_request(hub_a, "A:main", "B:coder", "q", "race test")
+        inbox = await eventually(lambda: tools.inbox(hub_b, "B:coder"), what="inbox", interval=0.001)
+        assert (await tools.accept_task(hub_b, "B:coder", inbox[0]["task_id"]))["accepted"]
+        assert inbox[0]["task_id"] == sent["task_id"]
+    denied = await tools.send_request(hub_a, "A:main", "B:private", "q", "should be rejected")
+    await tools.wait_for_result(hub_a, denied["task_id"], 20)
+    assert await tools.inbox(hub_b, "B:private") == []
