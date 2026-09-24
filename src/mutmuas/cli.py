@@ -228,7 +228,8 @@ async def cmd_result(args, hub: Hub):
 async def cmd_inbox(args, hub: Hub):
     types = None
     if args.only:
-        types = tools.ACTIONABLE if args.only == "actionable" else tuple(t.strip().upper() for t in args.only.split(","))
+        named = {"actionable": tools.ACTIONABLE, "wake": tools.WAKE}
+        types = named.get(args.only) or tuple(t.strip().upper() for t in args.only.split(","))
     rows = await tools.inbox(hub, _me(args), include_seen=args.all, peek=args.peek, wait_s=args.wait, types=types,
                              since=args.since)
     if args.json:
@@ -687,8 +688,9 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--peek", action="store_true", help="do not mark messages as read")
     p.add_argument("--since", metavar="ISO_TIME", help="only messages received after this time (notifier cursor; "
                                                          "each row's 'received_at' is the next cursor)")
-    p.add_argument("--only", metavar="TYPES", help="'actionable' or comma separated types, e.g. REQUEST,RESULT; "
-                                                   "a watcher using --wait --only actionable ignores ACKs/progress")
+    p.add_argument("--only", metavar="TYPES",
+                   help="'wake' (someone needs me to act: no ACKs, progress or RESULTs; best for a session "
+                        "watcher), 'actionable' (also RESULTs), or comma separated types, e.g. REQUEST,QUESTION")
     p.add_argument("--wait", type=float, nargs="?", const=3600, metavar="SECONDS",
                    help="block until a message arrives (default up to 3600 s); exit code 3 on timeout")
     p = add("watch", cmd_watch, "run forever: desktop notification per new actionable message (launchd/systemd)")

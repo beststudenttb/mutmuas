@@ -230,3 +230,21 @@ async def test_notifier_announces_each_new_message_once(make_config, cluster, tm
         proc.terminate()
         proc.wait(5)
         log.close()
+
+
+async def test_wake_filter_ignores_results_of_my_own_requests(make_config, cluster):
+    """--only wake: a RESULT for my request does not interrupt me; a new REQUEST to me does."""
+    import asyncio
+    a = make_config("A", [interactive("main")])
+    b = make_config("B", [worker("lab", "lab.py"), interactive("coder")])
+    await cluster.start(a)
+    await cluster.start(b)
+    hub_a = await cluster.client(a)
+    hub_b = await cluster.client(b)
+    sent = await tools.send_request(hub_a, "A:main", "B:lab", "echo", "wake test", inputs={"action": "echo"})
+    await eventually(lambda: (hub_a.ledger.task(sent["task_id"], "requester") or {}).get("status") == "COMPLETED",
+                     what="result arrived")
+    assert await tools.inbox(hub_a, "A:main", peek=True, wait_s=1, types=tools.WAKE) == []   # no wake-up
+    await tools.send_request(hub_b, "B:coder", "A:main", "please review", "needs A")
+    rows = await tools.inbox(hub_a, "A:main", peek=True, wait_s=10, types=tools.WAKE)
+    assert [m["type"] for m in rows] == ["REQUEST"]
