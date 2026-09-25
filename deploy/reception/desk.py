@@ -28,7 +28,7 @@ def read_env(path):
 async def connect(a):
     env = read_env(a.env)
     tls = ssl.create_default_context(cafile=a.ca) if a.ca else None
-    return await nats.connect(a.server, user=env.get("NATS_USER"), password=env.get("NATS_PASSWORD"), tls=tls,
+    return await nats.connect(a.server, user=env.get("MUTMUAS_NATS_USER"), password=env.get("MUTMUAS_NATS_PASSWORD"), tls=tls,
                               name="mutmuas:reception", max_reconnect_attempts=-1)
 
 
