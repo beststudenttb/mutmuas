@@ -116,6 +116,9 @@ distributed transactions. The KV record is the owner's *published view*, so anyo
 - `agent-node server-config` generates one user per node. The server enforces:
   - node X may publish messages only on subjects ending in `.X`, so it cannot impersonate another node;
   - node X may write only its own registry card and its own task records;
+  - node X may subscribe only to its own reply prefix `_INBOX_node_X.>`. JetStream delivers pulled mailbox
+    messages to reply inboxes, so with a shared `_INBOX.>` every node could read every other node's mail
+    just by listening (verified 2026-09-25). All nodes and the server config must be upgraded together;
   - receivers additionally drop envelopes whose `from` node disagrees with the subject.
 - Agent-level policy on the receiver: `accept_from` globs, plus permissions per request kind
   (`query→READ`, `artifact→PUBLISH_ARTIFACT`, `experiment→RUN_EXPERIMENT`, `code→WRITE_WORKTREE`).
@@ -127,7 +130,8 @@ distributed transactions. The KV record is the owner's *published view*, so anyo
 - `MERGE` and `ADMIN` exist in the permission model. Nothing merges automatically in Phase 1.
 
 **Known gap:** nodes need `$JS.API.>` to manage their own consumers, and that also lets a node read
-other mailboxes or delete streams. Closing it needs NATS accounts with scoped JetStream permissions
+other mailboxes *actively*, by creating its own consumer on the message stream, or delete streams. The
+per-node reply prefix closes only *passive* listening. Closing it needs NATS accounts with scoped JetStream permissions
 (decentralised JWT auth). That is a Phase 2 item. Until then, treat all nodes of a project as
 mutually trusted machines of one lab.
 

@@ -17,6 +17,7 @@ import secrets
 import subprocess
 from pathlib import Path
 
+from .bus import inbox_prefix
 from .ids import check_token
 
 
@@ -32,9 +33,10 @@ def node_permissions(project: str, node: str) -> dict[str, list[str]]:
             "$JS.API.>",                           # stream/consumer/kv management (see module doc)
             "$JS.ACK.>",                           # acks for pulled messages
             "$JS.FC.>",                            # flow control for object-store reads
-            "_INBOX.>",
         ],
-        "subscribe": ["_INBOX.>"],
+        # Replies (JetStream API answers and pulled mailbox messages) arrive on the node's own prefix
+        # only; a shared _INBOX.> would let one node read every other node's mail.
+        "subscribe": [f"{inbox_prefix(f'node_{node}')}.>"],
     }
 
 

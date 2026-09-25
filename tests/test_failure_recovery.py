@@ -195,6 +195,53 @@ async def test_generated_server_auth_enforces_node_identity(tmp_path, make_confi
                            reconnect=False)
     finally:
         await cluster.close()
+
+
+async def test_a_node_cannot_read_another_nodes_mail(tmp_path, make_config, cluster):
+    """Pulled mailbox messages arrive on reply inboxes. With a shared _INBOX.> any node could read all mail
+    (verified 2026-09-25 by a probe); now each node may subscribe only to its own prefix."""
+    import nats
+    from conftest import free_port
+
+    written = generate("testproj", ["A", "B", "C"], tmp_path / "server", listen_host="127.0.0.1",
+                       store_dir=str(tmp_path / "js-spy"), monitor_port=free_port())
+    server = NatsServer(tmp_path / "js-spy", conf=written["server"])
+    server.start()
+    try:
+        def cfg(node, agents):
+            c = make_config(node, agents)
+            c.nats = NatsConfig(servers=[server.url], credentials_file=str(written[node]))
+            raw = yaml.safe_load(c.path.read_text())
+            raw["nats"] = {"servers": [server.url], "credentials_file": str(written[node])}
+            c.path.write_text(yaml.safe_dump(raw))
+            return c
+        a, b = cfg("A", [interactive("main")]), cfg("B", [interactive("desk")])
+        await cluster.start(a)
+        await cluster.start(b)
+
+        creds = NatsConfig(servers=[server.url], credentials_file=str(written["C"]))
+        denied, seen = [], []
+
+        async def on_error(e):
+            denied.append(str(e))
+
+        async def grab(m):
+            seen.append(m.data)
+        spy = await nats.connect(server.url, user="node_C", password=creds.resolved_password(), error_cb=on_error)
+        for subject in ("_INBOX.>", "_INBOX_node_B.>", ">"):
+            await spy.subscribe(subject, cb=grab)
+        await spy.flush()
+
+        hub_a, hub_b = await cluster.client(a), await cluster.client(b)
+        await tools.send_request(hub_a, "A:main", "B:desk", "SECRET-4711", "spy test")
+        got = await eventually(lambda: tools.inbox(hub_b, "B:desk", peek=True), what="B still gets its mail")
+        assert got[0]["body"]["objective"] == "SECRET-4711"
+        await asyncio.sleep(1)
+        await spy.close()
+        assert not [d for d in seen if b"SECRET-4711" in d]
+        assert len([d for d in denied if "permissions violation for subscription" in d.lower()]) == 3, denied
+    finally:
+        await cluster.close()
         server.stop()
 
 

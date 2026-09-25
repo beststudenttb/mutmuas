@@ -84,6 +84,13 @@ class Names:
         return f"{owner.node}.{owner.agent}.{task_id}"
 
 
+def inbox_prefix(user: str | None) -> str:
+    """Reply subjects for this login. JetStream delivers pulled mailbox messages to reply inboxes, so a
+    shared _INBOX would let any node read every other node's mail. Each user gets its own prefix, and the
+    server lets it subscribe only there (server_config)."""
+    return f"_INBOX_{user}" if user else "_INBOX"
+
+
 async def connect(cfg: NatsConfig, name: str, *, reconnect: bool = True, connect_timeout: float = 5,
                   initial_connect_attempts: int | None = None) -> NATS:
     options: dict[str, Any] = {
@@ -99,6 +106,7 @@ async def connect(cfg: NatsConfig, name: str, *, reconnect: bool = True, connect
     if cfg.user:
         options["user"] = cfg.user
         options["password"] = cfg.resolved_password()
+        options["inbox_prefix"] = inbox_prefix(cfg.user)
     elif cfg.resolved_token():
         options["token"] = cfg.resolved_token()
     if cfg.tls_ca or cfg.tls_cert:
