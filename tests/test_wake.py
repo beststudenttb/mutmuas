@@ -362,3 +362,19 @@ async def _call(proc, id_, name, args):
 
 async def _find(out, pred):
     return next((m for m in out if pred(m)), None)
+
+
+async def test_lease_holder_from_older_code_still_lets_its_own_session_act(tmp_path):
+    """C, 2026-09-25: the holder's MCP ran e2fb5d1 (no session_pid); the session's own agentctl was refused."""
+    from mutmuas.ledger import Ledger
+    from mutmuas.node import lease_refusal
+    ledger = Ledger(tmp_path / "l.sqlite3")
+    mcp = await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(30)")
+    try:
+        ledger.session_beat("B:desk", mcp.pid, "/x")                     # old code: no session_pid recorded
+        assert ledger.session_of("B:desk")["session_pid"] is None
+        assert lease_refusal(ledger, "B:desk") is None                  # we are that MCP process's parent
+    finally:
+        mcp.kill()
+        await mcp.wait()
+        ledger.close()

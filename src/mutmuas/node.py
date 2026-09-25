@@ -87,7 +87,10 @@ def lease_refusal(ledger, agent: str) -> str | None:
     row = ledger.session_of(agent)
     if not row or row["pid"] in (0, os.getpid()) or not session_alive(row):
         return None
-    allowed = {row["pid"], row.get("session_pid")} - {None, 0}
+    # session_pid is missing when the holder's MCP process runs older code (e2fb5d1) than this CLI, as during
+    # an upgrade: then the MCP process's own parent is the session.
+    session = row.get("session_pid") or next(iter(_ancestors(row["pid"])[:1]), None)
+    allowed = {row["pid"], session} - {None, 0}
     if allowed & {os.getpid(), *_ancestors(os.getpid())}:
         return None
     return (f"{agent} is held by another session (process {row['pid']}, directory {row.get('cwd')}); this process "
