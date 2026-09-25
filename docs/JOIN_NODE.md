@@ -9,6 +9,8 @@
 
 ## 第 0 步 前提(笔记本)
 
+- **先读 [BEFORE_JOINING.md](BEFORE_JOINING.md)(入职前须知)**,读完再往下做。
+
 - 系统:macOS 或 Linux。Windows 请在 WSL2(Ubuntu)里操作,本文按 Linux 走。
 - 已装:`git`、conda(Miniconda/Anaconda 都行)、Claude Code CLI(`claude --version` 能出版本号)。
 - 能访问服务器:`nc -vz 150.89.170.193 4222` 显示 succeeded/open。
