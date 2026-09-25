@@ -496,10 +496,14 @@ def node_server_config(args):
     nodes = [n.strip() for n in args.nodes.split(",") if n.strip()]
     tls_hosts = [h.strip() for h in args.tls.split(",") if h.strip()] if args.tls else None
     written = generate(args.project, nodes, Path(args.out), tls_hosts=tls_hosts, port=args.port,
-                       store_dir=args.store_dir, listen_host=args.listen)
+                       store_dir=args.store_dir, listen_host=args.listen, reception=args.reception,
+                       invites=args.invite or [])
     for name, path in written.items():
         print(f"{name:>8}: {path}")
     print("copy <NODE>.env to each node and reference it as nats.credentials_file")
+    if args.invite:
+        print("invites/<ID>.env: its password is the invite code for the leader to hand over; the newcomer "
+              "connects as invite_<ID> with inbox_prefix _INV.<ID>. Re-run without --invite ID to delete it")
     if tls_hosts:
         print("copy tls/ca.crt (public, not secret) to each node and set nats.tls_ca; "
               f"connect with nats://{tls_hosts[0]}:{args.port}")
@@ -805,6 +809,10 @@ def agent_node_parser() -> argparse.ArgumentParser:
     p.add_argument("--tls", metavar="HOSTS",
                    help="enable TLS; comma separated IPs/DNS names clients use to reach the server "
                         "(e.g. 150.89.170.193). Generates a private CA + server cert")
+    p.add_argument("--reception", action="store_true",
+                   help="also a 'reception' user for the onboarding desk (reception.env)")
+    p.add_argument("--invite", action="append", metavar="ID",
+                   help="temporary mailbox for one newcomer (repeatable); leave an ID out to delete it")
     p.set_defaults(sync=node_server_config)
     p = sub.add_parser("service", help="launchd (macOS) / systemd (Linux) unit for the daemon")
     p.add_argument("--config")
