@@ -37,6 +37,7 @@ from .ids import Address, now_iso, parse_iso
 from .protocol import (REQUEST_KINDS, TERMINAL_STATES, ArtifactRef, Envelope, ProtocolError, reply_required,
                        result_body, task_state_for_result)
 from .runtime import TaskContext, make_runtime
+from .visibility import CARD_KEYS, accepts_kinds, acl, short
 from .worktree import GitError, Worktree
 
 log = logging.getLogger(__name__)
@@ -60,6 +61,37 @@ def _pid_alive(pid: int) -> bool:
 
 def session_alive(session: dict[str, Any]) -> bool:
     return session_fields(session, Path("/")).get("session") == "online"
+
+
+def _ancestors(pid: int) -> list[int]:
+    """pid's parent chain (via ps: works on macOS and Linux)."""
+    import subprocess
+    chain, seen = [], set()
+    while pid > 1 and pid not in seen:
+        seen.add(pid)
+        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True)
+        try:
+            pid = int(out.stdout.strip())
+        except ValueError:
+            break
+        chain.append(pid)
+    return chain
+
+
+def lease_refusal(ledger, agent: str) -> str | None:
+    """Why this process may not act as `agent` now, or None. A live session holds the agent: only that session
+    (its MCP process, or anything the session itself started, e.g. agentctl from its shell) may use it.
+    Daemon-run tasks (MUTMUAS_TASK_ID) are not sessions and are never refused."""
+    if os.environ.get("MUTMUAS_TASK_ID"):
+        return None
+    row = ledger.session_of(agent)
+    if not row or row["pid"] in (0, os.getpid()) or not session_alive(row):
+        return None
+    allowed = {row["pid"], row.get("session_pid")} - {None, 0}
+    if allowed & {os.getpid(), *_ancestors(os.getpid())}:
+        return None
+    return (f"{agent} is held by another session (process {row['pid']}, directory {row.get('cwd')}); this process "
+            "does not hold its session, so it may not read or answer its mail. One agent, one session.")
 
 
 def public_session(fields: dict[str, Any]) -> dict[str, Any]:
@@ -280,6 +312,10 @@ class NodeDaemon:
                     self.hub.ledger.mark_handled(env.message_id, "dropped", repr(e))
 
     async def _handle(self, agent: AgentConfig, env: Envelope) -> str | None:
+        if env.type == "UPDATE" and env.body.get("copy_of"):
+            return self._on_observer_copy(env)
+        if env.type == "UPDATE" and env.body.get("observers_add"):
+            return self._on_observers_added(env)
         if env.type == "REQUEST":
             return await self._on_request(agent, env)
         elif env.type == "CANCEL":
@@ -288,6 +324,31 @@ class NodeDaemon:
             pass   # surfaced to the agent through its inbox (MCP/CLI); see technical debt in docs
         else:
             await self._on_reply(env)
+
+    def _on_observer_copy(self, env: Envelope) -> str | None:
+        """A copy of a task's REQUEST or RESULT for an observer. Kept only if a participant sent it and the
+        recipient is among the participants it lists; then the recipient has an observer row (its ACL)."""
+        copy, people = env.body.get("copy_of") or {}, set(env.body.get("participants") or [])
+        if env.sender not in people or env.to not in people or not copy.get("from") or not copy.get("to"):
+            log.warning("dropped observer copy %s: sender or recipient not among its participants", env.short())
+            return "rejected"
+        requester, owner = ((copy["from"], copy["to"]) if copy.get("type") == "REQUEST"
+                            else (copy["to"], copy["from"]))
+        self.hub.ledger.record_observed(
+            env.task_id, env.to, requester, owner,
+            request=copy.get("body") if copy.get("type") == "REQUEST" else None,
+            result=copy.get("body") if copy.get("type") == "RESULT" else None,
+            observers=sorted(people - {requester, owner}))
+        return None
+
+    def _on_observers_added(self, env: Envelope) -> str | None:
+        """Another participant added observers: extend our copy of the list, so this side forwards the
+        RESULT to them too. Ignored unless the sender takes part in the task on our records."""
+        if env.sender not in acl(self.hub.ledger, env.task_id):
+            log.warning("ignored observers_add from non-participant %s on %s", env.sender, env.task_id)
+            return "rejected"
+        self.hub.ledger.add_observers(env.task_id, [str(o) for o in env.body["observers_add"]])
+        return None
 
     async def _on_request(self, agent: AgentConfig, env: Envelope) -> str | None:
         hub = self.hub
@@ -312,9 +373,9 @@ class NodeDaemon:
         if agent.mode == "worker":
             await self._accept(env.task_id)
             self._enqueue(env.to, env.task_id)
-            await self._notify(agent, env.to, env.task_id,
-                               f"FYI: {env.to} accepted a {env.body.get('kind', 'query')} task from {env.sender}: "
-                               f"{env.body.get('objective', '')[:300]}")
+            await self._notify(agent, env.to, env.task_id,      # status layer only: the lead is no participant
+                               f"FYI: {env.to} accepted {env.task_id} from {env.sender}: "
+                               f"{short(env.body.get('objective'))}")
         else:
             # Interactive agents accept explicitly (accept_task). Tell the requester it arrived meanwhile,
             # so "delivered but not picked up yet" is distinguishable from "lost".
@@ -458,7 +519,7 @@ class NodeDaemon:
         await hub.finish(task_id, body, refs)
         await self._notify(agent, current["owner"], task_id,
                            f"FYI: {current['owner']} finished {task_id} for {current['requester']} "
-                           f"({body['status']}): {body.get('summary', '')[:300]}")
+                           f"({body['status']})")
 
     async def _notify(self, agent: AgentConfig, sender: str, task_id: str, text: str) -> None:
         """Copy a node's lead (agent.notify) on work its workers take on. Best effort, informational only."""
@@ -586,18 +647,18 @@ class NodeDaemon:
             pending = None
             with contextlib.suppress(Exception):
                 pending = await bus.inbox_pending(Address(self.cfg.node, agent.id))
-            await bus.kv_put(bus.names.agents_kv, f"{self.cfg.node}.{agent.id}", {
+            card = {
                 "address": addr, "node": self.cfg.node, "agent_id": agent.id, "display": agent.display,
-                "role": agent.role, "description": agent.description, "provider": agent.provider,
-                "model": agent.model, "runtime": agent.runtime, "mode": agent.mode,
-                "capabilities": agent.capabilities, "permissions": agent.permissions,
-                "accept_from": agent.accept_from, "resources": self.cfg.resources,
+                "role": agent.role, "provider": agent.provider, "mode": agent.mode,
+                "capabilities": agent.capabilities, "accepts_kinds": accepts_kinds(agent.permissions),
                 # Public layer only (visibility.py): coarse availability, no current task, queue or inbox
                 # counts, no session directory. The agent reads its own details locally (whoami).
                 "state": state, "availability": "busy" if running or owned_open else "available",
                 **(public_session(session_fields(hub.ledger.session_of(addr), agent.workdir_path))
                    if agent.mode == "interactive" else {}),
-                "heartbeat_s": self.cfg.heartbeat_s, "last_heartbeat": now})
+                "heartbeat_s": self.cfg.heartbeat_s, "last_heartbeat": now}
+            await bus.kv_put(bus.names.agents_kv, f"{self.cfg.node}.{agent.id}",
+                             {k: v for k, v in card.items() if k in CARD_KEYS})
             if agent.mode == "interactive":
                 await self._warn_session_dir(addr, hub.ledger.session_of(addr), agent.workdir_path)
 

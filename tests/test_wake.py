@@ -254,3 +254,111 @@ async def test_one_agent_one_session(make_config, cluster):
 
 async def _pushed(notes, task_id):
     return next((n for n in notes if n["meta"].get("task_id") == task_id), None)
+
+
+# ---- A:codex review of the lease (dfacc41): reproduced first, then fixed ----
+
+def test_codex_lease_claim_has_no_race(tmp_path, monkeypatch):
+    """Two processes claiming at once must not both end up holding the agent."""
+    import threading
+    import time
+
+    from mutmuas.ledger import Ledger
+    path = tmp_path / "l.sqlite3"
+    Ledger(path).close()
+    original = Ledger.session_beat
+
+    def slow_beat(self, *a, **kw):              # widen any window between the check and the write
+        time.sleep(0.3)
+        return original(self, *a, **kw)
+    monkeypatch.setattr(Ledger, "session_beat", slow_beat)
+    results, barrier = {}, threading.Barrier(2)
+
+    def claim(pid):
+        ledger = Ledger(path)
+        barrier.wait()
+        results[pid] = ledger.session_claim("B:desk", pid, "/x", lambda row: True)
+        ledger.close()
+    threads = [threading.Thread(target=claim, args=(pid,)) for pid in (1001, 1002)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    holders = {pid for pid, holder in results.items() if holder == pid}
+    assert len(holders) == 1, results
+
+
+async def test_codex_second_session_cannot_use_the_agent(make_config, cluster, tmp_path):
+    a, b, hub_a, hub_b = await _pair(make_config, cluster)
+    workdir = b.agents[0].workdir_path
+    workdir.mkdir(parents=True, exist_ok=True)
+    first, first_out, p1 = await _mcp2(b, workdir)
+    await eventually(lambda: _card(hub_a, "B:desk", "online"), what="first session holds B:desk")
+    second, second_out, p2 = await _mcp2(b, workdir)
+    await eventually(lambda: _find(second_out, lambda m: (m.get("params") or {}).get("meta", {}).get("session")
+                                   == "duplicate"), what="second told")
+    sent = await tools.send_request(hub_a, "A:main", "B:desk", "mail for the holder", "lease test")
+    await eventually(lambda: tools.inbox(hub_b, "B:desk", peek=True), what="mail arrived")
+    # pause the holder (still the holder: its last beat is fresh) so only the second session could take a reminder
+    import signal
+    holder_pid = hub_b.ledger.session_of("B:desk")["pid"]
+    os.kill(holder_pid, signal.SIGSTOP)
+    await tools.remind_me(hub_b, "B:desk", "+0m", "holder's reminder")
+    await asyncio.sleep(2.5)
+    assert not await _find(second_out, lambda m: "holder's reminder" in json.dumps(m))
+    os.kill(holder_pid, signal.SIGCONT)
+
+    await _call(second, 7, "inbox", {"peek": False})
+    denied = await eventually(lambda: _find(second_out, lambda m: m.get("id") == 7), what="second's tool reply")
+    assert "does not hold" in json.dumps(denied)
+    assert await tools.inbox(hub_b, "B:desk", peek=True)                        # the mail was not taken
+    await _call(first, 8, "inbox", {"peek": True})
+    ok = await eventually(lambda: _find(first_out, lambda m: m.get("id") == 8), what="holder's tool reply")
+    assert sent["task_id"] in json.dumps(ok)
+
+    got = await eventually(lambda: _find(first_out, lambda m: "holder's reminder" in json.dumps(m)),
+                           what="reminder reaches the holder")
+    assert got and not await _find(second_out, lambda m: "holder's reminder" in json.dumps(m))
+
+    # the CLI from outside the holder's session is refused too; from inside it (a descendant) it works
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    outside = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "mutmuas.cli", "inbox", "--peek", "--config", str(b.path), "--as", "B:desk",
+        env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    out, err = await outside.communicate()
+    assert outside.returncode != 0 and b"session" in err
+    for proc, pump in ((first, p1), (second, p2)):
+        proc.stdin.close()
+        await asyncio.wait_for(proc.wait(), 15)
+        pump.cancel()
+
+
+async def _mcp2(b, workdir, beat="0.5"):
+    """Like _mcp, but the MCP server runs under its own shell (the 'session'), and every stdout line is kept."""
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path), "MUTMUAS_SESSION_BEAT_S": beat}
+    env.pop("MUTMUAS_TASK_ID", None)
+    cmd = f"{sys.executable} -m mutmuas.cli mcp --channel --config {b.path} --as B:desk; true"
+    proc = await asyncio.create_subprocess_exec(
+        "/bin/sh", "-c", cmd, cwd=str(workdir), env=env, stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    out: list[dict] = []
+
+    async def pump():
+        while line := await proc.stdout.readline():
+            out.append(json.loads(line))
+    for msg in ({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}):
+        proc.stdin.write((json.dumps(msg) + "\n").encode())
+    await proc.stdin.drain()
+    return proc, out, asyncio.create_task(pump())
+
+
+async def _call(proc, id_, name, args):
+    proc.stdin.write((json.dumps({"jsonrpc": "2.0", "id": id_, "method": "tools/call",
+                                  "params": {"name": name, "arguments": args}}) + "\n").encode())
+    await proc.stdin.drain()
+
+
+async def _find(out, pred):
+    return next((m for m in out if pred(m)), None)

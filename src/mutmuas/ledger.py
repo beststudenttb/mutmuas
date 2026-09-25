@@ -71,7 +71,8 @@ CREATE INDEX IF NOT EXISTS tasks_status ON tasks(role, status);
 -- exactly as long as the session; read by the daemon for the registry card (session: online|offline).
 CREATE TABLE IF NOT EXISTS sessions (
     local_agent     TEXT PRIMARY KEY,
-    pid             INTEGER NOT NULL,
+    pid             INTEGER NOT NULL,           -- the session's mutmuas MCP process
+    session_pid     INTEGER,                    -- its parent: the session itself (Claude Code, Codex, ...)
     cwd             TEXT,
     started_at      TEXT NOT NULL,
     last_seen       TEXT NOT NULL
@@ -119,6 +120,11 @@ class Ledger:
         self.db.execute("PRAGMA busy_timeout=30000")
         self._migrate_v1()
         self.db.executescript(SCHEMA)
+        self._add_column("sessions", "session_pid", "INTEGER")    # ledgers created by exp/wake e2fb5d1
+
+    def _add_column(self, table: str, column: str, decl: str) -> None:
+        if column not in [r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")]:
+            self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def _migrate_v1(self) -> None:
         """v1 keyed messages on message_id alone, which dropped same-node deliveries. Re-key in place."""
@@ -259,28 +265,31 @@ class Ledger:
 
     # ---- sessions and follow-ups ------------------------------------------
 
-    def session_beat(self, local_agent: str, pid: int, cwd: str | None) -> None:
-        now = now_iso()
-        self.db.execute("INSERT INTO sessions (local_agent, pid, cwd, started_at, last_seen) VALUES (?,?,?,?,?)"
-                        " ON CONFLICT(local_agent) DO UPDATE SET pid=excluded.pid, cwd=excluded.cwd,"
-                        " last_seen=excluded.last_seen,"
-                        " started_at=CASE WHEN sessions.pid=excluded.pid THEN sessions.started_at"
-                        " ELSE excluded.started_at END",
-                        (local_agent, pid, cwd, now, now))
+    _BEAT_SQL = ("INSERT INTO sessions (local_agent, pid, session_pid, cwd, started_at, last_seen)"
+                 " VALUES (?,?,?,?,?,?) ON CONFLICT(local_agent) DO UPDATE SET pid=excluded.pid,"
+                 " session_pid=excluded.session_pid, cwd=excluded.cwd, last_seen=excluded.last_seen,"
+                 " started_at=CASE WHEN sessions.pid=excluded.pid THEN sessions.started_at"
+                 " ELSE excluded.started_at END")
 
-    def session_claim(self, local_agent: str, pid: int, cwd: str | None, holder_alive) -> int:
+    def session_beat(self, local_agent: str, pid: int, cwd: str | None, session_pid: int | None = None) -> None:
+        now = now_iso()
+        self.db.execute(self._BEAT_SQL, (local_agent, pid, session_pid, cwd, now, now))
+
+    def session_claim(self, local_agent: str, pid: int, cwd: str | None, holder_alive,
+                      session_pid: int | None = None) -> int:
         """One agent, one session: beat as the holder if the lease is free, stale or already ours. Otherwise
-        record us as a contender and return the holder's pid. holder_alive(row) decides whether the current
-        holder still counts (fresh heartbeat and a live process)."""
+        record us as a contender and return the holder's pid. The check and the write are one transaction
+        (BEGIN IMMEDIATE), so two sessions starting together cannot both win."""
+        now = now_iso()
         with self.tx() as db:
             row = db.execute("SELECT * FROM sessions WHERE local_agent=?", (local_agent,)).fetchone()
             if row is not None and row["pid"] not in (0, pid) and holder_alive(dict(row)):
                 db.execute("INSERT INTO session_contenders (local_agent, pid, cwd, last_seen) VALUES (?,?,?,?)"
                            " ON CONFLICT(local_agent, pid) DO UPDATE SET last_seen=excluded.last_seen, cwd=excluded.cwd",
-                           (local_agent, pid, cwd, now_iso()))
+                           (local_agent, pid, cwd, now))
                 return row["pid"]
             db.execute("DELETE FROM session_contenders WHERE local_agent=? AND pid=?", (local_agent, pid))
-        self.session_beat(local_agent, pid, cwd)
+            db.execute(self._BEAT_SQL, (local_agent, pid, session_pid, cwd, now, now))
         return pid
 
     def session_contenders(self, local_agent: str) -> list[dict[str, Any]]:
@@ -313,8 +322,42 @@ class Ledger:
             "SELECT * FROM reminders WHERE local_agent=? AND fired_at IS NULL AND due <= ? ORDER BY due",
             (local_agent, now))]
 
-    def fire_reminder(self, reminder_id: int) -> None:
-        self.db.execute("UPDATE reminders SET fired_at=? WHERE id=?", (now_iso(), reminder_id))
+    def fire_reminder(self, reminder_id: int) -> bool:
+        """Take a due reminder: True for exactly one caller, so it is pushed once."""
+        cur = self.db.execute("UPDATE reminders SET fired_at=? WHERE id=? AND fired_at IS NULL",
+                              (now_iso(), reminder_id))
+        return cur.rowcount == 1
+
+    def record_observed(self, task_id: str, observer: str, requester: str, owner: str,
+                        request: dict[str, Any] | None = None, result: dict[str, Any] | None = None,
+                        observers: list[str] | None = None) -> None:
+        """An observer's own row for a task it was given copies of (role observer:<agent>)."""
+        role, now = f"observer:{observer}", now_iso()
+        with self.tx() as db:
+            row = db.execute("SELECT request, result FROM tasks WHERE task_id=? AND role=?", (task_id, role)).fetchone()
+            old_request = json.loads(row["request"]) if row and row["request"] else {}
+            new_request = {**old_request, **(request or {})}
+            if observers:
+                new_request["observers"] = sorted(set(new_request.get("observers") or []) | set(observers))
+            new_result = result if result is not None else (json.loads(row["result"]) if row and row["result"] else None)
+            status = "COMPLETED" if new_result and new_result.get("status") != "failed" else (
+                "FAILED" if new_result else "PENDING")
+            db.execute("INSERT INTO tasks (task_id, role, local_agent, requester, owner, status, result_status, request,"
+                       " result, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+                       " ON CONFLICT(task_id, role) DO UPDATE SET request=excluded.request, result=excluded.result,"
+                       " status=excluded.status, result_status=excluded.result_status, updated_at=excluded.updated_at",
+                       (task_id, role, observer, requester, owner, status,
+                        (new_result or {}).get("status"), json.dumps(new_request, ensure_ascii=False),
+                        json.dumps(new_result, ensure_ascii=False) if new_result is not None else None, now, now))
+
+    def add_observers(self, task_id: str, observers: list[str]) -> None:
+        """Extend the observer list on every row this node keeps for the task."""
+        with self.tx() as db:
+            for row in db.execute("SELECT role, request FROM tasks WHERE task_id=?", (task_id,)).fetchall():
+                request = json.loads(row["request"]) if row["request"] else {}
+                request["observers"] = sorted(set(request.get("observers") or []) | set(observers))
+                db.execute("UPDATE tasks SET request=?, updated_at=? WHERE task_id=? AND role=?",
+                           (json.dumps(request, ensure_ascii=False), now_iso(), task_id, row["role"]))
 
     def notice_once(self, task_id: str, reason: str) -> bool:
         """True the first time (task_id, reason) is recorded: send that follow-up now, and never again."""

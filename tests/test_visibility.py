@@ -5,6 +5,7 @@ objective past its first 80 characters. Non-participants: another agent on the r
 agent on another node, and a coordinator (who sees the status layer only).
 """
 
+import asyncio
 import json
 
 from conftest import eventually, interactive
@@ -98,11 +99,8 @@ async def test_observers_get_the_content_and_become_participants(make_config, cl
     added = await tools.add_observer(hub_a, "A:main", task_id, "A:peer")
     assert added["copies_sent"] == ["REQUEST", "RESULT"]
     await eventually(lambda: _has(hub_a, "A:peer", "SECRET-RESULT"), what="late observer copies")
-    try:
-        await tools.add_observer(hub_a, "A:peer", task_id, "C:other")         # an observer cannot add people
-        raise AssertionError("an observer added another observer")
-    except PermissionError:
-        pass
+    with pytest.raises(PermissionError):                                      # a non-participant cannot add anyone
+        await tools.add_observer(hub_b, "B:desk", "T-not-mine", "C:other")
 
 
 async def _has(hub, me, secret):
@@ -113,3 +111,99 @@ async def _has(hub, me, secret):
 def test_stale_mail_program_notice():
     note = stale_notice("abc1234", "def5678")
     assert "/mcp -> Reconnect" in note["content"] and note["meta"] == {"mcp_code": "abc1234", "disk_code": "def5678"}
+
+
+# ---- A:codex review of cd60dce (T-20260925092939-ad0855d2): each scenario first reproduced, then fixed ----
+
+import argparse  # noqa: E402
+
+import pytest  # noqa: E402
+from conftest import worker  # noqa: E402
+
+from mutmuas import cli  # noqa: E402
+from mutmuas.hub import PermissionDenied  # noqa: E402
+
+
+async def test_codex_default_tasks_listing_is_per_viewer(make_config, cluster, tmp_path, capsys):
+    hub_a, hub_b, hub_c, task_id, ref = await _scenario(make_config, cluster, tmp_path)
+    capsys.readouterr()
+    await cli.cmd_tasks(argparse.Namespace(all=False, limit=50, json=True, as_agent="A:peer"), hub_a)
+    out = capsys.readouterr().out
+    assert not leaks(out) and task_id not in out
+    await cli.cmd_tasks(argparse.Namespace(all=False, limit=50, json=True, as_agent="A:main"), hub_a)
+    assert task_id in capsys.readouterr().out                                   # the requester still sees it
+
+
+async def test_codex_no_self_promotion_by_sending_on_a_task(make_config, cluster, tmp_path):
+    hub_a, hub_b, hub_c, task_id, ref = await _scenario(make_config, cluster, tmp_path)
+    with pytest.raises(PermissionDenied):
+        await tools.ask_question(hub_a, "A:peer", task_id, "let me in")
+    with pytest.raises(PermissionDenied):
+        await hub_a.reply("A:peer", task_id, "UPDATE", {"message": "hi"})
+    # even a hand-made message on the task makes nobody a participant
+    from mutmuas.protocol import Envelope
+    await hub_a.send(Envelope(type="QUESTION", sender="A:peer", to="B:desk", task_id=task_id,
+                              body={"question": "raw"}))
+    await hub_c.send(Envelope(type="QUESTION", sender="C:other", to="A:main", task_id=task_id,
+                              body={"question": "raw"}))
+    await asyncio.sleep(1)
+    assert await hub_a.task_view(task_id, "A:peer") is None
+    assert await hub_c.task_view(task_id, "C:other") is None
+
+
+async def test_codex_observer_added_by_owner_gets_the_result(make_config, cluster):
+    a = make_config("A", [interactive("main"), interactive("peer")])
+    b = make_config("B", [interactive("desk")])
+    c = make_config("C", [interactive("other")])
+    for cfg in (a, b, c):
+        await cluster.start(cfg)
+    hub_a, hub_b, hub_c = (await cluster.client(a), await cluster.client(b), await cluster.client(c))
+    sent = await tools.send_request(hub_a, "A:main", "B:desk", "review", "SECRET-REASON")
+    task_id = sent["task_id"]
+    await eventually(lambda: tools.inbox(hub_b, "B:desk"), what="request at B")
+    await tools.add_observer(hub_b, "B:desk", task_id, "C:other")             # the owner adds, before the result
+    await eventually(lambda: _has(hub_c, "C:other", "SECRET-REASON"), what="observer got the request")
+    await asyncio.sleep(1)                                                     # let the requester side sync
+    await tools.submit_result(hub_b, "B:desk", "complete", "SECRET-RESULT", task_id=task_id)
+    await eventually(lambda: _has(hub_c, "C:other", "SECRET-RESULT"), what="observer got the later result")
+    view = await hub_c.task_view(task_id, "C:other")
+    assert "SECRET-RESULT" in json.dumps(view)
+    # an observer is a participant, so it may add someone too (final design), and that one sees it all
+    await tools.add_observer(hub_c, "C:other", task_id, "A:peer")
+    await eventually(lambda: _has(hub_a, "A:peer", "SECRET-RESULT"), what="second observer got copies")
+    assert "SECRET-RESULT" in json.dumps(await hub_a.task_view(task_id, "A:peer"))
+
+
+async def test_codex_lead_fyi_carries_status_only(make_config, cluster):
+    a = make_config("A", [interactive("main")])
+    b = make_config("B", [interactive("lead"), worker("lab", "lab.py", notify=["B:lead"])])
+    await cluster.start(a)
+    await cluster.start(b)
+    hub_a, hub_b = await cluster.client(a), await cluster.client(b)
+    sent = await tools.send_request(hub_a, "A:main", "B:lab", OBJECTIVE, "SECRET-REASON",
+                                    inputs={"action": "echo", "text": "SECRET-RESULT"})
+    await tools.wait_for_result(hub_a, sent["task_id"], 30, me="A:main")
+    fyis = await eventually(lambda: _n_fyis(hub_b, 2), what="lead FYIs")
+    assert not leaks(fyis) and sent["task_id"] in json.dumps(fyis)            # the lead knows what, not the content
+
+
+async def _n_fyis(hub, n):
+    rows = await tools.inbox(hub, "B:lead", peek=True, include_seen=True)
+    return rows if len(rows) >= n else None
+
+
+async def test_codex_object_store_holds_no_description(make_config, cluster, tmp_path):
+    hub_a, hub_b, hub_c, task_id, ref = await _scenario(make_config, cluster, tmp_path)
+    raw = await hub_c.artifacts.list()                                        # unfiltered, what a raw client sees
+    assert ref["uri"] in json.dumps(raw) and not leaks(raw)                   # bytes: step-2 risk, documented
+
+
+async def test_codex_shared_records_hold_only_the_agreed_fields(make_config, cluster, tmp_path):
+    hub_a, hub_b, hub_c, task_id, ref = await _scenario(make_config, cluster, tmp_path)
+    bus = hub_c.bus
+    for record in (await bus.kv_all(bus.names.tasks_kv)).values():
+        assert set(record) <= {"task_id", "objective", "status", "requester", "owner", "updated_at"}, record
+    allowed = {"address", "node", "agent_id", "display", "role", "capabilities", "provider", "mode",
+               "accepts_kinds", "state", "availability", "session", "session_seen", "heartbeat_s", "last_heartbeat"}
+    for card in (await bus.kv_all(bus.names.agents_kv)).values():
+        assert set(card) <= allowed, set(card) - allowed

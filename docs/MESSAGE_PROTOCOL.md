@@ -88,9 +88,14 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   - `session_warning` when the session was started outside the agent's workdir. Claude Code keeps memory
     per start directory, so a wrong start directory means an empty memory.
 - **One agent, one session.** The first session's MCP process holds the agent (a lease in the node
-  ledger). A second session acting as the same agent is told at once, receives no mail pushes, and should
-  not read that agent's mail. The holder is told about it too. When the holder closes, the other session
-  takes over at its next heartbeat. Two projects on one machine are two agents (e.g. `C:paper` and
+  ledger). The check and the write are one transaction, so two sessions starting together cannot both win.
+  - A second session acting as the same agent is told at once and receives no mail pushes and no
+    reminders.
+  - Its MCP tools (all but `whoami`) refuse to act.
+  - `agentctl` commands for that agent are refused too, unless they run inside the holding session: a
+    descendant of the session process, such as its shell.
+  - The holder is told about the contender. When the holder closes, the other session takes over at its
+    next heartbeat. Two projects on one machine are two agents (e.g. `C:paper` and
   `C:course`), not two sessions of one agent.
 - **Follow-ups.** Every 30 s the requester's daemon checks the tasks it is owed. Each follow-up is sent
   once: an UPDATE to the requester with `next` set to the requester (so it wakes), copied as an FYI to
@@ -119,8 +124,8 @@ There are four layers (`src/mutmuas/visibility.py`):
 
 | layer | who | what |
 |---|---|---|
-| public | everyone | address, role, capabilities, online/offline, `session` on duty, `availability` available/busy |
-| task status | coordinators + participants | task id, first 80 characters of the objective, status, requester → owner, times |
+| public | everyone | address, role, capabilities, provider, mode, `accepts_kinds`, online/offline, `session` on duty, `availability` available/busy |
+| task status | coordinators + participants | task id, first 80 characters of the objective, status, requester → owner, last update |
 | task content | participants only: requester, owner, `observers` | reason, inputs, the thread, the RESULT, artifacts |
 | private | nobody | session reasoning, memory, work logs, transcripts, raw run logs. Never sent over mutmuas; ask the person, who answers with a condensed summary |
 
@@ -135,12 +140,26 @@ There are four layers (`src/mutmuas/visibility.py`):
   - `artifact list` and `fetch` cover only artifacts the viewer published or was sent.
 - `coordinators` is set in the HR-issued node.yaml, e.g. `[B:claude-secretary]`; an agent cannot make
   itself one.
-- `observers` on a REQUEST (`agentctl ask --observer`), or `add_observer` / `agentctl observe` later by a
-  participant: observers receive FYI copies of the REQUEST and RESULT, and are participants from then on.
-  Copies never wake them.
+- **Participants** come from what the node persisted for the task: its requester, its owner, the `observers`
+  listed on its request, and agents holding an observer row. Sending mail on a task makes nobody a
+  participant. Only the requester or owner may send on a task: `reply`, `question`, `answer`, and `send`
+  with `--task`.
+- `observers` go on a REQUEST (`agentctl ask --observer`), or any participant adds them later with
+  `add_observer` / `agentctl observe`.
+  - Observers receive FYI copies of the REQUEST and RESULT. The copies never wake them.
+  - Each copy lists the task's participants. The observer's node keeps a copy only if both the sender and
+    the recipient are on that list.
+  - Every other participant is told `observers_add`, so the requester's side also forwards a later RESULT.
+- A worker's `notify` lead gets the status layer only: task id, a short objective, status.
+- Artifacts: the object store keeps no description (it travels in the participants' ArtifactRef).
 - A session started outside its workdir is reported to the agent and to the coordinators, not on the card.
-- **Not a security boundary.** Every process holding the node credential can still read the message
-  stream. Enforcement (the daemon as the only NATS principal, or NATS accounts) is step 2.
+- **Not a security boundary.** Every process holding the node credential can still read:
+  - the message stream;
+  - the object-store bytes;
+  - its node's whole ledger (the SQLite file).
+
+  It can also pass `--as` for another agent of its node, because there is no process identity in step 1.
+  Enforcement (the daemon as the only NATS principal, per-agent identity, or NATS accounts) is step 2.
 
 ### Example REQUEST
 

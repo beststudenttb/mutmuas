@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -25,7 +26,7 @@ from . import tools
 from .config import NodeConfig
 from .hub import Hub
 from .ids import now_iso
-from .node import _code_version, session_alive
+from .node import _code_version, lease_refusal, session_alive
 
 INSTRUCTIONS = """You are connected to the mutmuas multi-agent network. Other agents live on other machines
 (nodes) and are addressed as NODE:agent (e.g. B:representation). Use these tools instead of asking the
@@ -112,7 +113,7 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         One agent, one session: a second session gets told and receives no pushes until the first is gone."""
         me, told = os.getpid(), set()
         while True:
-            holder = hub.ledger.session_claim(addr, me, os.getcwd(), session_alive)
+            holder = hub.ledger.session_claim(addr, me, os.getcwd(), session_alive, session_pid=os.getppid())
             if holder != me and state.get("duplicate_of") != holder:
                 state["duplicate_of"] = holder
                 await push_now(duplicate_notice(addr, holder))
@@ -151,9 +152,9 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
                 cursor = max(cursor, m["seq"] or cursor)
                 if not state.get("duplicate_of"):          # only the session holding the agent is woken
                     await send(channel_notice(m))
-            for r in hub.ledger.due_reminders(addr, now_iso()):
-                await send(reminder_notice(r))
-                hub.ledger.fire_reminder(r["id"])
+            for r in ([] if state.get("duplicate_of") else hub.ledger.due_reminders(addr, now_iso())):
+                if hub.ledger.fire_reminder(r["id"]):   # only the holder takes the agent's reminders, once
+                    await send(reminder_notice(r))
             await asyncio.sleep(PUSH_POLL_S)
 
     @asynccontextmanager
@@ -177,6 +178,23 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
             await hub.close()
 
     server = MCPServer("mutmuas", instructions=INSTRUCTIONS, lifespan=lifespan)
+    register = server.tool
+
+    def guarded_tool(*dargs, **dkw):
+        """Every tool but whoami first checks that this session holds the agent (one agent, one session)."""
+        def wrap(fn):
+            if fn.__name__ == "whoami":
+                return register(*dargs, **dkw)(fn)
+
+            @functools.wraps(fn)
+            async def checked(*args, **kwargs):
+                refusal = lease_refusal(state["hub"].ledger, state["me"])
+                if refusal:
+                    return dump({"error": refusal + " This session does not hold the agent."})
+                return await fn(*args, **kwargs)
+            return register(*dargs, **dkw)(checked)
+        return wrap
+    server.tool = guarded_tool
 
     def hub() -> Hub:
         return state["hub"]

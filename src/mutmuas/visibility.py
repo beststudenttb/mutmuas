@@ -15,14 +15,17 @@ as the only NATS principal, or NATS accounts) is step 2.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from .config import NodeConfig
 from .ledger import Ledger
 
 OBJECTIVE_CHARS = 80
-STATUS_KEYS = ("task_id", "requester", "owner", "parent_task", "kind", "status", "result_status", "attempts",
-               "created_at", "updated_at")
+STATUS_KEYS = ("task_id", "requester", "owner", "status", "updated_at")
+# The public registry card: who someone is and whether they can take work now, nothing about the work.
+CARD_KEYS = ("address", "node", "agent_id", "display", "role", "capabilities", "provider", "mode", "accepts_kinds",
+             "state", "availability", "session", "session_seen", "heartbeat_s", "last_heartbeat")
 
 
 def short(text: str | None, n: int = OBJECTIVE_CHARS) -> str:
@@ -34,9 +37,26 @@ def status_layer(record: dict[str, Any]) -> dict[str, Any]:
     """What coordinators may see about any task, and all that goes into the shared task KV."""
     request = record.get("request") or {}
     out = {k: record.get(k) for k in STATUS_KEYS if record.get(k) not in (None, "", [])}
-    out.setdefault("kind", request.get("kind"))
     out["objective"] = short(record.get("objective") or request.get("objective"))
     return out
+
+
+def observer_role(agent: str) -> str:
+    """Task-row role for an observer (one row per observing agent: the table's key is (task_id, role))."""
+    return f"observer:{agent}"
+
+
+def acl(ledger: Ledger, task_id: str) -> set[str]:
+    """Who takes part in a task, from what this node persisted about it: requester, owner, the observers
+    listed on the request, and agents holding an observer row. Never inferred from who sent mail on it."""
+    people: set[str] = set()
+    for row in ledger.db.execute("SELECT role, local_agent, requester, owner, request FROM tasks WHERE task_id=?",
+                                 (task_id,)):
+        people |= {row["requester"], row["owner"]}
+        people |= set((json.loads(row["request"]) if row["request"] else {}).get("observers") or [])
+        if row["role"].startswith("observer:"):
+            people.add(row["local_agent"])
+    return people
 
 
 def is_coordinator(cfg: NodeConfig, viewer: str) -> bool:
@@ -45,14 +65,16 @@ def is_coordinator(cfg: NodeConfig, viewer: str) -> bool:
 
 
 def is_participant(ledger: Ledger, viewer: str, task_id: str, record: dict[str, Any] | None = None) -> bool:
-    """Requester, owner, or someone the task's mail was sent to (observers receive copies)."""
+    """Requester, owner or observer, per the persisted ACL (and the owner's published status record)."""
     if record and viewer in (record.get("requester"), record.get("owner")):
         return True
-    row = ledger.db.execute(
-        "SELECT 1 FROM tasks WHERE task_id=? AND local_agent=? UNION ALL "
-        "SELECT 1 FROM messages WHERE task_id=? AND local_agent=? LIMIT 1",
-        (task_id, viewer, task_id, viewer)).fetchone()
-    return row is not None
+    return viewer in acl(ledger, task_id)
+
+
+def accepts_kinds(permissions: list[str]) -> list[str]:
+    """Request kinds an agent may take, from its permissions: public, so senders pick a kind it accepts."""
+    from .protocol import REQUEST_KINDS
+    return sorted(kind for kind, needed in REQUEST_KINDS.items() if needed in permissions)
 
 
 def artifact_visible(ledger: Ledger, viewer: str, uri: str) -> bool:

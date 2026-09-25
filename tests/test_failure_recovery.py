@@ -36,7 +36,9 @@ async def test_node_restart_resumes_running_task(make_config, cluster, tmp_path)
 
     await cluster.start(b)
     result = await tools.wait_for_result(hub, task_id, 40)
-    assert result["result_status"] == "complete" and result["attempts"] == 2
+    assert result["result_status"] == "complete"
+    # the attempt count is the owner's business (not in the shared task KV); the requester sees it in the thread
+    assert any("attempt 2" in tools._note(m) for m in hub.ledger.thread(task_id))
     assert marker.read_text().count("attempt=2") == 1
     assert any("restarted" in tools._note(m) for m in hub.ledger.thread(task_id))
 

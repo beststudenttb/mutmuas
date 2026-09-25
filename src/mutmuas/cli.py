@@ -71,9 +71,19 @@ async def _with_hub(args, fn, *, require_bus: bool = True, watch: bool = False):
             await asyncio.sleep(delay)
             delay = min(delay * 2, 30)
     try:
+        command = getattr(getattr(args, "fn", None), "__name__", "")
+        if command not in LEASE_FREE:
+            from .node import lease_refusal
+            refusal = lease_refusal(hub.ledger, str(hub.local_agent(_me(args))[0]))
+            if refusal:
+                raise SystemExit(f"error: {refusal}")
         return await fn(hub)
     finally:
         await hub.close()
+
+
+# Commands that only read public state or never mark mail read: allowed while another session holds the agent.
+LEASE_FREE = {"cmd_status", "cmd_agents", "cmd_find", "cmd_watch", "cmd_whoami"}
 
 
 def _parse_kv(pairs: list[str] | None) -> dict[str, Any]:
@@ -209,7 +219,7 @@ async def cmd_tasks(args, hub: Hub):
     if args.all:
         rows = await hub.all_tasks(args.limit, viewer=_me(args))
     else:
-        rows = hub.ledger.tasks(limit=args.limit)
+        rows = await tools.list_tasks(hub, _me(args), args.limit)
     if args.json:
         return _print(rows, True)
     if not rows:

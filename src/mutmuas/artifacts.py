@@ -100,8 +100,10 @@ class ArtifactStore:
             digest = sha256_file(upload)
             key = _safe_key(key)
             with open(upload, "rb") as f:
+                # No description in the shared store (every node can list it): it travels in the ArtifactRef
+                # inside the participants' messages instead. The bytes themselves are a step-2 risk.
                 await self.bus.objects.put(key, f, meta=api.ObjectMeta(
-                    name=key, description=description or None,
+                    name=key, description=None,
                     headers={"Mutmuas-Sha256": digest, "Mutmuas-Media-Type": media_type or ""}))
         finally:
             if tmp:

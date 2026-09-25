@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .hub import Hub
-from .visibility import artifact_visible, message_visible
+from .visibility import acl, artifact_visible, is_participant, message_visible
 from .protocol import TERMINAL_STATES, ArtifactRef, Envelope, request_body, result_body
 
 
@@ -266,26 +266,42 @@ async def publish_artifact(hub: Hub, me: str, path: str, *, key: str | None = No
 
 
 async def add_observer(hub: Hub, me: str, task_id: str, observer: str) -> dict[str, Any]:
-    """Let someone else read a task I take part in: they get copies of its REQUEST and RESULT. On the
-    requester's side they also get the RESULT when it arrives later."""
+    """Let someone else read a task I take part in (requester, owner or observer): they get copies of its
+    REQUEST and RESULT, and the other participants are told so that later RESULTs reach them too."""
     from .ids import Address
     addr, _ = hub.local_agent(me)
-    task = hub.ledger.db.execute("SELECT * FROM tasks WHERE task_id=? AND local_agent=?",
-                                 (task_id, str(addr))).fetchone()
-    if task is None:
-        raise PermissionError(f"{addr} does not take part in {task_id}; only its requester or owner can add observers")
+    me_s = str(addr)
+    if me_s not in acl(hub.ledger, task_id):
+        raise PermissionError(f"{me_s} does not take part in {task_id}; only its participants can add observers")
     observer = str(Address.parse(observer))
-    task = hub.ledger.task(task_id, task["role"])
-    request = dict(task.get("request") or {})
-    request["observers"] = sorted(set(request.get("observers") or []) | {observer})
-    hub.ledger.update_task(task_id, task["role"], request=request, force=True)
-    sent = []
-    for row in hub.ledger.thread(task_id):
-        if row.get("type") in ("REQUEST", "RESULT"):
-            env = Envelope.from_dict({k: v for k, v in row.items() if k not in ("direction", "delivery", "error")})
-            await hub.copy_to_observers(str(addr), env, [observer])
-            sent.append(row["type"])
-    return {"task_id": task_id, "observer": observer, "copies_sent": sent}
+    hub.ledger.add_observers(task_id, [observer])
+    rows = [r for r in (hub.ledger.task(task_id, role) for role in
+                        ("requester", "owner", f"observer:{me_s}")) if r]
+    base = rows[0]
+    copies = []
+    request = next((r["request"] for r in rows if r.get("request")), None)
+    result = next((r["result"] for r in rows if r.get("result")), None)
+    for kind, body, frm, to in (("REQUEST", request, base["requester"], base["owner"]),
+                                ("RESULT", result, base["owner"], base["requester"])):
+        if body:
+            env = Envelope(type=kind, sender=frm, to=to, task_id=task_id, body=body)
+            await hub.copy_to_observers(me_s, env, [observer])
+            copies.append(kind)
+    for other in sorted({base["requester"], base["owner"]} - {me_s}):
+        try:          # so the requester's side forwards a later RESULT, and every side knows the ACL
+            await hub.send(Envelope(type="UPDATE", sender=me_s, to=other, task_id=task_id,
+                                    body={"message": f"{me_s} added observer {observer}", "fyi": True,
+                                          "observers_add": [observer]}))
+        except Exception:
+            pass
+    return {"task_id": task_id, "observer": observer, "copies_sent": copies}
+
+
+async def list_tasks(hub: Hub, me: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    """Tasks on this node's ledger that `me` takes part in (not every agent's on this machine)."""
+    viewer = str(hub.local_agent(me)[0])
+    return [t for t in hub.ledger.tasks(limit=None)
+            if is_participant(hub.ledger, viewer, t["task_id"])][:limit]
 
 
 async def whoami(hub: Hub, me: str | None = None) -> dict[str, Any]:

@@ -17,7 +17,7 @@ from .bus import Bus, BusUnavailable
 from .config import AgentConfig, NodeConfig
 from .ids import Address, new_task_id, parse_iso
 from .ledger import Ledger
-from .visibility import is_coordinator, is_participant, status_layer
+from .visibility import acl, is_coordinator, is_participant, status_layer
 from .protocol import (REQUEST_KINDS, TERMINAL_STATES, ArtifactRef, Envelope, ProtocolError,
                        task_state_for_result)
 
@@ -185,7 +185,9 @@ class Hub:
 
     async def copy_to_observers(self, sender: str, original: Envelope, observers: list[str]) -> None:
         """Observers read a task's content through copies of its REQUEST and RESULT (they are participants,
-        visibility.py); the requester's side sends them. FYI only: it never wakes them."""
+        visibility.py). Each copy carries the task's participants, so the observer's node can check that it
+        came from one of them. FYI only: it never wakes them."""
+        people = sorted(acl(self.ledger, original.task_id) | {original.sender, original.to, *observers})
         for observer in observers:
             if observer in (original.sender, original.to):
                 continue
@@ -194,18 +196,22 @@ class Hub:
                     type="UPDATE", sender=sender, to=observer, task_id=original.task_id,
                     conversation_id=original.conversation_id, artifacts=original.artifacts, body={
                         "message": f"observer copy: {original.type} {original.sender} -> {original.to}",
-                        "fyi": True, "copy_of": {"type": original.type, "from": original.sender,
-                                                 "to": original.to, "body": original.body}}))
+                        "fyi": True, "participants": people,
+                        "copy_of": {"type": original.type, "from": original.sender, "to": original.to,
+                                    "body": original.body}}))
             except Exception as e:
                 log.warning("copy to observer %s failed: %r", observer, e)
 
     async def reply(self, local: str, task_id: str, type: str, body: dict[str, Any] | None = None,
                     artifacts: list[ArtifactRef] | None = None) -> str:
-        """Send a message about an existing task to the other party."""
+        """Send a message about an existing task to the other party. Only its requester or owner may."""
         addr, _ = self.local_agent(local)
-        task = self.ledger.task(task_id)
+        task = next((t for t in (self.ledger.task(task_id, r) for r in ("requester", "owner"))
+                     if t and t["local_agent"] == str(addr)), None)
         if task is None:
-            raise KeyError(f"unknown task {task_id}")
+            if self.ledger.task(task_id) is None:
+                raise KeyError(f"unknown task {task_id}")
+            raise PermissionDenied(f"{addr} is not the requester or owner of {task_id}")
         peer = task["requester"] if task["owner"] == str(addr) else task["owner"]
         env = Envelope(type=type, sender=str(addr), to=peer, body=body or {}, task_id=task_id,
                        conversation_id=task["conversation_id"], artifacts=artifacts or [],
