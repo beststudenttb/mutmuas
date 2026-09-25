@@ -316,6 +316,10 @@ def cmd_down(a) -> None:
             pid = int(pidf.read_text())
             try:
                 os.killpg(pid, signal.SIGTERM)   # own session: only this process group
+                for _ in range(150):             # the daemon shuts down gracefully; wait for it
+                    time.sleep(0.1)
+                    os.killpg(pid, 0)
+                os.killpg(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             pidf.unlink()
