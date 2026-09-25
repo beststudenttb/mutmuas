@@ -50,6 +50,21 @@ else
   [ -n "$CA" ] && install -m 644 "$CA" "$DIR/ca.crt"
   "$BIN/agent-node" init --bare --config "$CONFIG" --project "$PROJECT" --node "$NODE" --server "$SERVER" \
       --credentials "$DIR/$NODE.env" ${CA:+--ca "$DIR/ca.crt"} --data-dir "$DIR/data" >/dev/null
+  # STANDARD v1: paths inside node/ are written relative to node.yaml (the loader resolves them against it),
+  # so the node directory can be moved or read on another machine without editing.
+  "$BIN/python" - "$CONFIG" <<'PY'
+import os, sys, yaml
+cfg = sys.argv[1]; base = os.path.dirname(os.path.abspath(cfg)); raw = yaml.safe_load(open(cfg))
+def rel(v):
+    if isinstance(v, str) and os.path.isabs(v) and os.path.commonpath([base, v]) == base:
+        return "./" + os.path.relpath(v, base)
+    return v
+raw["data_dir"] = rel(raw.get("data_dir"))
+for k in ("credentials_file", "tls_ca", "tls_cert", "tls_key"):
+    if k in (raw.get("nats") or {}):
+        raw["nats"][k] = rel(raw["nats"][k])
+yaml.safe_dump(raw, open(cfg, "w"), sort_keys=False, allow_unicode=True)
+PY
   echo "created"
 fi
 

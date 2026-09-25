@@ -69,6 +69,13 @@ PYTHON="$(conda run -n mutmuas which python)" scripts/install.sh
 
 完成后删掉临时副本:`rm -rf ~/mutmuas-join`
 
+最后,在笔记本的交互式 Claude 会话里挂一个**后台**唤醒监视(结构标准第 7 项)。有消息来时它会退出,把会话叫醒;会话处理完消息后,再挂一次:
+
+```bash
+~/mutmuas/claude/.venv/bin/agentctl inbox --wait 3600 --peek --only wake \
+    --config ~/mutmuas/node/node.yaml --as C:claude
+```
+
 ## 第 5 步 验证(笔记本)
 
 ```bash
