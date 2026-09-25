@@ -20,8 +20,10 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import platform
 import socket
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -31,13 +33,45 @@ from . import __version__
 from .bus import Names
 from .config import AgentConfig, NodeConfig
 from .hub import Hub
-from .ids import Address, now_iso
-from .protocol import (REQUEST_KINDS, TERMINAL_STATES, ArtifactRef, Envelope, ProtocolError, result_body,
-                       task_state_for_result)
+from .ids import Address, now_iso, parse_iso
+from .protocol import (REQUEST_KINDS, TERMINAL_STATES, ArtifactRef, Envelope, ProtocolError, reply_required,
+                       result_body, task_state_for_result)
 from .runtime import TaskContext, make_runtime
 from .worktree import GitError, Worktree
 
 log = logging.getLogger(__name__)
+
+SESSION_STALE_S = 50          # the session's MCP process beats every 15 s (mcp_server.HEARTBEAT_S)
+FOLLOW_UP_EVERY_S = 30
+OPEN_STATES = ("PENDING", "ACCEPTED", "RUNNING", "WAITING", "BLOCKED")
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def session_fields(session: dict[str, Any] | None, workdir: Path) -> dict[str, Any]:
+    """Registry card view of an interactive agent's session, from its MCP process heartbeat.
+    unknown: no session has ever registered (e.g. one without the mutmuas MCP server)."""
+    if session is None:
+        return {"session": "unknown"}
+    age = (datetime.now(timezone.utc) - parse_iso(session["last_seen"])).total_seconds()
+    online = age < SESSION_STALE_S and _pid_alive(session["pid"])
+    out: dict[str, Any] = {"session": "online" if online else "offline", "session_seen": session["last_seen"]}
+    if online and session.get("cwd"):
+        out["session_cwd"] = session["cwd"]
+        if os.path.realpath(session["cwd"]) != os.path.realpath(workdir):
+            # Claude Code keeps memory per start directory: the wrong one means an empty memory.
+            out["session_warning"] = f"session started in {session['cwd']}, not in its workdir {workdir}"
+    return out
 
 
 def _code_version() -> str:
@@ -445,14 +479,54 @@ class NodeDaemon:
     # ---- heartbeat / cards --------------------------------------------
 
     async def _heartbeat(self) -> None:
+        last_follow_up = 0.0
         while True:
             await asyncio.sleep(self.cfg.heartbeat_s)
             try:
                 await self._publish_cards()
+                if asyncio.get_running_loop().time() - last_follow_up >= FOLLOW_UP_EVERY_S:
+                    last_follow_up = asyncio.get_running_loop().time()
+                    await self._follow_ups()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 log.debug("heartbeat failed: %r", e)
+
+    async def _follow_ups(self) -> None:
+        """Chase replies this node is owed (like an email client's follow-up flag), each once:
+        - overdue: reply required, deadline passed, no RESULT yet;
+        - session_offline: the owner is an interactive agent whose node is up but whose session is gone,
+          so the request sits unread (leader's rule: no session found = that terminal is offline).
+        Nothing is chased while the owner's node itself is offline (a closed laptop): the clock waits."""
+        hub = self.hub
+        now = datetime.now(timezone.utc)
+        for t in hub.ledger.tasks(role="requester", statuses=OPEN_STATES, limit=None):
+            request = t.get("request") or {}
+            if not reply_required(request):
+                continue
+            card = await hub.card_or_none(t["owner"])
+            if not (card and card.get("online")):
+                continue
+            deadline = request.get("deadline")
+            with contextlib.suppress(TypeError, ValueError):
+                if deadline and parse_iso(deadline) < now and hub.ledger.notice_once(t["task_id"], "overdue"):
+                    await self._follow_up(t, "overdue", f"{t['owner']} has not replied to {t['task_id']} "
+                                                        f"(deadline {deadline}, status {t['status']})")
+            if (card.get("mode") == "interactive" and card.get("session") == "offline" and t["status"] == "PENDING"
+                    and hub.ledger.notice_once(t["task_id"], "session_offline")):
+                await self._follow_up(t, "session_offline", f"{t['owner']}'s node is up but its session is "
+                                                            f"offline: {t['task_id']} waits unread")
+
+    async def _follow_up(self, task: dict[str, Any], reason: str, text: str) -> None:
+        """Tell the requester (wakes it: next = requester), and copy the escalation addresses (FYI only)."""
+        requester = task["local_agent"]
+        for target, extra in ((requester, {"next": requester}), *((a, {}) for a in self.cfg.escalate_to)):
+            try:
+                await self.hub.send(Envelope(type="UPDATE", sender=requester, to=target, task_id=task["task_id"],
+                                             body={"message": f"follow-up ({reason}): {text}", "fyi": True,
+                                                   "follow_up": reason, **extra}))
+            except Exception as e:
+                log.warning("follow-up to %s failed: %r", target, e)
 
     async def _publish_cards(self, state_override: str | None = None) -> None:
         hub = self.hub
@@ -488,6 +562,8 @@ class NodeDaemon:
                 "open_tasks": len(owned_open), "queue": max(0, len(self._queued.get(addr, ())) - len(running)),
                 "inbox_unread": (hub.ledger.unseen_count(addr) if agent.mode == "interactive"
                                  else hub.ledger.count("in", "new", addr) + (pending or 0)),
+                **(session_fields(hub.ledger.session_of(addr), agent.workdir_path)
+                   if agent.mode == "interactive" else {}),
                 "heartbeat_s": self.cfg.heartbeat_s, "last_heartbeat": now})
 
     # ---- outbox -------------------------------------------------------

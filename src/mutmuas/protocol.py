@@ -14,7 +14,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from . import PROTOCOL_VERSION
-from .ids import Address, InvalidAddress, new_conversation_id, new_message_id, now_iso
+from .ids import Address, InvalidAddress, new_conversation_id, new_message_id, now_iso, parse_iso
 
 
 class ProtocolError(ValueError):
@@ -211,6 +211,20 @@ class Envelope:
             timeout = self.body.get("timeout_s")
             if timeout is not None and (not isinstance(timeout, (int, float)) or timeout <= 0):
                 raise ProtocolError("timeout_s must be a positive number")
+            if self.body.get("reply", "required") not in REPLY_MODES:
+                raise ProtocolError(f"REQUEST reply must be one of {REPLY_MODES}")
+            if self.body.get("deadline") is not None:
+                try:
+                    if parse_iso(self.body["deadline"]).tzinfo is None:
+                        raise ValueError("no timezone")
+                except (TypeError, ValueError) as e:
+                    raise ProtocolError("deadline must be an ISO 8601 time with a timezone") from e
+        if self.body.get("next") is not None:
+            # "who moves next": the baton in a thread. Whoever it names is woken like by a REQUEST.
+            try:
+                Address.parse(self.body["next"])
+            except (InvalidAddress, TypeError) as e:
+                raise ProtocolError(f"next must be an agent address, got {self.body['next']!r}") from e
         if self.type == "RESULT" and self.body["status"] not in RESULT_STATUSES:
             raise ProtocolError(f"RESULT status must be one of {RESULT_STATUSES} (never report partial as complete)")
         if self.type == "UPDATE" and self.body.get("state") not in (None, *TASK_STATES):
@@ -231,12 +245,23 @@ class Envelope:
         return f"{self.type} {self.sender}->{self.to} task={self.task_id} id={self.message_id}"
 
 
+# Like an email's "reply requested" flag. required (the default): the task stays open until the owner
+# answers with a RESULT. none: a notice; the receiving session reading it is the answer (read receipt).
+REPLY_MODES = ("required", "none")
+
+
+def reply_required(request: dict[str, Any] | None) -> bool:
+    return (request or {}).get("reply", "required") != "none"
+
+
 def request_body(objective: str, reason: str, *, kind: str = "query", inputs: Any = None,
                  expected_outputs: Any = None, constraints: Any = None, acceptance_criteria: Any = None,
-                 deadline: str | None = None, timeout_s: float | None = None) -> dict[str, Any]:
+                 deadline: str | None = None, timeout_s: float | None = None,
+                 reply: str | None = None) -> dict[str, Any]:
     body: dict[str, Any] = {"objective": objective, "reason": reason, "kind": kind}
     for key, value in (("inputs", inputs), ("expected_outputs", expected_outputs), ("constraints", constraints),
-                       ("acceptance_criteria", acceptance_criteria), ("deadline", deadline), ("timeout_s", timeout_s)):
+                       ("acceptance_criteria", acceptance_criteria), ("deadline", deadline), ("timeout_s", timeout_s),
+                       ("reply", reply)):
         if value not in (None, "", [], {}):
             body[key] = value
     return body

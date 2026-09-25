@@ -27,7 +27,7 @@ Addresses and ids used in subjects allow `[A-Za-z0-9_-]` only.
 
 | type | direction | required body | optional body | effect on task |
 |---|---|---|---|---|
-| `REQUEST` | requester → owner | `objective`, `reason` | `kind`, `inputs`, `expected_outputs`, `constraints`, `acceptance_criteria`, `deadline`, `timeout_s`, `parent_task` | creates task (PENDING) |
+| `REQUEST` | requester → owner | `objective`, `reason` | `kind`, `inputs`, `expected_outputs`, `constraints`, `acceptance_criteria`, `deadline`, `timeout_s`, `parent_task`, `reply` | creates task (PENDING) |
 | `ACK` | owner → requester | – | `state`, `message` | ACCEPTED (or RUNNING when an interactive agent accepts) |
 | `UPDATE` | owner → requester | `message` | `state` (task state), `progress` | `state` if given |
 | `QUESTION` | either | `question` | – | requester side: WAITING |
@@ -58,6 +58,43 @@ Addresses and ids used in subjects allow `[A-Za-z0-9_-]` only.
 The daemon never upgrades a status. If the agent process exits non-zero while claiming
 `complete`, the result is downgraded to `partial` and a limitation is added. If there is no
 structured result at all, the result is `partial` (exit 0) or `failed` (non-zero).
+
+### Replies, deadlines and the baton (borrowed from email)
+
+- `reply` on a REQUEST: `required` (the default) means the owner owes a RESULT. `none` makes it a notice.
+  The receiving session reading it, with a plain `inbox` and not `--peek`, closes the task with a read receipt
+  (`RESULT complete "read by X (no reply requested)"`).
+- `deadline` (ISO 8601 with a timezone) says when the reply is needed. Use `agentctl ask --due +2h`.
+- `next: <address>` on RESULT, UPDATE, QUESTION or ANSWER names whose move it is. That agent is woken exactly
+  as by a REQUEST, even by an UPDATE. Put it on the last message of every thread whose next step belongs to
+  someone.
+
+### Waking, presence and follow-ups
+
+- **Push.** `agentctl mcp --channel` declares the Claude Code `claude/channel` capability. When a message
+  reaches the ledger that would wake the agent (a wake type, or `next` naming it), the MCP server pushes one
+  line into the running session:
+  `mutmuas: new REQUEST from A:x (task T-…): <summary>`, with meta `{task_id, msg_type, sender}`.
+  - Start the session with `claude --dangerously-load-development-channels server:mutmuas` until the
+    channel is approved.
+  - The push never marks anything read. Mail that arrived before the session started is not pushed, so
+    handle the backlog with `inbox`.
+  - Codex keeps `agentctl watch` → `codex queue`.
+- **Presence.** The session's own mutmuas MCP process writes a heartbeat to the node ledger every 15 s. The
+  registry card of an interactive agent then shows one of:
+  - `session: online`, or `offline` (no heartbeat for 50 s, or the process has gone);
+  - `unknown` (no mutmuas MCP server has ever run for it);
+  - `session_warning` when the session was started outside the agent's workdir. Claude Code keeps memory
+    per start directory, so a wrong start directory means an empty memory.
+- **Follow-ups.** Every 30 s the requester's daemon checks the tasks it is owed. Each follow-up is sent
+  once: an UPDATE to the requester with `next` set to the requester (so it wakes), copied as an FYI to
+  `escalate_to` in node.yaml (e.g. the secretary). There are two:
+  - `overdue`: a reply is required, the deadline has passed, and there is no RESULT yet;
+  - `session_offline`: the owner is interactive, its node is up, its session is offline, and the request
+    is still PENDING.
+
+  Nothing is chased while the owner's node is offline (a closed laptop).
+- **Reading.** Only the session marks mail read. Pushes, watchers and scripts use `--peek`.
 
 ### Example REQUEST
 

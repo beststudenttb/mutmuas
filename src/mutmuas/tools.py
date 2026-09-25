@@ -43,10 +43,11 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                        inputs: Any = None, expected_outputs: Any = None, constraints: Any = None,
                        acceptance_criteria: Any = None, timeout_s: float | None = None,
                        deadline: str | None = None, artifacts: list[dict] | None = None,
-                       parent_task: str | None = None, priority: str = "normal") -> dict[str, Any]:
+                       parent_task: str | None = None, priority: str = "normal",
+                       reply: str | None = None) -> dict[str, Any]:
     body = request_body(objective, reason, kind=kind, inputs=inputs, expected_outputs=expected_outputs,
                         constraints=constraints, acceptance_criteria=acceptance_criteria,
-                        deadline=deadline, timeout_s=timeout_s)
+                        deadline=deadline, timeout_s=timeout_s, reply=reply)
     target = await hub.card_or_none(to)
     task_id, delivery = await hub.request(
         me, to, body, artifacts=[ArtifactRef.from_dict(a) for a in artifacts or []],
@@ -106,18 +107,23 @@ async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, 
     since: only messages that reached this node's ledger after this ISO timestamp (a notifier's cursor,
     so --peek does not report the same unread message again and again)."""
     addr, _ = hub.local_agent(me)
+    # A message that hands me the baton (body.next == me) needs me as much as a REQUEST does.
+    next_to = str(addr) if types == WAKE else None
     if wait_s and not include_seen:
         # Messages reach this node's ledger through the daemon, so waiting on the ledger is enough
         # (a second JetStream consumer on the same mailbox would split the messages).
         deadline = asyncio.get_running_loop().time() + wait_s
-        while hub.ledger.unseen_count(str(addr), types, since) == 0 and asyncio.get_running_loop().time() < deadline:
+        while (hub.ledger.unseen_count(str(addr), types, since, next_to=next_to) == 0
+               and asyncio.get_running_loop().time() < deadline):
             await asyncio.sleep(0.5)
     if include_seen:
         rows = hub.ledger.db.execute("SELECT envelope FROM messages WHERE direction='in' AND local_agent=?"
                                      " ORDER BY rowid DESC LIMIT ?", (str(addr), limit)).fetchall()
         envs = [Envelope.from_json(r["envelope"]) for r in rows]
     else:
-        envs = hub.ledger.unseen(str(addr), limit, mark=not peek, types=types, since=since)
+        envs = hub.ledger.unseen(str(addr), limit, mark=not peek, types=types, since=since, next_to=next_to)
+        if not peek:
+            await _read_receipts(hub, str(addr), envs)
     meta = {r[0]: (r[1], r[2]) for r in hub.ledger.db.execute(
         f"SELECT message_id, created_at, rowid FROM messages WHERE direction='in' AND message_id IN "
         f"({','.join('?' * len(envs))})", [e.message_id for e in envs]).fetchall()} if envs else {}
@@ -126,6 +132,17 @@ async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, 
              "seq": meta.get(e.message_id, (None, None))[1], "body": e.body,
              "artifacts": [a.to_dict() for a in e.artifacts]}
             for e in envs]
+
+
+async def _read_receipts(hub: Hub, me: str, envs: list[Envelope]) -> None:
+    """A REQUEST sent with reply: none is answered by being read: the session has now seen it, so close the
+    task with a read receipt. Only the session reading its mail gets here (peek never does)."""
+    for env in envs:
+        if env.type != "REQUEST" or (env.body or {}).get("reply") != "none":
+            continue
+        task = hub.ledger.task(env.task_id, "owner")
+        if task and task["owner"] == me and task["status"] not in TERMINAL_STATES:
+            await hub.finish(env.task_id, result_body("complete", f"read by {me} (no reply requested)"))
 
 
 async def accept_task(hub: Hub, me: str, task_id: str) -> dict[str, Any]:
@@ -142,7 +159,7 @@ async def reject_task(hub: Hub, me: str, task_id: str, reason: str) -> dict[str,
 
 
 async def report_progress(hub: Hub, me: str, message: str, task_id: str | None = None,
-                          state: str | None = None) -> dict[str, Any]:
+                          state: str | None = None, next: str | None = None) -> dict[str, Any]:
     task_id = task_id or _current_task()
     if not task_id:
         raise ValueError("task_id is required outside of a delegated task")
@@ -152,13 +169,15 @@ async def report_progress(hub: Hub, me: str, message: str, task_id: str | None =
         new_state = "RUNNING"
     msg_type = "BLOCKED" if new_state == "BLOCKED" else "UPDATE"
     body = {"reason": message} if msg_type == "BLOCKED" else {"state": new_state, "message": message}
+    if next:
+        body["next"] = next
     ok = await hub.owner_transition(task_id, new_state, message, msg_type=msg_type, body=body)
     return {"task_id": task_id, "state": new_state, "sent": ok}
 
 
 async def submit_result(hub: Hub, me: str, status: str, summary: str, *, task_id: str | None = None,
                         outputs: Any = None, artifacts: list[dict] | None = None, evidence: Any = None,
-                        limitations: Any = None, follow_up: Any = None) -> dict[str, Any]:
+                        limitations: Any = None, follow_up: Any = None, next: str | None = None) -> dict[str, Any]:
     task_id = task_id or _current_task()
     if not task_id:
         raise ValueError("task_id is required outside of a delegated task")
@@ -167,6 +186,8 @@ async def submit_result(hub: Hub, me: str, status: str, summary: str, *, task_id
         return {"task_id": task_id, "error": f"task already {task['status']}; result not changed"}
     body = result_body(status, summary, outputs=outputs, evidence=evidence, limitations=limitations,
                        follow_up=follow_up)
+    if next:
+        body["next"] = next
     refs = [ArtifactRef.from_dict(a) for a in artifacts or []]
     if task_id == _current_task():
         # Inside a daemon-run task: store a draft; the daemon sends it when the process exits.
@@ -177,13 +198,13 @@ async def submit_result(hub: Hub, me: str, status: str, summary: str, *, task_id
     return {"task_id": task_id, "delivered": True, "status": status}
 
 
-async def ask_question(hub: Hub, me: str, task_id: str, question: str) -> dict[str, Any]:
-    delivery = await hub.reply(me, task_id, "QUESTION", {"question": question})
+async def ask_question(hub: Hub, me: str, task_id: str, question: str, next: str | None = None) -> dict[str, Any]:
+    delivery = await hub.reply(me, task_id, "QUESTION", {"question": question, **({"next": next} if next else {})})
     return {"task_id": task_id, "delivery": delivery}
 
 
-async def answer(hub: Hub, me: str, task_id: str, text: str) -> dict[str, Any]:
-    delivery = await hub.reply(me, task_id, "ANSWER", {"answer": text})
+async def answer(hub: Hub, me: str, task_id: str, text: str, next: str | None = None) -> dict[str, Any]:
+    delivery = await hub.reply(me, task_id, "ANSWER", {"answer": text, **({"next": next} if next else {})})
     return {"task_id": task_id, "delivery": delivery}
 
 

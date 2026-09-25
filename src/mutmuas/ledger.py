@@ -66,6 +66,24 @@ CREATE TABLE IF NOT EXISTS tasks (
     PRIMARY KEY (task_id, role)
 );
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(role, status);
+
+-- Is the interactive agent's session there? Written by the session's own mutmuas MCP process, which lives
+-- exactly as long as the session; read by the daemon for the registry card (session: online|offline).
+CREATE TABLE IF NOT EXISTS sessions (
+    local_agent     TEXT PRIMARY KEY,
+    pid             INTEGER NOT NULL,
+    cwd             TEXT,
+    started_at      TEXT NOT NULL,
+    last_seen       TEXT NOT NULL
+);
+
+-- Follow-ups already sent (overdue reply, session gone), so each is sent once.
+CREATE TABLE IF NOT EXISTS notices (
+    task_id         TEXT NOT NULL,
+    reason          TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    PRIMARY KEY (task_id, reason)
+);
 """
 
 TASK_JSON_FIELDS = ("request", "result", "result_draft", "input_refs", "output_refs")
@@ -171,22 +189,33 @@ class Ledger:
         self.db.execute("UPDATE messages SET state=?, last_error=?, updated_at=? WHERE message_id=? AND direction='in'",
                         (state, error, now_iso(), message_id))
 
+    @staticmethod
+    def _type_filter(types: tuple[str, ...] | None, next_to: str | None) -> tuple[str, tuple]:
+        """types, plus (with next_to) any message that hands the baton to that agent (body.next)."""
+        if not types:
+            return "", ()
+        in_types = f"type IN ({','.join('?' * len(types))})"
+        if next_to:
+            return f" AND ({in_types} OR json_extract(envelope, '$.body.next') = ?)", (*types, next_to)
+        return f" AND {in_types}", tuple(types)
+
     def unseen(self, local_agent: str, limit: int = 50, mark: bool = True,
-               types: tuple[str, ...] | None = None, since: str | None = None) -> list[Envelope]:
+               types: tuple[str, ...] | None = None, since: str | None = None,
+               next_to: str | None = None) -> list[Envelope]:
         """Inbound messages an interactive agent has not looked at yet.
 
         Only messages the dispatcher has fully handled: a REQUEST shows up once its task exists
         (so accept_task always works), and requests rejected by policy never show up.
         """
         with self.tx() as db:
-            type_sql = f" AND type IN ({','.join('?' * len(types))})" if types else ""
+            type_sql, type_args = self._type_filter(types, next_to)
             # a digit-only `since` is a rowid cursor (monotonic; timestamps collide within a millisecond)
             by_row = since is not None and str(since).isdigit()
             since_sql = (" AND rowid > ?" if by_row else " AND created_at > ?") if since else ""
             since_arg = ((int(since) if by_row else since),) if since else ()
             rows = db.execute("SELECT message_id, envelope FROM messages WHERE direction='in' AND seen=0"
                               f" AND state='handled' AND local_agent=?{type_sql}{since_sql} ORDER BY rowid LIMIT ?",
-                              (local_agent, *(types or ()), *since_arg, limit)).fetchall()
+                              (local_agent, *type_args, *since_arg, limit)).fetchall()
             if mark and rows:
                 db.executemany("UPDATE messages SET seen=1 WHERE message_id=? AND direction='in'",
                                [(r["message_id"],) for r in rows])
@@ -195,16 +224,45 @@ class Ledger:
     def mark_seen(self, task_id: str) -> None:
         self.db.execute("UPDATE messages SET seen=1 WHERE direction='in' AND task_id=?", (task_id,))
 
-    def unseen_count(self, local_agent: str, types: tuple[str, ...] | None = None, since: str | None = None) -> int:
+    def unseen_count(self, local_agent: str, types: tuple[str, ...] | None = None, since: str | None = None,
+                     next_to: str | None = None) -> int:
         sql = "SELECT COUNT(*) FROM messages WHERE direction='in' AND seen=0 AND state='handled' AND local_agent=?"
         args: list[Any] = [local_agent]
         if since:
             sql += " AND rowid > ?" if str(since).isdigit() else " AND created_at > ?"
             args.append(int(since) if str(since).isdigit() else since)
-        if types:
-            sql += f" AND type IN ({','.join('?' * len(types))})"
-            args.extend(types)
-        return self.db.execute(sql, args).fetchone()[0]
+        type_sql, type_args = self._type_filter(types, next_to)
+        return self.db.execute(sql + type_sql, [*args, *type_args]).fetchone()[0]
+
+    def last_rowid(self) -> int:
+        """The newest message's rowid: a cursor meaning "from now on"."""
+        return self.db.execute("SELECT COALESCE(MAX(rowid), 0) FROM messages").fetchone()[0]
+
+    # ---- sessions and follow-ups ------------------------------------------
+
+    def session_beat(self, local_agent: str, pid: int, cwd: str | None) -> None:
+        now = now_iso()
+        self.db.execute("INSERT INTO sessions (local_agent, pid, cwd, started_at, last_seen) VALUES (?,?,?,?,?)"
+                        " ON CONFLICT(local_agent) DO UPDATE SET pid=excluded.pid, cwd=excluded.cwd,"
+                        " last_seen=excluded.last_seen,"
+                        " started_at=CASE WHEN sessions.pid=excluded.pid THEN sessions.started_at"
+                        " ELSE excluded.started_at END",
+                        (local_agent, pid, cwd, now, now))
+
+    def session_end(self, local_agent: str, pid: int) -> None:
+        """The session closed cleanly. The row stays (pid 0) so the card can say offline, not unknown."""
+        self.db.execute("UPDATE sessions SET pid=0, last_seen=? WHERE local_agent=? AND pid=?",
+                        (now_iso(), local_agent, pid))
+
+    def session_of(self, local_agent: str) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT * FROM sessions WHERE local_agent=?", (local_agent,)).fetchone()
+        return dict(row) if row else None
+
+    def notice_once(self, task_id: str, reason: str) -> bool:
+        """True the first time (task_id, reason) is recorded: send that follow-up now, and never again."""
+        cur = self.db.execute("INSERT OR IGNORE INTO notices (task_id, reason, created_at) VALUES (?,?,?)",
+                              (task_id, reason, now_iso()))
+        return cur.rowcount == 1
 
     def count(self, direction: str, state: str, local_agent: str | None = None) -> int:
         sql = "SELECT COUNT(*) FROM messages WHERE direction=? AND state=?"

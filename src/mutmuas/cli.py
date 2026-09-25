@@ -15,7 +15,7 @@ import shutil
 import signal
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -150,11 +150,30 @@ async def cmd_find(args, hub: Hub):
     _print(await tools.find_agent(hub, args.capability), args.json)
 
 
+def _parse_due(text: str | None) -> str | None:
+    """'+90m', '+2h', '+1d' (from now) or an ISO time with timezone -> ISO deadline."""
+    if not text:
+        return None
+    units = {"m": "minutes", "h": "hours", "d": "days"}
+    if text.startswith("+"):
+        if text[-1] not in units or not text[1:-1].replace(".", "", 1).isdigit():
+            raise SystemExit(f"--due {text!r}: use +90m, +2h, +1d or an ISO time with timezone")
+        return (datetime.now(timezone.utc) + timedelta(**{units[text[-1]]: float(text[1:-1])})).isoformat()
+    try:
+        when = parse_iso(text)
+    except ValueError:
+        raise SystemExit(f"--due {text!r}: use +90m, +2h, +1d or an ISO time with timezone") from None
+    if when.tzinfo is None:
+        raise SystemExit(f"--due {text!r} has no timezone (e.g. 2026-09-25T18:00:00+09:00)")
+    return when.isoformat()
+
+
 async def cmd_ask(args, hub: Hub):
     out = await tools.send_request(
         hub, _me(args), args.to, args.objective, args.reason or "requested via agentctl", kind=args.kind,
         inputs=_parse_kv(args.input) or None, expected_outputs=args.expect, acceptance_criteria=args.accept,
-        constraints=args.constraint, timeout_s=args.timeout, priority=args.priority)
+        constraints=args.constraint, timeout_s=args.timeout, priority=args.priority,
+        reply=args.reply, deadline=_parse_due(args.due))
     if args.wait is not None:
         out = await tools.wait_for_result(hub, out["task_id"], args.wait)
     _print(out, args.json)
@@ -166,7 +185,8 @@ async def cmd_send(args, hub: Hub):
     artifacts = data.get("artifacts", []) if "body" in data else body.pop("artifacts", [])
     msg_type = args.type.upper()
     if msg_type == "REQUEST":
-        fields = ("kind", "inputs", "expected_outputs", "constraints", "acceptance_criteria", "timeout_s", "deadline")
+        fields = ("kind", "inputs", "expected_outputs", "constraints", "acceptance_criteria", "timeout_s", "deadline",
+                  "reply")
         unknown = sorted(set(body) - set(fields) - {"objective", "reason", "priority"})
         if unknown:   # never drop content silently; free-form data belongs in inputs
             raise SystemExit(f"error: unknown REQUEST field(s) {unknown}; put free-form data under 'inputs'. "
@@ -313,7 +333,8 @@ async def cmd_reject(args, hub: Hub):
 
 
 async def cmd_update(args, hub: Hub):
-    _print(await tools.report_progress(hub, _me(args), args.message, args.task, args.state), args.json)
+    _print(await tools.report_progress(hub, _me(args), args.message, args.task, args.state, next=args.next),
+           args.json)
 
 
 async def cmd_submit(args, hub: Hub):
@@ -324,16 +345,17 @@ async def cmd_submit(args, hub: Hub):
     if not status or not summary:
         raise SystemExit("--status and --summary (or a --file with them) are required")
     _print(await tools.submit_result(hub, _me(args), status, summary, task_id=args.task, artifacts=artifacts,
+                                     next=args.next or data.get("next"),
                                      **{k: data[k] for k in ("outputs", "evidence", "limitations", "follow_up")
                                         if k in data}), args.json)
 
 
 async def cmd_question(args, hub: Hub):
-    _print(await tools.ask_question(hub, _me(args), args.task_id, args.text), args.json)
+    _print(await tools.ask_question(hub, _me(args), args.task_id, args.text, next=args.next), args.json)
 
 
 async def cmd_answer(args, hub: Hub):
-    _print(await tools.answer(hub, _me(args), args.task_id, args.text), args.json)
+    _print(await tools.answer(hub, _me(args), args.task_id, args.text, next=args.next), args.json)
 
 
 async def cmd_artifact(args, hub: Hub):
@@ -371,7 +393,7 @@ async def cmd_history(args, hub: Hub):
 
 def cmd_mcp(args):
     from .mcp_server import run
-    run(_cfg(args), _me(args))
+    run(_cfg(args), _me(args), channel=args.channel)
 
 
 # --------------------------------------------------------------------------- agent-node commands
@@ -685,6 +707,9 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--constraint", action="append", help="constraint on how to do it (repeatable)")
     p.add_argument("--priority", default="normal", choices=["low", "normal", "high"])
     p.add_argument("--timeout", type=float, help="task timeout on the owner side (s)")
+    p.add_argument("--reply", choices=["required", "none"],
+                   help="none: a notice, closed with a read receipt once they read it (default: required)")
+    p.add_argument("--due", metavar="WHEN", help="reply needed by: +90m, +2h, +1d or ISO time; overdue is followed up")
     p.add_argument("--wait", type=float, nargs="?", const=600, help="wait for the result (s)")
     p = add("send", cmd_send, "send a message from a YAML file", bus=False)
     p.add_argument("to")
@@ -726,18 +751,22 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("message")
     p.add_argument("--task")
     p.add_argument("--state", choices=["RUNNING", "WAITING", "BLOCKED"])
+    p.add_argument("--next", metavar="ADDR", help="whose move it is now (wakes them)")
     p = add("submit-result", cmd_submit, "finish a task I own", bus=False)
     p.add_argument("--task")
     p.add_argument("--status", choices=["complete", "partial", "failed"])
     p.add_argument("--summary")
     p.add_argument("--artifact", action="append", help="artifact URI (repeatable)")
     p.add_argument("--file", help="YAML with status/summary/outputs/artifacts/evidence/limitations/follow_up")
+    p.add_argument("--next", metavar="ADDR", help="whose move it is now (wakes them)")
     p = add("question", cmd_question, "ask the other side of a task", bus=False)
     p.add_argument("task_id")
     p.add_argument("text")
+    p.add_argument("--next", metavar="ADDR", help="whose move it is now (wakes them)")
     p = add("answer", cmd_answer, "answer a question on a task", bus=False)
     p.add_argument("task_id")
     p.add_argument("text")
+    p.add_argument("--next", metavar="ADDR", help="whose move it is now (wakes them)")
     p = add("artifact", cmd_artifact, "publish | fetch | list artifacts")
     p.add_argument("action", choices=["publish", "fetch", "list"])
     p.add_argument("target", nargs="?", help="path (publish) or URI (fetch)")
@@ -751,6 +780,9 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=500)
     p = sub.add_parser("mcp", help="run the MCP server (stdio) for Claude Code / Codex")
     _common(p)
+    p.add_argument("--channel", action="store_true",
+                   help="push new mail into the Claude Code session (claude/channel); start the session with "
+                        "--dangerously-load-development-channels server:mutmuas")
     p.set_defaults(fn=None, sync=cmd_mcp)
     return parser
 
