@@ -77,6 +77,15 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_seen       TEXT NOT NULL
 );
 
+-- Other sessions that tried to act as an agent whose session lease is held (one agent, one session).
+CREATE TABLE IF NOT EXISTS session_contenders (
+    local_agent     TEXT NOT NULL,
+    pid             INTEGER NOT NULL,
+    cwd             TEXT,
+    last_seen       TEXT NOT NULL,
+    PRIMARY KEY (local_agent, pid)
+);
+
 -- "Remind me at …": the session's MCP process pushes the text into the session when it is due.
 CREATE TABLE IF NOT EXISTS reminders (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -259,10 +268,30 @@ class Ledger:
                         " ELSE excluded.started_at END",
                         (local_agent, pid, cwd, now, now))
 
+    def session_claim(self, local_agent: str, pid: int, cwd: str | None, holder_alive) -> int:
+        """One agent, one session: beat as the holder if the lease is free, stale or already ours. Otherwise
+        record us as a contender and return the holder's pid. holder_alive(row) decides whether the current
+        holder still counts (fresh heartbeat and a live process)."""
+        with self.tx() as db:
+            row = db.execute("SELECT * FROM sessions WHERE local_agent=?", (local_agent,)).fetchone()
+            if row is not None and row["pid"] not in (0, pid) and holder_alive(dict(row)):
+                db.execute("INSERT INTO session_contenders (local_agent, pid, cwd, last_seen) VALUES (?,?,?,?)"
+                           " ON CONFLICT(local_agent, pid) DO UPDATE SET last_seen=excluded.last_seen, cwd=excluded.cwd",
+                           (local_agent, pid, cwd, now_iso()))
+                return row["pid"]
+            db.execute("DELETE FROM session_contenders WHERE local_agent=? AND pid=?", (local_agent, pid))
+        self.session_beat(local_agent, pid, cwd)
+        return pid
+
+    def session_contenders(self, local_agent: str) -> list[dict[str, Any]]:
+        return [dict(r) for r in self.db.execute("SELECT * FROM session_contenders WHERE local_agent=?",
+                                                 (local_agent,))]
+
     def session_end(self, local_agent: str, pid: int) -> None:
         """The session closed cleanly. The row stays (pid 0) so the card can say offline, not unknown."""
         self.db.execute("UPDATE sessions SET pid=0, last_seen=? WHERE local_agent=? AND pid=?",
                         (now_iso(), local_agent, pid))
+        self.db.execute("DELETE FROM session_contenders WHERE local_agent=? AND pid=?", (local_agent, pid))
 
     def session_of(self, local_agent: str) -> dict[str, Any] | None:
         row = self.db.execute("SELECT * FROM sessions WHERE local_agent=?", (local_agent,)).fetchone()

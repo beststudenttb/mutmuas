@@ -87,6 +87,11 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   - `unknown` (no mutmuas MCP server has ever run for it);
   - `session_warning` when the session was started outside the agent's workdir. Claude Code keeps memory
     per start directory, so a wrong start directory means an empty memory.
+- **One agent, one session.** The first session's MCP process holds the agent (a lease in the node
+  ledger). A second session acting as the same agent is told at once, receives no mail pushes, and should
+  not read that agent's mail. The holder is told about it too. When the holder closes, the other session
+  takes over at its next heartbeat. Two projects on one machine are two agents (e.g. `C:paper` and
+  `C:course`), not two sessions of one agent.
 - **Follow-ups.** Every 30 s the requester's daemon checks the tasks it is owed. Each follow-up is sent
   once: an UPDATE to the requester with `next` set to the requester (so it wakes), copied as an FYI to
   `escalate_to` in node.yaml (e.g. the secretary). There are two:

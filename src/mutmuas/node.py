@@ -58,6 +58,10 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def session_alive(session: dict[str, Any]) -> bool:
+    return session_fields(session, Path("/")).get("session") == "online"
+
+
 def public_session(fields: dict[str, Any]) -> dict[str, Any]:
     """On the shared card only: is the session on duty. Its directory and warnings are for the agent and
     the coordinators."""

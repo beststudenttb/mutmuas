@@ -25,7 +25,7 @@ from . import tools
 from .config import NodeConfig
 from .hub import Hub
 from .ids import now_iso
-from .node import _code_version
+from .node import _code_version, session_alive
 
 INSTRUCTIONS = """You are connected to the mutmuas multi-agent network. Other agents live on other machines
 (nodes) and are addressed as NODE:agent (e.g. B:representation). Use these tools instead of asking the
@@ -49,7 +49,7 @@ human to relay messages:
   observers only. Your reasoning, memory and logs are private: if asked, reply with a condensed summary."""
 
 CHANNEL = "notifications/claude/channel"
-HEARTBEAT_S = 15.0
+HEARTBEAT_S = float(os.environ.get("MUTMUAS_SESSION_BEAT_S", "15"))   # tests shorten it
 PUSH_POLL_S = 1.0
 CODE_CHECK_S = 60.0
 
@@ -84,6 +84,19 @@ def channel_notice(m: dict[str, Any]) -> dict[str, Any]:
                      "summary": summary}}
 
 
+def duplicate_notice(addr: str, holder: int) -> dict[str, Any]:
+    return {"content": f"mutmuas: another session already acts as {addr} (process {holder}). One agent has one "
+                       "session: this one gets no mail pushes and must not read or answer its mail. Close one of "
+                       "the two sessions, or register this one as its own agent.",
+            "meta": {"session": "duplicate", "holder_pid": str(holder)}}
+
+
+def contender_notice(addr: str, contender: dict[str, Any]) -> dict[str, Any]:
+    return {"content": f"mutmuas: a second session tried to act as {addr} (process {contender['pid']}, "
+                       f"directory {contender.get('cwd')}). This session keeps the mail; tell the leader.",
+            "meta": {"session": "contender", "contender_pid": str(contender["pid"])}}
+
+
 def reminder_notice(r: dict[str, Any]) -> dict[str, Any]:
     return {"content": f"mutmuas reminder (set {r['created_at']}): {r['text']}",
             "meta": {"reminder": str(r["id"]), "due": r["due"]}}
@@ -95,10 +108,28 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
     io = io if io is not None else {}
 
     async def heartbeat(hub: Hub, addr: str) -> None:
-        """This process lives exactly as long as the session that started it: its beat is the session's."""
+        """This process lives exactly as long as the session that started it: its beat is the session's.
+        One agent, one session: a second session gets told and receives no pushes until the first is gone."""
+        me, told = os.getpid(), set()
         while True:
-            hub.ledger.session_beat(addr, os.getpid(), os.getcwd())
+            holder = hub.ledger.session_claim(addr, me, os.getcwd(), session_alive)
+            if holder != me and state.get("duplicate_of") != holder:
+                state["duplicate_of"] = holder
+                await push_now(duplicate_notice(addr, holder))
+            elif holder == me:
+                if state.pop("duplicate_of", None):
+                    await push_now({"content": f"mutmuas: the other session has gone; this session now holds "
+                                               f"{addr} and receives its mail.", "meta": {"session": "holder"}})
+                for c in hub.ledger.session_contenders(addr):
+                    if c["pid"] not in told and session_alive({**c, "pid": c["pid"]}):
+                        told.add(c["pid"])
+                        await push_now(contender_notice(addr, c))
             await asyncio.sleep(HEARTBEAT_S)
+
+    async def push_now(params: dict[str, Any]) -> None:
+        if channel and io.get("write") is not None:
+            await io["write"].send(SessionMessage(message=JSONRPCNotification(
+                jsonrpc="2.0", method=CHANNEL, params=params)))
 
     async def push(hub: Hub, addr: str, cursor: int) -> None:
         """Wake the session on new mail that needs it (Claude Code channels). Never marks anything read."""
@@ -118,7 +149,8 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
                     await send(stale_notice(state["code"], disk))
             for m in await tools.inbox(hub, addr, peek=True, types=tools.WAKE, since=str(cursor), limit=20):
                 cursor = max(cursor, m["seq"] or cursor)
-                await send(channel_notice(m))
+                if not state.get("duplicate_of"):          # only the session holding the agent is woken
+                    await send(channel_notice(m))
             for r in hub.ledger.due_reminders(addr, now_iso()):
                 await send(reminder_notice(r))
                 hub.ledger.fire_reminder(r["id"])
@@ -156,8 +188,10 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
     async def whoami() -> str:
         """Your own address, permissions, open tasks, unread count and session state (private to you)."""
         disk = await asyncio.to_thread(_code_version)
-        return dump(await tools.whoami(hub(), state["me"]) | {"mcp_code": state["code"], "disk_code": disk,
-                                                              "mcp_stale": disk != state["code"]})
+        extra = {"mcp_code": state["code"], "disk_code": disk, "mcp_stale": disk != state["code"]}
+        if state.get("duplicate_of"):
+            extra["session_duplicate_of"] = state["duplicate_of"]
+        return dump(await tools.whoami(hub(), state["me"]) | extra)
 
     @server.tool()
     async def list_agents(capability: str | None = None, online_only: bool = False) -> str:

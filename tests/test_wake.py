@@ -198,3 +198,59 @@ def test_push_summary_is_short_and_never_empty():
     assert len(note["meta"]["summary"]) <= SUMMARY_CHARS + 1 and note["meta"]["summary"].endswith("…")
     odd = {"type": "UPDATE", "from": "A:x", "task_id": "T-2", "body": {"state": "RUNNING", "detail": "halfway"}}
     assert channel_notice(odd)["meta"]["summary"] == "RUNNING"
+
+
+async def _mcp(b, workdir, beat="0.5"):
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path), "MUTMUAS_SESSION_BEAT_S": beat}
+    env.pop("MUTMUAS_TASK_ID", None)
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "mutmuas.cli", "mcp", "--channel", "--config", str(b.path), "--as", "B:desk",
+        cwd=str(workdir), env=env, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL)
+    notes: list[dict] = []
+
+    async def pump():
+        while line := await proc.stdout.readline():
+            msg = json.loads(line)
+            if msg.get("method") == "notifications/claude/channel":
+                notes.append(msg["params"])
+    for msg in ({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"}):
+        proc.stdin.write((json.dumps(msg) + "\n").encode())
+    await proc.stdin.drain()
+    return proc, notes, asyncio.create_task(pump())
+
+
+async def test_one_agent_one_session(make_config, cluster):
+    a, b, hub_a, hub_b = await _pair(make_config, cluster)
+    workdir = b.agents[0].workdir_path
+    workdir.mkdir(parents=True, exist_ok=True)
+    first, first_notes, p1 = await _mcp(b, workdir)
+    await eventually(lambda: _card(hub_a, "B:desk", "online"), what="first session holds B:desk")
+    second, second_notes, p2 = await _mcp(b, workdir)
+
+    async def note(notes, kind):
+        return next((n for n in notes if n["meta"].get("session") == kind), None)
+    dup = await eventually(lambda: note(second_notes, "duplicate"), what="second session told it is a duplicate")
+    assert str(first.pid) in dup["content"]
+    await eventually(lambda: note(first_notes, "contender"), what="first session told about the second")
+
+    sent = await tools.send_request(hub_a, "A:main", "B:desk", "who gets woken", "lease test")
+    await eventually(lambda: _pushed(first_notes, sent["task_id"]), what="holder woken")
+    await asyncio.sleep(1.5)
+    assert not await _pushed(second_notes, sent["task_id"])                 # only one session is woken
+
+    first.stdin.close()
+    await asyncio.wait_for(first.wait(), 15)
+    await eventually(lambda: note(second_notes, "holder"), what="second session takes over", timeout=20)
+    later = await tools.send_request(hub_a, "A:main", "B:desk", "now you", "lease test")
+    await eventually(lambda: _pushed(second_notes, later["task_id"]), what="new holder woken")
+    second.stdin.close()
+    await asyncio.wait_for(second.wait(), 15)
+    for p in (p1, p2):
+        p.cancel()
+
+
+async def _pushed(notes, task_id):
+    return next((n for n in notes if n["meta"].get("task_id") == task_id), None)
