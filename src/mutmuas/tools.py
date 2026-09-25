@@ -328,9 +328,12 @@ async def whoami(hub: Hub, me: str | None = None) -> dict[str, Any]:
            "coordinator": str(addr) in (hub.cfg.coordinators or [])}
     if agent.mode == "interactive":
         out.update(session_fields(hub.ledger.session_of(str(addr)), agent.workdir_path))
-        out.update(_sessions_live(hub, str(addr)))
+    procs = _agentctl_processes(str(addr))
+    if agent.mode == "interactive":
+        out.update(_sessions_live(hub, str(addr), [p["pid"] for p in procs if p["mcp"]]))
     out["repo"] = _repo_state(agent.workdir_path)
-    out["background"] = _background(str(addr))
+    out["code"] = _repo_state(Path(__file__).resolve().parent)    # the checkout this node's code runs from
+    out["background"] = [{k: p[k] for k in ("pid", "elapsed", "command")} for p in procs if not p["mcp"]]
     if out.get("sessions_live", 0) > 1:
         out["warning"] = (f"{out['sessions_live']} sessions use {addr}: one address, one session (R3.7); "
                           "they read each other's mail")
@@ -338,52 +341,82 @@ async def whoami(hub: Hub, me: str | None = None) -> dict[str, Any]:
 
 
 # whoami's reorientation facts (weekend r3b, P2). They check what a handoff says about *this* session: who
-# else uses the address, where the workdir stands against origin, what runs in the background. They cannot
-# show what is missing elsewhere (e.g. a review that was never requested): that needs the task history.
+# else uses the address, where the workdir and the code checkout stand against origin, what runs in the
+# background. They cannot show what is missing elsewhere (e.g. a review that was never requested): that needs
+# the task history.
 
-def _sessions_live(hub: Hub, addr: str) -> dict[str, Any]:
+def _sessions_live(hub: Hub, addr: str, mcp_pids: list[int]) -> dict[str, Any]:
+    """Sessions using the address: the lease holder, live contenders, and any `agentctl mcp --as <addr>`
+    process on this machine (an MCP from older code never writes the lease table). Each pid counts once."""
     from .node import session_alive
     holder = hub.ledger.session_of(addr)
-    live = [c["pid"] for c in hub.ledger.session_contenders(addr)
-            if session_alive({**c, "pid": c["pid"]})]
-    held = 1 if holder and holder["pid"] and session_alive(holder) else 0
-    return {"sessions_live": held + len(live), "session_contenders": live}
+    pids = set(mcp_pids)
+    if holder and holder["pid"] and session_alive(holder):
+        pids.add(holder["pid"])
+    contenders = [c["pid"] for c in hub.ledger.session_contenders(addr) if session_alive({**c, "pid": c["pid"]})]
+    pids.update(contenders)
+    return {"sessions_live": len(pids), "session_pids": sorted(pids), "session_contenders": contenders}
 
 
 def _git(repo: Path, *args: str) -> str | None:
     import subprocess
-    out = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=10)
+    try:
+        out = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):      # git missing, hanging (TimeoutExpired), ...
+        return None
     return out.stdout.strip() if out.returncode == 0 else None
 
 
-def _repo_state(workdir: Path) -> dict[str, Any] | None:
-    """The workdir's commit against its upstream, as of the last fetch (no network: say how old that is)."""
-    head = _git(workdir, "rev-parse", "--short=7", "HEAD")
+def _repo_state(path: Path) -> dict[str, Any] | None:
+    """A checkout's commit against its upstream, as known locally (no network). upstream_updated_at is when
+    the upstream ref last changed here (fetch or push of *that* branch; FETCH_HEAD changes with any fetch)."""
+    head = _git(path, "rev-parse", "--short=7", "HEAD")
     if head is None:
         return None
-    state: dict[str, Any] = {"path": str(workdir), "head": head,
-                             "branch": _git(workdir, "rev-parse", "--abbrev-ref", "HEAD"),
-                             "upstream": _git(workdir, "rev-parse", "--abbrev-ref", "@{upstream}"),
-                             "dirty": bool(_git(workdir, "status", "--porcelain", "--untracked-files=no"))}
+    root = _git(path, "rev-parse", "--show-toplevel")
+    branch = _git(path, "symbolic-ref", "--quiet", "--short", "HEAD")
+    state: dict[str, Any] = {"path": root or str(path), "head": head, "branch": branch, "detached": branch is None,
+                             "upstream": _git(path, "rev-parse", "--abbrev-ref", "@{upstream}") if branch else None,
+                             "dirty": bool(_git(path, "status", "--porcelain", "--untracked-files=no"))}
     if state["upstream"]:
-        counts = _git(workdir, "rev-list", "--left-right", "--count", "HEAD...@{upstream}")
+        counts = _git(path, "rev-list", "--left-right", "--count", "HEAD...@{upstream}")
         if counts:
             state["ahead"], state["behind"] = (int(n) for n in counts.split())
-    common = _git(workdir, "rev-parse", "--path-format=absolute", "--git-common-dir")
-    fetch_head = Path(common) / "FETCH_HEAD" if common else None
-    if fetch_head and fetch_head.exists():
-        state["fetched_at"] = datetime.fromtimestamp(fetch_head.stat().st_mtime, timezone.utc).isoformat(
-            timespec="seconds")
-        state["note"] = "ahead/behind as of the last fetch; run git fetch for the current origin"
-    else:
-        state["fetched_at"] = None
-        state["note"] = "never fetched here: ahead/behind compare with a stale origin; run git fetch"
+        state["upstream_as_of"] = _upstream_as_of(path, state["upstream"])
+        state["note"] = ("ahead/behind against the upstream as last fetched here (upstream_as_of); "
+                         "run git fetch for the current origin" if state["upstream_as_of"] else
+                         "no record of when the upstream was last fetched here: ahead/behind may be stale; "
+                         "run git fetch")
+    elif state["detached"]:
+        remotes = _git(path, "branch", "-r", "--contains", "HEAD", "--format=%(refname:short)")
+        state["contained_in"] = (remotes or "").split()[:10]
+        state["note"] = "detached HEAD: contained_in lists the remote branches (as last fetched) that include it"
     return state
 
 
-def _background(addr: str) -> list[dict[str, Any]]:
-    """agentctl processes running as this address (e.g. mail watchers), other than this one and its parents.
-    Only processes that name the address with --as are found, not ones that got it from MUTMUAS_AGENT."""
+def _upstream_as_of(path: Path, upstream: str) -> str | None:
+    """When this checkout last learned the upstream's state: the later of the upstream ref's last change
+    (reflog) and the last fetch that included that branch (FETCH_HEAD, only if it lists it: a fetch of some
+    other branch says nothing about this one; a fetch that found nothing new leaves no reflog entry)."""
+    times = []
+    entry = _git(path, "reflog", "show", "-n1", "--date=iso-strict", "--format=%gd", upstream)
+    if entry and "@{" in entry:
+        times.append(datetime.fromisoformat(entry.split("@{", 1)[1].rstrip("}")))
+    common = _git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    fetch_head = Path(common) / "FETCH_HEAD" if common else None
+    branch = upstream.split("/", 1)[1] if "/" in upstream else upstream
+    try:
+        if fetch_head and f"branch '{branch}' of" in fetch_head.read_text():
+            times.append(datetime.fromtimestamp(fetch_head.stat().st_mtime, timezone.utc))
+    except OSError:
+        pass
+    return max(times).astimezone(timezone.utc).isoformat(timespec="seconds") if times else None
+
+
+def _agentctl_processes(addr: str) -> list[dict[str, Any]]:
+    """agentctl processes naming this address with --as, other than this process and its ancestors. mcp=True:
+    an MCP server, i.e. a session (counted as one, not as background). Processes that got the address from
+    MUTMUAS_AGENT instead of --as are not found."""
     import subprocess
     try:
         ps = subprocess.run(["ps", "-axo", "pid=,ppid=,etime=,command="], capture_output=True, text=True,
@@ -404,8 +437,10 @@ def _background(addr: str) -> list[dict[str, Any]]:
         argv = cmd.split()
         named = any(a == "--as" and i + 1 < len(argv) and argv[i + 1] == addr or a == f"--as={addr}"
                     for i, a in enumerate(argv))
-        if pid not in mine and named and "agentctl" in cmd:
-            found.append({"pid": pid, "elapsed": elapsed, "command": cmd[:200]})
+        at = next((i for i, a in enumerate(argv) if a.endswith("agentctl")), None)
+        if pid not in mine and named and at is not None:
+            mcp = argv[at + 1:at + 2] == ["mcp"]
+            found.append({"pid": pid, "elapsed": elapsed, "command": cmd[:200], "mcp": mcp})
     return found
 
 
