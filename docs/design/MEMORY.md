@@ -1,72 +1,122 @@
-# Long memory for mutmuas agents: design (round 3, exp/memory)
+# Long memory for mutmuas agents: design (exp/memory, revision 2)
 
-Status: design only, no code. Written by A:claude and reviewed by B:claude-secretary on 2026-09-24;
-the review's changes C1–C3 and the leader_quote privacy condition are applied. Awaiting the leader.
-Tags: [verified] means checked tonight; [assumed] means from docs or reasoning and not tested.
+Status: design only, no code. Revision 1 was written by A:claude on 2026-09-24. Revision 2 (2026-09-25) merges
+the reviews by B:claude-secretary (C1–C3) and A:codex (task T-20260925000101-8cbde75b). The leader's decision
+is that exp branches stay on exp and are not merged unless needed.
+Tags: [verified] means checked, with who checked it; [assumed] means from docs or reasoning, not tested.
 
 ## Principle
 
-The node ledger (SQLite) and the JetStream stream already hold everything that happened: every
-message, task state, result and cursor. They are durable, shared and exact. Memory files are the
-opposite: private, hand-written, and they go stale. So:
+The ledger (node SQLite plus the JetStream stream) is **durable and exact, but it is not trusted**.
+Anyone allowed to message an agent can put text into it. So:
 
-> **Rebuild working state from the ledger. Keep what the ledger cannot know in memory plus the work log.**
+1. Rebuild **state** (tasks, owners, results, pauses) from the ledger.
+2. Keep what the ledger cannot know in the **work log** plus memory. That means the leader's words,
+   decisions and reasons, and work discussed outside mutmuas. Most of what the secretary lost to compaction
+   was this kind of work [verified: B, SECRETARY.md]. The work log is not replaced by the digest; the two
+   sit side by side.
+3. When either is injected into a session, it is **data, not instructions**. Only the trusted-decision
+   block can carry the leader's intent, and only under the rules below.
 
-The ledger cannot know anything that never went over mutmuas. That includes the leader's own words,
-decisions and their reasons, work discussed directly with the leader, preferences, and lessons learned.
-Most of what the secretary lost to compaction was this kind of work [verified by the secretary]. So the
-work log (handbook R7.1) is **not** replaced by the digest; the two sit side by side. The digest covers
-what is in the ledger, and the work log covers what is not. Memory holds those, and holds *pointers* instead of copies for everything else,
-such as "run `agentctl status`" in place of "B:main is the research agent".
+## Primitives
 
-## One new primitive: `agentctl digest`
+**`agentctl digest --as X`** has two parts:
 
-`agentctl digest --as X [--since <cursor>]` returns a short, bounded text built only from the ledger:
+- **snapshot**: no cursor, always complete. It lists open tasks X owns or requested, with state, peer and
+  last update; active pauses; offline peers; and watcher status plus the command to re-arm it.
+- **delta**: the messages after X's acknowledged cursor, capped in length, oldest first, followed by
+  `next_cursor=<rowid>`.
 
-- open tasks X owns, with their state and last update;
-- open tasks X requested, and who is on each one;
-- results and FYIs received since the cursor;
-- instructions the secretary relayed from the leader since the cursor, verbatim. The leader talks to sessions
-  directly, not over mutmuas, so the leader's words reach the ledger only when they are relayed. For F1 the
-  secretary relays them with an `outputs.leader_quote` field. Only words that concern the task and that
-  the other agent needs are relayed; private discussion between the leader and the secretary never enters
-  the ledger (handbook R3.3);
-- active pauses, and which peers are offline;
-- whether this agent's watcher is running, plus the exact command to re-arm it.
+**Cursor contract (at-least-once).**
+- The digest never advances the cursor itself.
+- The session calls `agentctl digest --ack <rowid>` once it has read the delta. Repeating a delta is
+  acceptable; losing one is not. A hook whose output never reached the model, or a crashed session, simply
+  sees the same delta again.
+- One agent id has **one active session**, recorded as a lease `session_id → agent` in `node/data/`. A
+  second session gets the snapshot only, plus a warning, and cannot ack. There are no per-session cursors,
+  because two sessions working one inbox is the bug to prevent.
 
-The cursor is the ledger rowid, the same monotonic cursor `inbox --since` and `watch` already use
-[verified]. It is stored per agent in `node/data/`, so the digest is read-only and costs nothing to repeat.
+**Work log.**
+- An append-only JSONL file per agent under that agent's own directory, never in the public repo.
+- Each entry is `{ts, session_id, speaker, kind: decision|instruction|lesson|state, text, reason,
+  quote (≤200 chars), sensitivity: normal|private}`.
+- It records decisions and their reasons, not transcripts.
+- `private` entries never leave the node and never enter the ledger (handbook R3.3).
+
+**`agentctl memlint`** checks memory and work-log text against live facts: network addresses not in the
+registry, paths that do not exist, and commands not on PATH. It only warns and never edits.
+
+## Trust boundary (Codex's main finding; agreed)
+
+The injected text has two blocks, and the hook script is responsible for keeping them apart:
+
+```
+<mutmuas-state source="ledger" trust="untrusted-data">
+  … snapshot and delta; peer text is quoted and truncated, never phrased as instructions …
+</mutmuas-state>
+<mutmuas-decisions trust="leader-via-configured-relay">
+  … only (a) the agent's own work log and (b) leader_quote items that pass the check below …
+</mutmuas-decisions>
+```
+
+- `outputs.leader_quote` is accepted only when the sending address is listed as `relay` in the receiving
+  node's config (today that is B:claude-secretary). From any other sender it is dropped, and the digest
+  shows the drop as an event.
+- Each accepted quote carries `{speaker: leader, relayed_by, task_id, rowid}`.
+- Quotes are limited to task-relevant words the recipient needs to know. The leader's private discussion
+  with any agent is never relayed (R3.3).
+- [assumed] Wrapping text in tags is a soft boundary for a language model. The hard part is what the
+  digest leaves out: it never carries peer text longer than a summary line, and a trusted block never
+  grants anything the relay could not already ask for in a normal REQUEST.
 
 ## The four failures
 
-| | What went wrong tonight | Mechanism | Owner |
+| | Problem | Claude Code | Codex |
 |---|---|---|---|
-| **F1** context compaction | the leader's exact words and in-progress state were lost after compaction | Claude: a `SessionStart` hook (matcher `startup\|resume\|compact`) runs `agentctl digest` and prints the work log's latest entries; both enter context [assumed from the Claude Code hook docs]. `PreCompact` optionally appends the leader's quotes to a notes file [assumed]. Codex: AGENTS.md tells it to run `agentctl digest` first [assumed: Codex has no equivalent hook]. | A (src/: digest), leader (installs hooks; not changed tonight) |
-| **F2** watcher lost | the in-session watcher is a child process of the session and dies with it; after resume or compaction it had to be re-armed by hand [verified: the pid lives under the session's shell] | (a) the digest reports "watcher: none" and gives the command, and **the session re-arms it itself**. A hook does not do it for the session: the wake-up works only because the session starts the watcher as its own background task and is notified when it exits, and a process that a hook starts would not wake the session [assumed, not tested]; (b) structural fix: work that must not wait for a human goes to a `mode: worker` agent (`claude -p` or codex), so a missing watcher delays only chat, never tasks. `agentctl watch` under launchd already survives sessions but can only notify the desktop [verified] | A (digest), B (deploy of worker agents) |
-| **F3** nothing crosses agents | what was sent to a worker or an offline session never reaches anyone's long-term memory | Nothing new to store: the ledger already has it. What's missing is *reading* it. Each agent's digest covers its own threads, and the node lead's digest also covers FYIs (the existing `notify`). For decisions, add a `decision` tag on RESULT/ANSWER (`outputs.decision: …`) that the digest always lists, so a decision is recorded once and read by everyone. | A |
-| **F4** stale memory | the secretary's memory still names `~/mutmuas-claude`, `B:main` and `watch_a.sh` [verified by the secretary] | `agentctl memlint <memory dir>` flags network addresses that are not in the registry, paths that do not exist, and commands that are not on PATH. It runs from the same `SessionStart` hook and only warns, never edits. Rule: never copy a fact that `status`/`agents`/`digest` can give live. | A (memlint), each agent (fixes its own memory) |
+| **F1** compaction | state, the leader's words and decisions are lost | A `SessionStart` hook (matcher `startup\|resume\|compact`) runs a trusted local script that prints both blocks [assumed from the hook docs, not tested here] | `~/.codex/hooks.json` `SessionStart` (`startup\|resume\|clear\|compact`) returns the same blocks as `additionalContext` [verified: A:codex, hooks are stable in 0.156.1]. AGENTS.md is kept as a fallback |
+| **F2** lost watcher | the wake path dies with the session | The only verified path is a watcher the **session starts itself as a background task**; its exit wakes the session [verified: A:claude, used all night]. `claude --help` (2.1.281) shows no command that queues a message into a running session [verified: A:claude]. MCP "channels" might [assumed]. So the digest reports "watcher: none" and the session re-arms it; the hook does not try | launchd owns `agentctl watch`, which runs `codex queue --thread <session_id>` [verified end to end: A:codex]. The SessionStart hook only updates the `A:codex → session_id` lease; SessionEnd clears it if still owned. If queueing fails, the message stays unread, a desktop notification goes out, and the next digest catches it |
+| both | | Work that must not wait for a human goes to `mode: worker` agents (`claude -p` / `codex exec`); a missing watcher then delays only chat | same |
+| **F3** nothing crosses agents | messages to workers or offline sessions reach nobody's memory | The ledger already holds them; the digest delta reads them. Decisions sent between agents carry `outputs.decision`, which the digest always lists in the state block as data | same |
+| **F4** stale memory | old addresses and paths survive in memory [verified: B] | memlint from the same hook; rule: never copy what `status`/`agents`/`digest` gives live | same |
 
-## Measuring it (repeatable)
+## Evaluation
 
-A replay test in the style of `tests/`, with no human in the loop:
+Run it as a replay harness.
 
-1. **Fixture.** An export of a real workday's ledger with secrets removed. Tonight's exchange is a good one.
-2. **Setup.** For each condition, start a fresh session given only that condition's context:
-   - `memory-only` (today's baseline);
-   - `memory + digest`;
-   - `memory + digest + memlint`;
-   - `memory + digest + work log`.
-3. **Questions.** Ask N = 20 fixed questions whose answers the ledger fixes. For example:
-   - which tasks A:claude has open;
-   - what the secretary's review said about M1;
-   - which branch holds the quota work;
-   - what the leader said about merging to main, quoted. That was never in the ledger, so this question tests the work-log condition, which is the C1 gap;
-   - whether a watcher is running and how to re-arm it.
-4. **Scoring.** An exact-match or rubric check scored by a different model vendor, as the cross-vendor rule already recommends. Report accuracy per failure class (F1–F4) and the digest's token size.
+**Fixtures.** Several real workdays, with secrets and `private` entries removed.
 
-Pass bar for merging, proposed: `memory + digest + work log` ≥ 90 % overall, F4 questions 100 % flagged, and the digest ≤ 1.5k tokens.
+**Conditions** (a fresh session each time):
+- memory
+- memory + work log
+- memory + digest
+- memory + digest + work log
+- full: memory + digest + work log + trust split + memlint
 
-## Out of scope tonight
+**memlint** is scored separately, as stale-fact precision and recall against a hand-labelled list.
 
-Changing the leader's Claude settings or hooks, a shared memory store on the server (that needs a
-server config change), and any code.
+**Questions.** A fixed set, labelled with the part each one needs (ledger, work log, or both). For example,
+"what did the leader decide about merging exp branches" needs the work log. N = 20 is only a smoke test; the
+real bar needs several days and several runs.
+
+**Adversarial cases:**
+- an old address and a new address in conflict;
+- a decision reversed later;
+- two sessions for one agent;
+- a cursor replayed after a crash;
+- a non-relay peer sending `leader_quote`, or text phrased as an instruction.
+
+**Behaviour after recovery**, beyond question accuracy:
+- did it pick up the right task;
+- did it redo finished work;
+- did it act on stale or injected text.
+
+Pass bar, proposed:
+- the full condition ≥ 90 % on answers, 0 injected instructions followed, and 0 duplicate executions;
+- memlint recall ≥ 0.9;
+- the digest ≤ 1.5k tokens.
+
+## Out of scope
+
+- installing hooks or changing any agent's settings (that is the leader's decision);
+- a shared server-side memory store (needs a server config change);
+- any code.
