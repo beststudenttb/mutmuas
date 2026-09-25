@@ -17,11 +17,14 @@
 ## 第 1 步 服务器签发凭据(由 leader 在服务器 B 上执行)
 
 ```bash
+cd ~/mutmuas/server && b=backup-$(date +%Y%m%d-%H%M%S) && mkdir -m 700 $b && cp -p nats-server.conf *.env $b/   # 先备份(R4.2)
 cd ~/mutmuas/claude
 .venv/bin/agent-node server-config --project mutmuas --nodes A,B,C --out ~/mutmuas/server \
-    --tls 150.89.170.193 --store-dir /home/tb/mutmuas/server/jetstream
+    --tls 150.89.170.193,127.0.0.1 --store-dir /home/tb/mutmuas/server/jetstream
 systemctl --user reload mutmuas-nats-server
 ```
+
+- `--tls` 的主机列表**必须和首次生成证书时一致**(现在是 `150.89.170.193,127.0.0.1`)。证书已存在时会直接复用,但哪天证书重签,少写的地址就连不上了:B 本机用 127.0.0.1 连接的进程会 TLS 失败。
 
 - 重新运行时,已有节点(A、B、admin)的密码和 TLS 证书**保持不变**,只新增 `node_C`,已在 B 上用副本验证过。
 - 产出两个文件:`~/mutmuas/server/C.env`(密码)和 `~/mutmuas/server/tls/ca.crt`(公开证书)。
@@ -82,7 +85,7 @@ cd ~/mutmuas/claude
 | 现象 | 原因 / 处理 |
 |---|---|
 | `Authorization Violation` | 第 1 步没做或没 reload;或者拷错了 env 文件 |
-| TLS handshake error / certificate | 没带 `--ca`;或者地址不是 `150.89.170.193`(证书只签了这个地址) |
+| TLS handshake error / certificate | 没带 `--ca`;或者地址不在证书里(证书只签了 `150.89.170.193` 和 `127.0.0.1`) |
 | 连接超时 | 网络到不了 4222 端口,先用 `nc -vz` 检查 |
 | setup.sh 说 node 不匹配 | `~/mutmuas/node/node.yaml` 已存在,而且是别的节点名。先确认再处理,不要直接删 |
 
