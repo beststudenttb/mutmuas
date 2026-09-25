@@ -378,3 +378,31 @@ async def test_lease_holder_from_older_code_still_lets_its_own_session_act(tmp_p
         mcp.kill()
         await mcp.wait()
         ledger.close()
+
+
+async def test_tool_errors_say_why(make_config, cluster):
+    """C's review: a failing MCP tool only said 'Error executing tool remind_me'; the reason was lost."""
+    a, b, hub_a, hub_b = await _pair(make_config, cluster)
+    workdir = b.agents[0].workdir_path
+    workdir.mkdir(parents=True, exist_ok=True)
+    proc, out, pump = await _mcp2(b, workdir)
+    await eventually(lambda: _card(hub_a, "B:desk", "online"), what="session up")
+    await _call(proc, 21, "remind_me", {"at": "tomorrow", "text": "x"})
+    reply = await eventually(lambda: _find(out, lambda m: m.get("id") == 21), what="tool reply")
+    assert "ValueError" in json.dumps(reply) and "timezone" in json.dumps(reply)
+    await _call(proc, 22, "remind_me", {"at": "+30s", "text": "seconds work too"})
+    ok = await eventually(lambda: _find(out, lambda m: m.get("id") == 22), what="tool reply")
+    assert '\\"reminder\\"' in json.dumps(ok)
+    proc.stdin.close()
+    await asyncio.wait_for(proc.wait(), 15)
+    pump.cancel()
+
+
+async def test_clear_inbox_sends_read_receipts(make_config, cluster):
+    """C's review: notices cleared with clear_inbox never got their read receipt, so they stayed open."""
+    a, b, hub_a, hub_b = await _pair(make_config, cluster)
+    sent = await tools.send_request(hub_a, "A:main", "B:desk", "FYI only", "notice", reply="none")
+    rows = await eventually(lambda: tools.inbox(hub_b, "B:desk", peek=True), what="notice arrived")
+    await tools.clear_inbox(hub_b, "B:desk", max(m["seq"] for m in rows))
+    result = await tools.wait_for_result(hub_a, sent["task_id"], 20)
+    assert result["status"] == "COMPLETED" and "read by B:desk" in result["result"]["summary"]

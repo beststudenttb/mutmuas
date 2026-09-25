@@ -144,24 +144,30 @@ async def clear_inbox(hub: Hub, me: str, before_seq: int) -> dict[str, Any]:
     """Mark every unread message up to seq (the rowid shown by inbox) as read. For the session only, after it
     has looked at the list: clearing a backlog of old mail it has already dealt with elsewhere."""
     addr, _ = hub.local_agent(me)
-    return {"marked_read": hub.ledger.mark_seen_before(str(addr), int(before_seq)), "up_to_seq": int(before_seq)}
+    cleared = hub.ledger.mark_seen_before(str(addr), int(before_seq))
+    await _read_receipts(hub, str(addr), cleared)          # cleared notices are read notices: close them too
+    return {"marked_read": len(cleared), "up_to_seq": int(before_seq)}
 
 
 async def remind_me(hub: Hub, me: str, at: str, text: str) -> dict[str, Any]:
     """Have the session's mutmuas MCP process push `text` into the session at `at` (ISO time with timezone, or
-    +10m/+2h). Needs a session running with the channel; a reminder due while no session runs fires at the next
+    +30s/+10m/+2h). Needs a session running with the channel; a reminder due while no session runs fires at the next
     session start."""
     from datetime import datetime, timedelta, timezone
 
     from .ids import parse_iso
     addr, _ = hub.local_agent(me)
-    units = {"m": "minutes", "h": "hours", "d": "days"}
+    units = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
     if at.startswith("+") and at[-1] in units and at[1:-1].replace(".", "", 1).isdigit():
         due = datetime.now(timezone.utc) + timedelta(**{units[at[-1]]: float(at[1:-1])})
     else:
-        due = parse_iso(at)
+        hint = f"at={at!r}: use an ISO time with timezone (e.g. 2026-09-25T18:00:00+09:00) or +30s / +10m / +2h"
+        try:
+            due = parse_iso(at)
+        except ValueError:
+            raise ValueError(hint) from None
         if due.tzinfo is None:
-            raise ValueError("at needs a timezone (e.g. 2026-09-25T18:00:00+09:00) or +10m / +2h")
+            raise ValueError(hint)
     due_iso = due.astimezone(timezone.utc).isoformat(timespec="milliseconds")
     return {"reminder": hub.ledger.add_reminder(str(addr), due_iso, text), "due": due_iso}
 

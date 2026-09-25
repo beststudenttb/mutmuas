@@ -306,11 +306,15 @@ class Ledger:
         row = self.db.execute("SELECT * FROM sessions WHERE local_agent=?", (local_agent,)).fetchone()
         return dict(row) if row else None
 
-    def mark_seen_before(self, local_agent: str, before_seq: int) -> int:
-        """Mark everything up to a rowid as read: the session's explicit 'clear the backlog'."""
-        cur = self.db.execute("UPDATE messages SET seen=1 WHERE direction='in' AND local_agent=? AND seen=0"
-                              " AND rowid <= ?", (local_agent, before_seq))
-        return cur.rowcount
+    def mark_seen_before(self, local_agent: str, before_seq: int) -> list[Envelope]:
+        """Mark everything up to a rowid as read (the session's explicit 'clear the backlog'); returns what
+        was marked, so read receipts can follow."""
+        with self.tx() as db:
+            rows = db.execute("SELECT message_id, envelope FROM messages WHERE direction='in' AND local_agent=?"
+                              " AND seen=0 AND state='handled' AND rowid <= ?", (local_agent, before_seq)).fetchall()
+            db.executemany("UPDATE messages SET seen=1 WHERE message_id=? AND direction='in'",
+                           [(r["message_id"],) for r in rows])
+        return [Envelope.from_json(r["envelope"]) for r in rows]
 
     def add_reminder(self, local_agent: str, due: str, text: str) -> int:
         cur = self.db.execute("INSERT INTO reminders (local_agent, due, text, created_at) VALUES (?,?,?,?)",

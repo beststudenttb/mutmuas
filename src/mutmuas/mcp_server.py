@@ -181,17 +181,20 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
     register = server.tool
 
     def guarded_tool(*dargs, **dkw):
-        """Every tool but whoami first checks that this session holds the agent (one agent, one session)."""
+        """Every tool but whoami first checks that this session holds the agent (one agent, one session), and
+        every tool reports why it failed: the framework alone only says 'Error executing tool <name>'."""
         def wrap(fn):
-            if fn.__name__ == "whoami":
-                return register(*dargs, **dkw)(fn)
-
             @functools.wraps(fn)
             async def checked(*args, **kwargs):
-                refusal = lease_refusal(state["hub"].ledger, state["me"])
-                if refusal:
-                    return dump({"error": refusal + " This session does not hold the agent."})
-                return await fn(*args, **kwargs)
+                if fn.__name__ != "whoami":
+                    refusal = lease_refusal(state["hub"].ledger, state["me"])
+                    if refusal:
+                        return dump({"error": refusal + " This session does not hold the agent."})
+                try:
+                    return await fn(*args, **kwargs)
+                except Exception as e:
+                    logging.getLogger(__name__).warning("tool %s failed: %r", fn.__name__, e)
+                    return dump({"error": f"{type(e).__name__}: {e}"})
             return register(*dargs, **dkw)(checked)
         return wrap
     server.tool = guarded_tool
