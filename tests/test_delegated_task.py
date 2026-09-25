@@ -54,7 +54,9 @@ async def test_three_node_chain(make_config, cluster):
     result = await tools.wait_for_result(hub, sent["task_id"], 40)
     assert result["result_status"] == "complete"
     assert result["result"]["summary"] == "sub-task said: echo: from the chain"
-    child = await hub.task_view(result["result"]["outputs"]["child_task"])
+    child_id = result["result"]["outputs"]["child_task"]
+    assert await hub.task_view(child_id) is None               # A is not part of B's sub-task (visibility)
+    child = await (await cluster.client(c)).task_view(child_id, "C:helper")
     assert child["parent_task"] == sent["task_id"] and child["requester"] == "B:planner"
 
 

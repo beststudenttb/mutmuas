@@ -17,6 +17,7 @@ from .bus import Bus, BusUnavailable
 from .config import AgentConfig, NodeConfig
 from .ids import Address, new_task_id, parse_iso
 from .ledger import Ledger
+from .visibility import is_coordinator, is_participant, status_layer
 from .protocol import (REQUEST_KINDS, TERMINAL_STATES, ArtifactRef, Envelope, ProtocolError,
                        task_state_for_result)
 
@@ -89,7 +90,8 @@ class Hub:
         if online_only:
             cards = [c for c in cards if c["online"]]
         # Best candidates first: online, idle, short queue.
-        cards.sort(key=lambda c: (not c["online"], c.get("state") != "idle", c.get("queue", 0), c["address"]))
+        cards.sort(key=lambda c: (not c["online"], c.get("availability") == "busy", c.get("state") != "idle",
+                                  c["address"]))
         return cards
 
     async def agent_card(self, address: str) -> dict[str, Any] | None:
@@ -177,7 +179,25 @@ class Hub:
             body = {**body, "parent_task": parent_task}
         env = Envelope(type="REQUEST", sender=str(addr), to=await self.resolve(to), body=body,
                        task_id=task_id or new_task_id(), priority=priority, artifacts=artifacts or [])
-        return env.task_id, await self.send(env)
+        delivery = await self.send(env)
+        await self.copy_to_observers(str(addr), env, body.get("observers") or [])
+        return env.task_id, delivery
+
+    async def copy_to_observers(self, sender: str, original: Envelope, observers: list[str]) -> None:
+        """Observers read a task's content through copies of its REQUEST and RESULT (they are participants,
+        visibility.py); the requester's side sends them. FYI only: it never wakes them."""
+        for observer in observers:
+            if observer in (original.sender, original.to):
+                continue
+            try:
+                await self.send(Envelope(
+                    type="UPDATE", sender=sender, to=observer, task_id=original.task_id,
+                    conversation_id=original.conversation_id, artifacts=original.artifacts, body={
+                        "message": f"observer copy: {original.type} {original.sender} -> {original.to}",
+                        "fyi": True, "copy_of": {"type": original.type, "from": original.sender,
+                                                 "to": original.to, "body": original.body}}))
+            except Exception as e:
+                log.warning("copy to observer %s failed: %r", observer, e)
 
     async def reply(self, local: str, task_id: str, type: str, body: dict[str, Any] | None = None,
                     artifacts: list[ArtifactRef] | None = None) -> str:
@@ -194,7 +214,20 @@ class Hub:
 
     # ---- task views ---------------------------------------------------
 
-    async def task_view(self, task_id: str) -> dict[str, Any] | None:
+    async def task_view(self, task_id: str, viewer: str | None = None) -> dict[str, Any] | None:
+        """What `viewer` may see of a task: everything for a participant, the status layer for a coordinator,
+        nothing for anyone else (None, as if unknown). viewer None: this node's default agent."""
+        viewer = str(self.local_agent(viewer)[0])
+        view = await self._task_view(task_id)
+        if view is None:
+            return None
+        if is_participant(self.ledger, viewer, task_id, view):
+            return view
+        if is_coordinator(self.cfg, viewer):
+            return status_layer(view) | {"visibility": "status only (coordinator)"}
+        return None
+
+    async def _task_view(self, task_id: str) -> dict[str, Any] | None:
         """Merge the local ledger with the owner's published record (authoritative for owner state)."""
         local = self.ledger.task(task_id)
         remote = None
@@ -226,17 +259,22 @@ class Hub:
         keys = await bus.kv_keys(bus.names.tasks_kv, [f"*.*.{task_id}"])
         return await bus.kv_get(bus.names.tasks_kv, keys[0]) if keys else None
 
-    async def all_tasks(self, limit: int = 100) -> list[dict[str, Any]]:
-        """Global task list from the shared KV (every owner publishes its tasks there)."""
+    async def all_tasks(self, limit: int = 100, viewer: str | None = None) -> list[dict[str, Any]]:
+        """Network task list from the shared KV (status layer only): all of it for a coordinator, the tasks
+        `viewer` takes part in for everyone else."""
+        viewer = str(self.local_agent(viewer)[0])
         bus = self._require_bus()
-        records = list((await bus.kv_all(bus.names.tasks_kv)).values())
+        records = [status_layer(r) for r in (await bus.kv_all(bus.names.tasks_kv)).values()]
+        if not is_coordinator(self.cfg, viewer):
+            records = [r for r in records if is_participant(self.ledger, viewer, r["task_id"], r)]
         records.sort(key=lambda r: r.get("created_at", ""), reverse=True)
         return records[:limit]
 
-    async def wait_result(self, task_id: str, timeout: float = 600, poll: float = 0.5) -> dict[str, Any]:
+    async def wait_result(self, task_id: str, timeout: float = 600, poll: float = 0.5,
+                          viewer: str | None = None) -> dict[str, Any]:
         deadline = asyncio.get_running_loop().time() + timeout
         while True:
-            view = await self.task_view(task_id)
+            view = await self.task_view(task_id, viewer)
             if view is None:
                 raise KeyError(f"unknown task {task_id}")
             if view.get("status") in TERMINAL_STATES:
@@ -253,13 +291,9 @@ class Hub:
         task = self.ledger.task(task_id, "owner")
         if task is None or self.bus is None:
             return
-        record = {k: task[k] for k in ("task_id", "requester", "owner", "parent_task", "status", "result_status",
-                                       "created_at", "updated_at", "attempts", "input_refs", "output_refs")}
-        request = task.get("request") or {}
-        record.update(objective=request.get("objective"), reason=request.get("reason"), kind=request.get("kind"),
-                      result=task.get("result"))
-        record["thread"] = [{k: m.get(k) for k in ("message_id", "type", "from", "to", "timestamp")}
-                            | {"note": _note(m)} for m in self.ledger.thread(task_id)]
+        # Only the status layer goes to the shared KV (readable by every node): no reason, inputs, thread,
+        # result or artifact references. Content stays with the participants (visibility.py).
+        record = status_layer(task)
         try:
             await self.bus.kv_put(self.bus.names.tasks_kv,
                                   self.bus.names.task_key(Address.parse(task["owner"]), task_id), record)

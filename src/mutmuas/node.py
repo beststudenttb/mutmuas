@@ -58,6 +58,12 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def public_session(fields: dict[str, Any]) -> dict[str, Any]:
+    """On the shared card only: is the session on duty. Its directory and warnings are for the agent and
+    the coordinators."""
+    return {k: v for k, v in fields.items() if k in ("session", "session_seen")}
+
+
 def session_fields(session: dict[str, Any] | None, workdir: Path) -> dict[str, Any]:
     """Registry card view of an interactive agent's session, from its MCP process heartbeat.
     unknown: no session has ever registered (e.g. one without the mutmuas MCP server)."""
@@ -357,6 +363,8 @@ class NodeDaemon:
             status = env.body.get("state")
         elif env.type == "RESULT":
             status = task_state_for_result(env.body["status"])
+            observers = (task.get("request") or {}).get("observers") or []
+            await self.hub.copy_to_observers(task["local_agent"], env, observers)
             fields.update(result=env.body, result_status=env.body["status"],
                           output_refs=[a.to_dict() for a in env.artifacts])
         elif env.type in ("REJECT", "ERROR"):
@@ -499,6 +507,21 @@ class NodeDaemon:
             except Exception as e:
                 log.debug("heartbeat failed: %r", e)
 
+    async def _warn_session_dir(self, addr: str, session: dict[str, Any] | None, workdir: Path) -> None:
+        """A session started outside its workdir gets an empty memory: tell the agent and the coordinators,
+        once per session."""
+        warning = session_fields(session, workdir).get("session_warning")
+        if not warning or not self.hub.ledger.notice_once(f"session:{addr}:{session['started_at']}", "cwd"):
+            return
+        for target, extra in ((addr, {"next": addr}), *((c, {}) for c in self.cfg.coordinators if c != addr)):
+            try:
+                await self.hub.send(Envelope(type="UPDATE", sender=addr, to=target,
+                                             task_id=f"session-{self.cfg.node}", body={
+                                                 "message": f"session warning for {addr}: {warning}",
+                                                 "fyi": True, "follow_up": "session_dir", **extra}))
+            except Exception as e:
+                log.warning("session warning to %s failed: %r", target, e)
+
     async def _follow_ups(self) -> None:
         """Chase replies this node is owed (like an email client's follow-up flag), each once:
         - overdue: reply required, deadline passed, no RESULT yet;
@@ -565,13 +588,14 @@ class NodeDaemon:
                 "model": agent.model, "runtime": agent.runtime, "mode": agent.mode,
                 "capabilities": agent.capabilities, "permissions": agent.permissions,
                 "accept_from": agent.accept_from, "resources": self.cfg.resources,
-                "state": state, "current_task": running[0] if running else None,
-                "open_tasks": len(owned_open), "queue": max(0, len(self._queued.get(addr, ())) - len(running)),
-                "inbox_unread": (hub.ledger.unseen_count(addr) if agent.mode == "interactive"
-                                 else hub.ledger.count("in", "new", addr) + (pending or 0)),
-                **(session_fields(hub.ledger.session_of(addr), agent.workdir_path)
+                # Public layer only (visibility.py): coarse availability, no current task, queue or inbox
+                # counts, no session directory. The agent reads its own details locally (whoami).
+                "state": state, "availability": "busy" if running or owned_open else "available",
+                **(public_session(session_fields(hub.ledger.session_of(addr), agent.workdir_path))
                    if agent.mode == "interactive" else {}),
                 "heartbeat_s": self.cfg.heartbeat_s, "last_heartbeat": now})
+            if agent.mode == "interactive":
+                await self._warn_session_dir(addr, hub.ledger.session_of(addr), agent.workdir_path)
 
     # ---- outbox -------------------------------------------------------
 

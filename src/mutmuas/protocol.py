@@ -211,6 +211,15 @@ class Envelope:
             timeout = self.body.get("timeout_s")
             if timeout is not None and (not isinstance(timeout, (int, float)) or timeout <= 0):
                 raise ProtocolError("timeout_s must be a positive number")
+            observers = self.body.get("observers")
+            if observers is not None:
+                if not isinstance(observers, list):
+                    raise ProtocolError("observers must be a list of agent addresses")
+                for o in observers:
+                    try:
+                        Address.parse(o)
+                    except (InvalidAddress, TypeError) as e:
+                        raise ProtocolError(f"observer must be an agent address, got {o!r}") from e
             if self.body.get("reply", "required") not in REPLY_MODES:
                 raise ProtocolError(f"REQUEST reply must be one of {REPLY_MODES}")
             if self.body.get("deadline") is not None:
@@ -257,11 +266,11 @@ def reply_required(request: dict[str, Any] | None) -> bool:
 def request_body(objective: str, reason: str, *, kind: str = "query", inputs: Any = None,
                  expected_outputs: Any = None, constraints: Any = None, acceptance_criteria: Any = None,
                  deadline: str | None = None, timeout_s: float | None = None,
-                 reply: str | None = None) -> dict[str, Any]:
+                 reply: str | None = None, observers: list[str] | None = None) -> dict[str, Any]:
     body: dict[str, Any] = {"objective": objective, "reason": reason, "kind": kind}
     for key, value in (("inputs", inputs), ("expected_outputs", expected_outputs), ("constraints", constraints),
                        ("acceptance_criteria", acceptance_criteria), ("deadline", deadline), ("timeout_s", timeout_s),
-                       ("reply", reply)):
+                       ("reply", reply), ("observers", observers)):
         if value not in (None, "", [], {}):
             body[key] = value
     return body

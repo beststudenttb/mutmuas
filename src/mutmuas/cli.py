@@ -121,20 +121,8 @@ async def cmd_status(args, hub: Hub):
             state = "OFFLINE" if not c["online"] else c.get("state", "?").upper()
             alias = f" ({c['display']})" if c.get("display") else ""
             session = f"  session {c['session']}" if c.get("session") else ""
-            print(f"  {c['address']}{alias}  {state}  [{c.get('mode')}/{c.get('runtime') or '-'}]{session}")
-            details = []
-            if c.get("current_task"):
-                details.append(f"task: {c['current_task']}")
-            if c.get("queue"):
-                details.append(f"queued: {c['queue']}")
-            if c.get("open_tasks"):
-                details.append(f"open: {c['open_tasks']}")
-            if c.get("inbox_unread"):
-                details.append(f"inbox: {c['inbox_unread']}")
-            if details:
-                print("    " + "  ".join(details))
-            if c.get("session_warning"):
-                print(f"    WARNING: {c['session_warning']}")
+            busy = f"  {c['availability']}" if c.get("availability") and c["online"] else ""
+            print(f"  {c['address']}{alias}  {state}{busy}  [{c.get('mode')}/{c.get('runtime') or '-'}]{session}")
     if not known and not by_node:
         print("no nodes registered yet (is any agent-node running?)")
 
@@ -148,6 +136,14 @@ async def cmd_agents(args, hub: Hub):
         session = f"session:{c['session']}" if c.get("session") else ""
         print(f"{c['address']:<28} {flag} {c.get('state', ''):<8} {session:<16} {c.get('role', ''):<28} "
               f"{','.join(c.get('capabilities', []))}")
+
+
+async def cmd_observe(args, hub: Hub):
+    _print(await tools.add_observer(hub, _me(args), args.task_id, args.observer), args.json)
+
+
+async def cmd_whoami(args, hub: Hub):
+    _print(await tools.whoami(hub, _me(args)), args.json)
 
 
 async def cmd_find(args, hub: Hub):
@@ -177,9 +173,9 @@ async def cmd_ask(args, hub: Hub):
         hub, _me(args), args.to, args.objective, args.reason or "requested via agentctl", kind=args.kind,
         inputs=_parse_kv(args.input) or None, expected_outputs=args.expect, acceptance_criteria=args.accept,
         constraints=args.constraint, timeout_s=args.timeout, priority=args.priority,
-        reply=args.reply, deadline=_parse_due(args.due))
+        reply=args.reply, deadline=_parse_due(args.due), observers=args.observer)
     if args.wait is not None:
-        out = await tools.wait_for_result(hub, out["task_id"], args.wait)
+        out = await tools.wait_for_result(hub, out["task_id"], args.wait, me=_me(args))
     _print(out, args.json)
 
 
@@ -190,7 +186,7 @@ async def cmd_send(args, hub: Hub):
     msg_type = args.type.upper()
     if msg_type == "REQUEST":
         fields = ("kind", "inputs", "expected_outputs", "constraints", "acceptance_criteria", "timeout_s", "deadline",
-                  "reply")
+                  "reply", "observers")
         unknown = sorted(set(body) - set(fields) - {"objective", "reason", "priority"})
         if unknown:   # never drop content silently; free-form data belongs in inputs
             raise SystemExit(f"error: unknown REQUEST field(s) {unknown}; put free-form data under 'inputs'. "
@@ -211,7 +207,7 @@ async def cmd_send(args, hub: Hub):
 
 async def cmd_tasks(args, hub: Hub):
     if args.all:
-        rows = await hub.all_tasks(args.limit)
+        rows = await hub.all_tasks(args.limit, viewer=_me(args))
     else:
         rows = hub.ledger.tasks(limit=args.limit)
     if args.json:
@@ -227,9 +223,9 @@ async def cmd_tasks(args, hub: Hub):
 
 
 async def cmd_task(args, hub: Hub):
-    view = await hub.task_view(args.task_id)
+    view = await hub.task_view(args.task_id, _me(args))
     if view is None:
-        raise SystemExit(f"unknown task {args.task_id}")
+        raise SystemExit(f"unknown task {args.task_id} (or not visible to you)")
     if args.json:
         return _print(view, True)
     req = view.get("request") or {}
@@ -251,9 +247,9 @@ async def cmd_task(args, hub: Hub):
 
 async def cmd_result(args, hub: Hub):
     if args.wait is not None:
-        out = await tools.wait_for_result(hub, args.task_id, args.wait)
+        out = await tools.wait_for_result(hub, args.task_id, args.wait, me=_me(args))
     else:
-        out = await tools.check_task(hub, args.task_id)
+        out = await tools.check_task(hub, args.task_id, me=_me(args))
     _print(out, args.json)
     if args.fetch and out.get("output_refs"):
         for ref in out["output_refs"]:
@@ -369,24 +365,15 @@ async def cmd_artifact(args, hub: Hub):
         out = await tools.publish_artifact(hub, _me(args), args.target, key=args.key, description=args.description,
                                            backend=args.backend, task_id=args.task)
     elif args.action == "fetch":
-        out = await tools.fetch_artifact(hub, args.target, args.dest)
+        out = await tools.fetch_artifact(hub, args.target, args.dest, me=_me(args))
     else:
-        out = await hub.artifacts.list()
+        out = await tools.list_artifacts(hub, _me(args))
     _print(out, args.json)
 
 
 async def cmd_history(args, hub: Hub):
-    """Raw audit trail straight from the JetStream stream (all nodes)."""
-    rows = []
-    for subject, data in await hub.bus.history(limit=args.limit):
-        try:
-            env = Envelope.from_json(data)
-        except ProtocolError:
-            rows.append({"subject": subject, "invalid": True})
-            continue
-        if args.task and env.task_id != args.task:
-            continue
-        rows.append(env.to_dict())
+    """Audit trail from the message stream: the messages I sent or received."""
+    rows = await tools.history(hub, _me(args), args.task, args.limit)
     if args.json:
         return _print(rows, True)
     for r in rows:
@@ -700,6 +687,10 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p = add("agents", cmd_agents, "list agents")
     p.add_argument("--capability")
     p.add_argument("--online", action="store_true")
+    add("whoami", cmd_whoami, "my own details: open tasks, unread, session (private, from this node)", bus=False)
+    p = add("observe", cmd_observe, "let another agent read a task I take part in (add an observer)", bus=False)
+    p.add_argument("task_id")
+    p.add_argument("observer")
     p = add("find", cmd_find, "best agent for a capability/role")
     p.add_argument("capability")
     p = add("ask", cmd_ask, "send a REQUEST quickly")
@@ -716,6 +707,8 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--reply", choices=["required", "none"],
                    help="none: a notice, closed with a read receipt once they read it (default: required)")
     p.add_argument("--due", metavar="WHEN", help="reply needed by: +90m, +2h, +1d or ISO time; overdue is followed up")
+    p.add_argument("--observer", action="append", metavar="ADDR",
+                   help="may also read this task's request and result (repeatable)")
     p.add_argument("--wait", type=float, nargs="?", const=600, help="wait for the result (s)")
     p = add("send", cmd_send, "send a message from a YAML file", bus=False)
     p.add_argument("to")

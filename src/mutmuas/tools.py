@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .hub import Hub
+from .visibility import artifact_visible, message_visible
 from .protocol import TERMINAL_STATES, ArtifactRef, Envelope, request_body, result_body
 
 
@@ -22,8 +23,8 @@ def _current_task() -> str | None:
 
 def card_summary(card: dict[str, Any]) -> dict[str, Any]:
     keys = ("address", "display", "role", "mode", "runtime", "provider", "model", "capabilities", "permissions",
-            "accept_from", "state", "online", "current_task", "queue", "inbox_unread", "last_heartbeat",
-            "session", "session_seen", "session_cwd", "session_warning", "description")
+            "accept_from", "state", "availability", "online", "last_heartbeat", "session", "session_seen",
+            "description")
     return {k: card.get(k) for k in keys if card.get(k) not in (None, "", [])}
 
 
@@ -44,10 +45,10 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                        acceptance_criteria: Any = None, timeout_s: float | None = None,
                        deadline: str | None = None, artifacts: list[dict] | None = None,
                        parent_task: str | None = None, priority: str = "normal",
-                       reply: str | None = None) -> dict[str, Any]:
+                       reply: str | None = None, observers: list[str] | None = None) -> dict[str, Any]:
     body = request_body(objective, reason, kind=kind, inputs=inputs, expected_outputs=expected_outputs,
                         constraints=constraints, acceptance_criteria=acceptance_criteria,
-                        deadline=deadline, timeout_s=timeout_s, reply=reply)
+                        deadline=deadline, timeout_s=timeout_s, reply=reply, observers=observers)
     target = await hub.card_or_none(to)
     task_id, delivery = await hub.request(
         me, to, body, artifacts=[ArtifactRef.from_dict(a) for a in artifacts or []],
@@ -83,13 +84,13 @@ def _note(m: dict[str, Any]) -> str:
     return ""
 
 
-async def check_task(hub: Hub, task_id: str) -> dict[str, Any]:
-    view = await hub.task_view(task_id)
-    return _brief(view) if view else {"error": f"unknown task {task_id}"}
+async def check_task(hub: Hub, task_id: str, me: str | None = None) -> dict[str, Any]:
+    view = await hub.task_view(task_id, me)
+    return _brief(view) if view else {"error": f"unknown task {task_id} (or not visible to you)"}
 
 
-async def wait_for_result(hub: Hub, task_id: str, timeout_s: float = 600) -> dict[str, Any]:
-    return _brief(await hub.wait_result(task_id, timeout_s))
+async def wait_for_result(hub: Hub, task_id: str, timeout_s: float = 600, me: str | None = None) -> dict[str, Any]:
+    return _brief(await hub.wait_result(task_id, timeout_s, viewer=me))
 
 
 # Messages that need a decision from the recipient; ACKs and progress UPDATEs are informational.
@@ -264,7 +265,69 @@ async def publish_artifact(hub: Hub, me: str, path: str, *, key: str | None = No
     return ref.to_dict()
 
 
-async def fetch_artifact(hub: Hub, uri: str, dest_dir: str | None = None, sha256: str | None = None) -> dict:
+async def add_observer(hub: Hub, me: str, task_id: str, observer: str) -> dict[str, Any]:
+    """Let someone else read a task I take part in: they get copies of its REQUEST and RESULT. On the
+    requester's side they also get the RESULT when it arrives later."""
+    from .ids import Address
+    addr, _ = hub.local_agent(me)
+    task = hub.ledger.db.execute("SELECT * FROM tasks WHERE task_id=? AND local_agent=?",
+                                 (task_id, str(addr))).fetchone()
+    if task is None:
+        raise PermissionError(f"{addr} does not take part in {task_id}; only its requester or owner can add observers")
+    observer = str(Address.parse(observer))
+    task = hub.ledger.task(task_id, task["role"])
+    request = dict(task.get("request") or {})
+    request["observers"] = sorted(set(request.get("observers") or []) | {observer})
+    hub.ledger.update_task(task_id, task["role"], request=request, force=True)
+    sent = []
+    for row in hub.ledger.thread(task_id):
+        if row.get("type") in ("REQUEST", "RESULT"):
+            env = Envelope.from_dict({k: v for k, v in row.items() if k not in ("direction", "delivery", "error")})
+            await hub.copy_to_observers(str(addr), env, [observer])
+            sent.append(row["type"])
+    return {"task_id": task_id, "observer": observer, "copies_sent": sent}
+
+
+async def whoami(hub: Hub, me: str | None = None) -> dict[str, Any]:
+    """My own details, read from this node's ledger: private, never on the shared card."""
+    from .node import session_fields
+    addr, agent = hub.local_agent(me)
+    open_tasks = hub.ledger.tasks(role="owner", local_agent=str(addr),
+                                  statuses=("PENDING", "ACCEPTED", "RUNNING", "WAITING", "BLOCKED"))
+    out = {"address": str(addr), "project": hub.cfg.project, "role": agent.role, "mode": agent.mode,
+           "workdir": str(agent.workdir_path), "permissions": agent.permissions,
+           "capabilities": agent.capabilities, "open_tasks": [t["task_id"] for t in open_tasks],
+           "inbox_unread": hub.ledger.unseen_count(str(addr)),
+           "coordinator": str(addr) in (hub.cfg.coordinators or [])}
+    if agent.mode == "interactive":
+        out.update(session_fields(hub.ledger.session_of(str(addr)), agent.workdir_path))
+    return out
+
+
+async def list_artifacts(hub: Hub, me: str | None = None) -> list[dict[str, Any]]:
+    """Artifacts `me` published or was sent (visibility.py), not the whole object store."""
+    viewer = str(hub.local_agent(me)[0])
+    return [a for a in await hub.artifacts.list() if artifact_visible(hub.ledger, viewer, a["uri"])]
+
+
+async def history(hub: Hub, me: str | None = None, task_id: str | None = None, limit: int = 500) -> list[dict]:
+    """Messages from the stream that `me` sent or received. Everyone else's mail is not for `me`."""
+    viewer = str(hub.local_agent(me)[0])
+    rows = []
+    for _subject, data in await hub.bus.history(limit=limit):
+        try:
+            env = Envelope.from_json(data).to_dict()
+        except Exception:
+            continue
+        if (task_id is None or env.get("task_id") == task_id) and message_visible(viewer, env):
+            rows.append(env)
+    return rows
+
+
+async def fetch_artifact(hub: Hub, uri: str, dest_dir: str | None = None, sha256: str | None = None,
+                         me: str | None = None) -> dict:
+    if not artifact_visible(hub.ledger, str(hub.local_agent(me)[0]), uri):
+        return {"uri": uri, "error": "not visible to you: only its publisher and those it was sent to may fetch it"}
     dest = dest_dir or os.path.join(os.getcwd(), "mutmuas_artifacts")
     ref = ArtifactRef(uri=uri, sha256=sha256)
     path = await hub.artifacts.fetch(ref, dest)

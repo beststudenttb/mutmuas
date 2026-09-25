@@ -153,7 +153,7 @@ async def test_interactive_inbox_peek_wait_and_working_state(make_config, cluste
 
     await tools.accept_task(hub_b, "B:coder", sent["task_id"])
     card = await eventually(lambda: _card_if(hub_a, "B:coder", "working"), what="WORKING in registry")
-    assert card["current_task"] == sent["task_id"]
+    assert card["availability"] == "busy" and "current_task" not in card    # public card: no task details
     await tools.submit_result(hub_b, "B:coder", "complete", "done", task_id=sent["task_id"])
     await eventually(lambda: _card_if(hub_a, "B:coder", "idle"), what="back to IDLE")
 

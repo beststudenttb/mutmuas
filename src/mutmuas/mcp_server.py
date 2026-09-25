@@ -25,6 +25,7 @@ from . import tools
 from .config import NodeConfig
 from .hub import Hub
 from .ids import now_iso
+from .node import _code_version
 
 INSTRUCTIONS = """You are connected to the mutmuas multi-agent network. Other agents live on other machines
 (nodes) and are addressed as NODE:agent (e.g. B:representation). Use these tools instead of asking the
@@ -43,11 +44,21 @@ human to relay messages:
 - Say whether you need a reply: send_request(reply="none") for a notice (it closes when the other session
   reads it), otherwise the other side owes you a RESULT, by `deadline` if you set one. When a thread's next
   step belongs to someone, name them with next=<address>: that wakes them.
-- A channel message "mutmuas: new ..." means mail arrived: read it with inbox (that marks it read)."""
+- A channel message "mutmuas: new ..." means mail arrived: read it with inbox (that marks it read).
+- Privacy: you see other agents' status, not their work. A task's content is for its requester, owner and
+  observers only. Your reasoning, memory and logs are private: if asked, reply with a condensed summary."""
 
 CHANNEL = "notifications/claude/channel"
 HEARTBEAT_S = 15.0
 PUSH_POLL_S = 1.0
+CODE_CHECK_S = 60.0
+
+
+def stale_notice(started: str, now: str) -> dict[str, Any]:
+    """This process cannot swap its own code: an MCP session must be re-initialized by the client."""
+    return {"content": f"mutmuas: the mail program was updated ({started} -> {now}) but this session still runs "
+                       "the old one. Ask the leader to run /mcp -> Reconnect (mutmuas) in this session.",
+            "meta": {"mcp_code": started, "disk_code": now}}
 
 
 SUMMARY_CHARS = 80
@@ -97,7 +108,14 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
             if io.get("write") is not None:
                 await io["write"].send(SessionMessage(message=JSONRPCNotification(
                     jsonrpc="2.0", method=CHANNEL, params=params)))
+        last_code_check = asyncio.get_running_loop().time()
         while True:
+            if asyncio.get_running_loop().time() - last_code_check >= CODE_CHECK_S:
+                last_code_check = asyncio.get_running_loop().time()
+                disk = await asyncio.to_thread(_code_version)
+                if disk != state["code"] and not state.get("stale_told"):
+                    state["stale_told"] = True
+                    await send(stale_notice(state["code"], disk))
             for m in await tools.inbox(hub, addr, peek=True, types=tools.WAKE, since=str(cursor), limit=20):
                 cursor = max(cursor, m["seq"] or cursor)
                 await send(channel_notice(m))
@@ -110,6 +128,7 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
     async def lifespan(_server):
         hub = await Hub.open(cfg, "mcp", require_bus=False)
         state["hub"] = hub
+        state["code"] = await asyncio.to_thread(_code_version)
         state["me"] = str(hub.local_agent(me)[0])
         background = []
         if not os.environ.get("MUTMUAS_TASK_ID"):          # an interactive session, not a daemon-run task
@@ -135,10 +154,10 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
 
     @server.tool()
     async def whoami() -> str:
-        """Your own address, node and permissions."""
-        addr, agent = hub().local_agent(state["me"])
-        return dump({"address": str(addr), "project": cfg.project, "role": agent.role, "mode": agent.mode,
-                     "permissions": agent.permissions, "capabilities": agent.capabilities})
+        """Your own address, permissions, open tasks, unread count and session state (private to you)."""
+        disk = await asyncio.to_thread(_code_version)
+        return dump(await tools.whoami(hub(), state["me"]) | {"mcp_code": state["code"], "disk_code": disk,
+                                                              "mcp_stale": disk != state["code"]})
 
     @server.tool()
     async def list_agents(capability: str | None = None, online_only: bool = False) -> str:
@@ -155,7 +174,8 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
                            inputs: dict[str, Any] | None = None, expected_outputs: list[str] | None = None,
                            constraints: list[str] | None = None, acceptance_criteria: list[str] | None = None,
                            timeout_s: float | None = None, artifacts: list[dict[str, Any]] | None = None,
-                           priority: str = "normal", reply: str = "required", deadline: str | None = None) -> str:
+                           priority: str = "normal", reply: str = "required", deadline: str | None = None,
+                           observers: list[str] | None = None) -> str:
         """Delegate a task to another agent. kind: query | artifact | experiment | code.
         reply: required (the default: they owe you a RESULT) | none (a notice; closed once they read it).
         deadline: ISO time with timezone by which you need the reply; overdue replies are followed up.
@@ -163,17 +183,17 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         return dump(await tools.send_request(
             hub(), state["me"], to, objective, reason, kind=kind, inputs=inputs, expected_outputs=expected_outputs,
             constraints=constraints, acceptance_criteria=acceptance_criteria, timeout_s=timeout_s,
-            artifacts=artifacts, priority=priority, reply=reply, deadline=deadline))
+            artifacts=artifacts, priority=priority, reply=reply, deadline=deadline, observers=observers))
 
     @server.tool()
     async def check_task(task_id: str) -> str:
         """Current state of a task, its result if finished, and its latest messages."""
-        return dump(await tools.check_task(hub(), task_id))
+        return dump(await tools.check_task(hub(), task_id, me=state["me"]))
 
     @server.tool()
     async def wait_for_result(task_id: str, timeout_s: float = 600) -> str:
         """Block until the task finishes (or timeout_s passes) and return the outcome."""
-        return dump(await tools.wait_for_result(hub(), task_id, timeout_s))
+        return dump(await tools.wait_for_result(hub(), task_id, timeout_s, me=state["me"]))
 
     @server.tool()
     async def cancel_task(task_id: str, reason: str = "") -> str:
@@ -188,6 +208,12 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         Old mail you have dealt with elsewhere: look at inbox(only="all", peek=True), then clear_inbox."""
         types = {"wake": tools.WAKE, "actionable": tools.ACTIONABLE}.get(only)
         return dump(await tools.inbox(hub(), state["me"], include_seen, peek=peek, types=types))
+
+    @server.tool()
+    async def add_observer(task_id: str, observer: str) -> str:
+        """Let another agent read a task you take part in (copies of its request and result). Task content is
+        otherwise only for its requester, owner and observers; other people's tasks are not yours to read."""
+        return dump(await tools.add_observer(hub(), state["me"], task_id, observer))
 
     @server.tool()
     async def clear_inbox(before_seq: int) -> str:
@@ -257,7 +283,7 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
     @server.tool()
     async def fetch_artifact(uri: str, dest_dir: str | None = None, sha256: str | None = None) -> str:
         """Download an artifact reference (artifact://, file://, http(s)://) to a local directory."""
-        return dump(await tools.fetch_artifact(hub(), uri, dest_dir, sha256))
+        return dump(await tools.fetch_artifact(hub(), uri, dest_dir, sha256, me=state["me"]))
 
     return server
 

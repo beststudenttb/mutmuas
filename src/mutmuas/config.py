@@ -115,6 +115,7 @@ class NodeConfig:
     message_retention_days: float = 30
     artifact_max_mb: float = 2048         # upload cap for the NATS object store backend
     escalate_to: list[str] = field(default_factory=list)   # copied on follow-ups (overdue reply, session gone)
+    coordinators: list[str] = field(default_factory=list)  # may see every task's status layer (visibility.py)
     agents: list[AgentConfig] = field(default_factory=list)
     path: Path | None = None              # where this config was loaded from
 

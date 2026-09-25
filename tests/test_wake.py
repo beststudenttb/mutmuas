@@ -82,7 +82,9 @@ async def test_channel_push_and_session_presence(make_config, cluster, tmp_path)
         await send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
         card = await eventually(lambda: _card(hub_a, "B:desk", "online"), what="session online on the card")
-        assert card["session_cwd"] == str(workdir) and "session_warning" not in card
+        assert "session_cwd" not in card                                      # the directory is private
+        mine = await tools.whoami(hub_b, "B:desk")
+        assert mine["session_cwd"] == str(workdir) and "session_warning" not in mine
 
         sent = await tools.send_request(hub_a, "A:main", "B:desk", "wake up and review PR 7", "channel test")
         note = await read_until(lambda m: m.get("method") == "notifications/claude/channel")

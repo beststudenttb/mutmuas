@@ -107,6 +107,36 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   pushes it into the session when it is due, or at the next session start if no session was running. Use
   it instead of promising to come back.
 
+### Visibility (step 1: minimal exposure by default)
+
+The leader's rule: everyone may know what state a task is in; nobody may look into someone else's work.
+There are four layers (`src/mutmuas/visibility.py`):
+
+| layer | who | what |
+|---|---|---|
+| public | everyone | address, role, capabilities, online/offline, `session` on duty, `availability` available/busy |
+| task status | coordinators + participants | task id, first 80 characters of the objective, status, requester → owner, times |
+| task content | participants only: requester, owner, `observers` | reason, inputs, the thread, the RESULT, artifacts |
+| private | nobody | session reasoning, memory, work logs, transcripts, raw run logs. Never sent over mutmuas; ask the person, who answers with a condensed summary |
+
+- Shared stores carry only the public and status layers. The registry card has no current task, queue,
+  inbox counts or session directory; the agent reads those itself with `whoami`. The task KV has no reason,
+  inputs, thread, result or artifact references.
+- Every tool filters by viewer:
+  - `task`, `result` and MCP `check_task` return nothing to non-participants, and the status layer to
+    coordinators;
+  - `tasks --all` lists the viewer's own tasks, or every status record for a coordinator;
+  - `history` lists only messages the viewer sent or received;
+  - `artifact list` and `fetch` cover only artifacts the viewer published or was sent.
+- `coordinators` is set in the HR-issued node.yaml, e.g. `[B:claude-secretary]`; an agent cannot make
+  itself one.
+- `observers` on a REQUEST (`agentctl ask --observer`), or `add_observer` / `agentctl observe` later by a
+  participant: observers receive FYI copies of the REQUEST and RESULT, and are participants from then on.
+  Copies never wake them.
+- A session started outside its workdir is reported to the agent and to the coordinators, not on the card.
+- **Not a security boundary.** Every process holding the node credential can still read the message
+  stream. Enforcement (the daemon as the only NATS principal, or NATS accounts) is step 2.
+
 ### Example REQUEST
 
 ```yaml
