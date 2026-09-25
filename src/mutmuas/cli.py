@@ -697,7 +697,9 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p = add("agents", cmd_agents, "list agents")
     p.add_argument("--capability")
     p.add_argument("--online", action="store_true")
-    add("whoami", cmd_whoami, "my own details: open tasks, unread, session (private, from this node)", bus=False)
+    add("whoami", cmd_whoami, "my own details: open tasks, unread, session, sessions using my address, workdir vs "
+        "origin (as of the last fetch), my background agentctl processes. Checks a handoff's facts about this "
+        "session; it cannot show what is missing elsewhere (e.g. a review never requested)", bus=False)
     p = add("observe", cmd_observe, "let another agent read a task I take part in (add an observer)", bus=False)
     p.add_argument("task_id")
     p.add_argument("observer")

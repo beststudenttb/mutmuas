@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -327,7 +328,85 @@ async def whoami(hub: Hub, me: str | None = None) -> dict[str, Any]:
            "coordinator": str(addr) in (hub.cfg.coordinators or [])}
     if agent.mode == "interactive":
         out.update(session_fields(hub.ledger.session_of(str(addr)), agent.workdir_path))
+        out.update(_sessions_live(hub, str(addr)))
+    out["repo"] = _repo_state(agent.workdir_path)
+    out["background"] = _background(str(addr))
+    if out.get("sessions_live", 0) > 1:
+        out["warning"] = (f"{out['sessions_live']} sessions use {addr}: one address, one session (R3.7); "
+                          "they read each other's mail")
     return out
+
+
+# whoami's reorientation facts (weekend r3b, P2). They check what a handoff says about *this* session: who
+# else uses the address, where the workdir stands against origin, what runs in the background. They cannot
+# show what is missing elsewhere (e.g. a review that was never requested): that needs the task history.
+
+def _sessions_live(hub: Hub, addr: str) -> dict[str, Any]:
+    from .node import session_alive
+    holder = hub.ledger.session_of(addr)
+    live = [c["pid"] for c in hub.ledger.session_contenders(addr)
+            if session_alive({**c, "pid": c["pid"]})]
+    held = 1 if holder and holder["pid"] and session_alive(holder) else 0
+    return {"sessions_live": held + len(live), "session_contenders": live}
+
+
+def _git(repo: Path, *args: str) -> str | None:
+    import subprocess
+    out = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=10)
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def _repo_state(workdir: Path) -> dict[str, Any] | None:
+    """The workdir's commit against its upstream, as of the last fetch (no network: say how old that is)."""
+    head = _git(workdir, "rev-parse", "--short=7", "HEAD")
+    if head is None:
+        return None
+    state: dict[str, Any] = {"path": str(workdir), "head": head,
+                             "branch": _git(workdir, "rev-parse", "--abbrev-ref", "HEAD"),
+                             "upstream": _git(workdir, "rev-parse", "--abbrev-ref", "@{upstream}"),
+                             "dirty": bool(_git(workdir, "status", "--porcelain", "--untracked-files=no"))}
+    if state["upstream"]:
+        counts = _git(workdir, "rev-list", "--left-right", "--count", "HEAD...@{upstream}")
+        if counts:
+            state["ahead"], state["behind"] = (int(n) for n in counts.split())
+    common = _git(workdir, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    fetch_head = Path(common) / "FETCH_HEAD" if common else None
+    if fetch_head and fetch_head.exists():
+        state["fetched_at"] = datetime.fromtimestamp(fetch_head.stat().st_mtime, timezone.utc).isoformat(
+            timespec="seconds")
+        state["note"] = "ahead/behind as of the last fetch; run git fetch for the current origin"
+    else:
+        state["fetched_at"] = None
+        state["note"] = "never fetched here: ahead/behind compare with a stale origin; run git fetch"
+    return state
+
+
+def _background(addr: str) -> list[dict[str, Any]]:
+    """agentctl processes running as this address (e.g. mail watchers), other than this one and its parents.
+    Only processes that name the address with --as are found, not ones that got it from MUTMUAS_AGENT."""
+    import subprocess
+    try:
+        ps = subprocess.run(["ps", "-axo", "pid=,ppid=,etime=,command="], capture_output=True, text=True,
+                            timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows = {}
+    for line in ps.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) == 4 and parts[0].isdigit():
+            rows[int(parts[0])] = (int(parts[1]), parts[2], parts[3])
+    mine, pid = set(), os.getpid()
+    while pid in rows and pid not in mine:          # this process and its ancestors are not "background"
+        mine.add(pid)
+        pid = rows[pid][0]
+    found = []
+    for pid, (_, elapsed, cmd) in sorted(rows.items()):
+        argv = cmd.split()
+        named = any(a == "--as" and i + 1 < len(argv) and argv[i + 1] == addr or a == f"--as={addr}"
+                    for i, a in enumerate(argv))
+        if pid not in mine and named and "agentctl" in cmd:
+            found.append({"pid": pid, "elapsed": elapsed, "command": cmd[:200]})
+    return found
 
 
 async def list_artifacts(hub: Hub, me: str | None = None) -> list[dict[str, Any]]:
