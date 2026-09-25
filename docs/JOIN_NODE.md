@@ -14,7 +14,7 @@
 - 系统:macOS 或 Linux。Windows 请在 WSL2(Ubuntu)里操作,本文按 Linux 走。
 - 已装:`git`、conda(Miniconda/Anaconda 都行)、Claude Code CLI(`claude --version` 能出版本号)。
 - 能访问服务器:`nc -vz 150.89.170.193 4222` 显示 succeeded/open。
-- 能拉仓库:`git clone git@github.com:beststudenttb/mutmuas.git` 需要 GitHub 访问权限。
+- 能拉仓库:仓库是公开的,用 https 即可,不需要 GitHub 钥匙:`git clone https://github.com/beststudenttb/mutmuas.git`。
 
 ## 第 1 步 服务器签发凭据(由 leader 在服务器 B 上执行)
 
@@ -49,7 +49,7 @@ mutmuas 自身统一用 conda 环境 `mutmuas`(Python 3.12)。任务自己要用
 ```bash
 conda create -y -n mutmuas python=3.12
 mkdir -p ~/mutmuas
-git clone -b claude git@github.com:beststudenttb/mutmuas.git ~/mutmuas/claude
+git clone -b claude https://github.com/beststudenttb/mutmuas.git ~/mutmuas/claude
 cd ~/mutmuas/claude
 PYTHON="$(conda run -n mutmuas which python)" scripts/install.sh
 ```
