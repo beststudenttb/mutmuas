@@ -9,7 +9,7 @@ to the secretary through your temporary mailbox, then waits. When the secretary 
 receives the sealed bundle, checks the secretary's signature (secretary_ed25519.pub next to this file),
 decrypts it and writes the files to --out (700 dir, 600 files). It never prints secrets.
 """
-import argparse, asyncio, hashlib, json, os, ssl, sys
+import argparse, asyncio, hashlib, json, logging, os, ssl, sys
 from pathlib import Path
 
 import nats, yaml
@@ -52,19 +52,24 @@ async def run(a):
             await asyncio.wait_for(asyncio.shield(got), a.poll)
         except asyncio.TimeoutError:
             try:
-                await nc.request("mm.mutmuas.reception.in", json.dumps({"type": "status", "invite": inv}).encode(), timeout=10)
+                r = await nc.request("mm.mutmuas.reception.in", json.dumps({"type": "status", "invite": inv}).encode(), timeout=10)
+                print(f"still waiting; desk says: {json.loads(r.data).get('status')}")
             except Exception:
-                pass
+                print("still waiting; desk did not answer this poll (it will retry)")
     files = got.result()
     out = Path(os.path.expanduser(a.out)); out.mkdir(parents=True, exist_ok=True); os.chmod(out, 0o700)
     for name, data in files.items():
-        fd = os.open(out / name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        if Path(name).name != name or name.startswith("."):
+            sys.exit(f"refusing a bundle file with an unsafe name: {name!r}")
+        mode = 0o644 if name.endswith(".crt") else 0o600   # the CA certificate is public (STANDARD item 2)
+        fd = os.open(out / name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
         with os.fdopen(fd, "wb") as f: f.write(data)
         print(f"wrote {out / name}  sha256 {hashlib.sha256(data).hexdigest()[:16]}")
     await nc.close()
 
 
 def main():
+    logging.getLogger("asyncio").setLevel(logging.ERROR)   # hide a harmless TLS-close warning newcomers mistake for an error
     p = argparse.ArgumentParser()
     p.add_argument("--invite", required=True); p.add_argument("--questionnaire"); p.add_argument("--out", required=True)
     p.add_argument("--server", default="nats://150.89.170.193:4222"); p.add_argument("--ca")
