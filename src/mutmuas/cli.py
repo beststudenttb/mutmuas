@@ -243,7 +243,7 @@ async def cmd_inbox(args, hub: Hub):
         named = {"actionable": tools.ACTIONABLE, "wake": tools.WAKE}
         types = named.get(args.only) or tuple(t.strip().upper() for t in args.only.split(","))
     rows = await tools.inbox(hub, _me(args), include_seen=args.all, peek=args.peek, wait_s=args.wait, types=types,
-                             since=args.since)
+                             since=args.since, new=args.new)
     if args.json:
         _print(rows, True)
     elif not rows:
@@ -268,7 +268,7 @@ async def cmd_watch(args, hub: Hub):
     # Cursor = ledger rowid (monotonic). An old timestamp cursor (A:codex: ms collisions lost mail) is reset
     # to the current end of the ledger.
     if not cursor_file.exists() or not cursor_file.read_text().strip().isdigit():
-        cursor_file.write_text(str(hub.ledger.db.execute("SELECT COALESCE(MAX(rowid), 0) FROM messages").fetchone()[0]))
+        cursor_file.write_text(str(hub.ledger.last_rowid()))
     while True:
         try:
             rows = await tools.inbox(hub, me, peek=True, wait_s=args.interval, types=tools.ACTIONABLE,
@@ -707,6 +707,9 @@ def agentctl_parser() -> argparse.ArgumentParser:
                         "watcher), 'actionable' (also RESULTs), or comma separated types, e.g. REQUEST,QUESTION")
     p.add_argument("--wait", type=float, nargs="?", const=3600, metavar="SECONDS",
                    help="block until a message arrives (default up to 3600 s); exit code 3 on timeout")
+    p.add_argument("--new", action="store_true",
+                   help="only messages that arrive after this command starts: a --peek watcher re-armed while "
+                        "an older message is still unread does not fire again at once (no cursor to keep)")
     p = add("watch", cmd_watch, "run forever: desktop notification per new actionable message (launchd/systemd)")
     p.add_argument("--interval", type=float, default=3600, help="max seconds per wait cycle")
     p.add_argument("--dry-run", action="store_true", help="log notifications instead of showing them")

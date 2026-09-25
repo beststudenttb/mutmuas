@@ -195,6 +195,10 @@ class Ledger:
     def mark_seen(self, task_id: str) -> None:
         self.db.execute("UPDATE messages SET seen=1 WHERE direction='in' AND task_id=?", (task_id,))
 
+    def last_rowid(self) -> int:
+        """The newest message's rowid: a cursor meaning "from now on"."""
+        return self.db.execute("SELECT COALESCE(MAX(rowid), 0) FROM messages").fetchone()[0]
+
     def unseen_count(self, local_agent: str, types: tuple[str, ...] | None = None, since: str | None = None) -> int:
         sql = "SELECT COUNT(*) FROM messages WHERE direction='in' AND seen=0 AND state='handled' AND local_agent=?"
         args: list[Any] = [local_agent]

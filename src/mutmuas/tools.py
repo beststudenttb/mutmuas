@@ -100,12 +100,16 @@ WAKE = ("REQUEST", "QUESTION", "ANSWER", "BLOCKED", "REJECT", "CANCEL", "ERROR")
 
 async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, peek: bool = False,
                 wait_s: float | None = None, types: tuple[str, ...] | None = None,
-                since: str | None = None) -> list[dict[str, Any]]:
+                since: str | None = None, new: bool = False) -> list[dict[str, Any]]:
     """Unread messages for ``me``. peek: do not mark them read. wait_s: block until one arrives (or timeout).
     types: only these message types (e.g. ACTIONABLE), for both waiting and listing.
     since: only messages that reached this node's ledger after this ISO timestamp (a notifier's cursor,
-    so --peek does not report the same unread message again and again)."""
+    so --peek does not report the same unread message again and again).
+    new: only messages that arrive from now on. A --peek watcher re-armed while an older message is still
+    unread would otherwise return at once; with new it needs no cursor of its own."""
     addr, _ = hub.local_agent(me)
+    if new and since is None:
+        since = str(hub.ledger.last_rowid())
     if wait_s and not include_seen:
         # Messages reach this node's ledger through the daemon, so waiting on the ledger is enough
         # (a second JetStream consumer on the same mailbox would split the messages).

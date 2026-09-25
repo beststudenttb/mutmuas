@@ -107,10 +107,12 @@ def build_server(cfg: NodeConfig, me: str | None) -> MCPServer:
         return dump(await tools.inbox(hub(), state["me"], include_seen, peek=peek))
 
     @server.tool()
-    async def wait_for_message(timeout_s: float = 600, peek: bool = False, actionable_only: bool = True) -> str:
+    async def wait_for_message(timeout_s: float = 600, peek: bool = False, actionable_only: bool = True,
+                               new: bool = False) -> str:
         """Block until at least one unread message arrives for you (or timeout_s passes), then return them.
-        actionable_only ignores ACKs and progress UPDATEs. Returns [] on timeout. Use it instead of polling."""
-        return dump(await tools.inbox(hub(), state["me"], peek=peek, wait_s=timeout_s,
+        actionable_only ignores ACKs and progress UPDATEs. new: only messages arriving from now on (older
+        unread ones are ignored). Returns [] on timeout. Use it instead of polling."""
+        return dump(await tools.inbox(hub(), state["me"], peek=peek, wait_s=timeout_s, new=new,
                                       types=tools.ACTIONABLE if actionable_only else None))
 
     @server.tool()

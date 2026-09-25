@@ -181,3 +181,29 @@ def test_recover_sees_every_open_task_and_rowid_cursor_misses_nothing(tmp_path):
     rest = ledger.unseen("B:lab", limit=50, mark=False, since=str(cursor))
     assert len(first) == 50 and len(rest) == 1                 # the 51st is not lost
     ledger.close()
+
+
+async def test_new_watcher_ignores_older_unread_messages(make_config, cluster):
+    """inbox --wait --peek --new: re-armed while an older message is still unread, it must not fire at once;
+    it fires on the next message, and returns only that one (both A:claude and C:claude hit this)."""
+    a = make_config("A", [interactive("main")])
+    b = make_config("B", [interactive("desk")])
+    await cluster.start(a)
+    await cluster.start(b)
+    hub_a, hub_b = await cluster.client(a), await cluster.client(b)
+    old = await tools.send_request(hub_a, "A:main", "B:desk", "old", "left unread")
+    await eventually(lambda: tools.inbox(hub_b, "B:desk", peek=True, types=tools.WAKE), what="old request arrived")
+
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    assert await tools.inbox(hub_b, "B:desk", peek=True, wait_s=1.5, types=tools.WAKE, new=True) == []
+    assert loop.time() - start >= 1.4                          # it waited instead of firing on the old one
+    # without --new the same call returns the old message at once: the bug being fixed
+    assert [m["task_id"] for m in await tools.inbox(hub_b, "B:desk", peek=True, wait_s=1.5,
+                                                   types=tools.WAKE)] == [old["task_id"]]
+
+    waiter = asyncio.create_task(tools.inbox(hub_b, "B:desk", peek=True, wait_s=20, types=tools.WAKE, new=True))
+    await asyncio.sleep(0.3)
+    fresh = await tools.send_request(hub_a, "A:main", "B:desk", "fresh", "arrives while waiting")
+    got = await asyncio.wait_for(waiter, 25)
+    assert [m["task_id"] for m in got] == [fresh["task_id"]]
