@@ -77,6 +77,16 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_seen       TEXT NOT NULL
 );
 
+-- "Remind me at …": the session's MCP process pushes the text into the session when it is due.
+CREATE TABLE IF NOT EXISTS reminders (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    local_agent     TEXT NOT NULL,
+    due             TEXT NOT NULL,
+    text            TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    fired_at        TEXT
+);
+
 -- Follow-ups already sent (overdue reply, session gone), so each is sent once.
 CREATE TABLE IF NOT EXISTS notices (
     task_id         TEXT NOT NULL,
@@ -257,6 +267,25 @@ class Ledger:
     def session_of(self, local_agent: str) -> dict[str, Any] | None:
         row = self.db.execute("SELECT * FROM sessions WHERE local_agent=?", (local_agent,)).fetchone()
         return dict(row) if row else None
+
+    def mark_seen_before(self, local_agent: str, before_seq: int) -> int:
+        """Mark everything up to a rowid as read: the session's explicit 'clear the backlog'."""
+        cur = self.db.execute("UPDATE messages SET seen=1 WHERE direction='in' AND local_agent=? AND seen=0"
+                              " AND rowid <= ?", (local_agent, before_seq))
+        return cur.rowcount
+
+    def add_reminder(self, local_agent: str, due: str, text: str) -> int:
+        cur = self.db.execute("INSERT INTO reminders (local_agent, due, text, created_at) VALUES (?,?,?,?)",
+                              (local_agent, due, text, now_iso()))
+        return cur.lastrowid
+
+    def due_reminders(self, local_agent: str, now: str) -> list[dict[str, Any]]:
+        return [dict(r) for r in self.db.execute(
+            "SELECT * FROM reminders WHERE local_agent=? AND fired_at IS NULL AND due <= ? ORDER BY due",
+            (local_agent, now))]
+
+    def fire_reminder(self, reminder_id: int) -> None:
+        self.db.execute("UPDATE reminders SET fired_at=? WHERE id=?", (now_iso(), reminder_id))
 
     def notice_once(self, task_id: str, reason: str) -> bool:
         """True the first time (task_id, reason) is recorded: send that follow-up now, and never again."""

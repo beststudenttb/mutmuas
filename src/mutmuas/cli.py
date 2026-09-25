@@ -120,7 +120,8 @@ async def cmd_status(args, hub: Hub):
         for c in by_node.get(node, []):
             state = "OFFLINE" if not c["online"] else c.get("state", "?").upper()
             alias = f" ({c['display']})" if c.get("display") else ""
-            print(f"  {c['address']}{alias}  {state}  [{c.get('mode')}/{c.get('runtime') or '-'}]")
+            session = f"  session {c['session']}" if c.get("session") else ""
+            print(f"  {c['address']}{alias}  {state}  [{c.get('mode')}/{c.get('runtime') or '-'}]{session}")
             details = []
             if c.get("current_task"):
                 details.append(f"task: {c['current_task']}")
@@ -132,6 +133,8 @@ async def cmd_status(args, hub: Hub):
                 details.append(f"inbox: {c['inbox_unread']}")
             if details:
                 print("    " + "  ".join(details))
+            if c.get("session_warning"):
+                print(f"    WARNING: {c['session_warning']}")
     if not known and not by_node:
         print("no nodes registered yet (is any agent-node running?)")
 
@@ -142,7 +145,8 @@ async def cmd_agents(args, hub: Hub):
         return _print(rows, True)
     for c in rows:
         flag = "online " if c.get("online") else "offline"
-        print(f"{c['address']:<28} {flag} {c.get('state', ''):<8} {c.get('role', ''):<28} "
+        session = f"session:{c['session']}" if c.get("session") else ""
+        print(f"{c['address']:<28} {flag} {c.get('state', ''):<8} {session:<16} {c.get('role', ''):<28} "
               f"{','.join(c.get('capabilities', []))}")
 
 
@@ -258,6 +262,8 @@ async def cmd_result(args, hub: Hub):
 
 
 async def cmd_inbox(args, hub: Hub):
+    if args.clear_before is not None:
+        return _print(await tools.clear_inbox(hub, _me(args), args.clear_before), args.json)
     types = None
     if args.only:
         named = {"actionable": tools.ACTIONABLE, "wake": tools.WAKE}
@@ -736,6 +742,8 @@ def agentctl_parser() -> argparse.ArgumentParser:
                         "watcher), 'actionable' (also RESULTs), or comma separated types, e.g. REQUEST,QUESTION")
     p.add_argument("--wait", type=float, nargs="?", const=3600, metavar="SECONDS",
                    help="block until a message arrives (default up to 3600 s); exit code 3 on timeout")
+    p.add_argument("--clear-before", type=int, metavar="SEQ",
+                   help="mark all unread mail up to this seq as read (after looking at it with --all/--peek)")
     p = add("watch", cmd_watch, "run forever: desktop notification per new actionable message (launchd/systemd)")
     p.add_argument("--interval", type=float, default=3600, help="max seconds per wait cycle")
     p.add_argument("--dry-run", action="store_true", help="log notifications instead of showing them")

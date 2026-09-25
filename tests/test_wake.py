@@ -10,6 +10,7 @@ import pytest
 from conftest import eventually, interactive
 
 from mutmuas import tools
+from mutmuas.mcp_server import SUMMARY_CHARS, channel_notice
 from mutmuas.node import session_fields
 
 
@@ -86,8 +87,16 @@ async def test_channel_push_and_session_presence(make_config, cluster, tmp_path)
         sent = await tools.send_request(hub_a, "A:main", "B:desk", "wake up and review PR 7", "channel test")
         note = await read_until(lambda m: m.get("method") == "notifications/claude/channel")
         assert sent["task_id"] in note["params"]["content"] and "review PR 7" in note["params"]["content"]
-        assert note["params"]["meta"] == {"task_id": sent["task_id"], "msg_type": "REQUEST", "sender": "A:main"}
+        assert note["params"]["meta"] == {"task_id": sent["task_id"], "msg_type": "REQUEST", "sender": "A:main",
+                                          "summary": "wake up and review PR 7"}
         assert await tools.inbox(hub_b, "B:desk", peek=True)                     # pushing did not mark it read
+        listed = {c["address"]: c for c in await tools.list_agents(hub_a)}
+        assert listed["B:desk"]["session"] == "online"                          # visible in `agents`, not only raw
+
+        await tools.remind_me(hub_b, "B:desk", "+0m", "check C's reply to T3")
+        reminder = await read_until(lambda m: m.get("method") == "notifications/claude/channel"
+                                    and "reminder" in m["params"]["meta"])
+        assert "check C's reply to T3" in reminder["params"]["content"]
     finally:
         proc.stdin.close()
         await asyncio.wait_for(proc.wait(), 15)
@@ -145,3 +154,45 @@ def test_due_parsing():
     for bad in ("+90", "tomorrow", "2026-09-25T18:00:00"):
         with pytest.raises(SystemExit):
             _parse_due(bad)
+
+
+async def test_wrong_kind_from_a_colleague_is_refused_but_seen(make_config, cluster):
+    a = make_config("A", [interactive("main"), interactive("stranger")])
+    b = make_config("B", [interactive("desk", accept_from=["A:main"])])
+    await cluster.start(a)
+    await cluster.start(b)
+    hub_a, hub_b = await cluster.client(a), await cluster.client(b)
+    wrong = await tools.send_request(hub_a, "A:main", "B:desk", "please fix these 4 things", "review", kind="code")
+    await tools.send_request(hub_a, "A:stranger", "B:desk", "let me in", "not allowed")
+    assert (await tools.wait_for_result(hub_a, wrong["task_id"], 20))["status"] == "FAILED"   # still refused
+    rows = await eventually(lambda: tools.inbox(hub_b, "B:desk", peek=True, types=tools.WAKE), what="seen")
+    await asyncio.sleep(0.5)
+    rows = await tools.inbox(hub_b, "B:desk", peek=True, types=tools.WAKE)
+    assert [m["task_id"] for m in rows] == [wrong["task_id"]]                  # the stranger stays invisible
+    assert rows[0]["note"].startswith("rejected: permission denied") and "kind=code" in rows[0]["note"]
+    assert "[rejected: permission denied" in channel_notice(rows[0])["content"]
+
+
+async def test_clear_inbox_marks_a_backlog_read(make_config, cluster):
+    a, b, hub_a, hub_b = await _pair(make_config, cluster)
+    for i in range(3):
+        await tools.send_request(hub_a, "A:main", "B:desk", f"old {i}", "backlog", reply="none")
+    rows = await eventually(lambda: _n(hub_b, 3), what="backlog")
+    last = max(m["seq"] for m in rows)
+    fresh = await tools.send_request(hub_a, "A:main", "B:desk", "new one", "after the backlog")
+    await eventually(lambda: _n(hub_b, 4), what="new one")
+    assert (await tools.clear_inbox(hub_b, "B:desk", last))["marked_read"] == 3
+    assert [m["task_id"] for m in await tools.inbox(hub_b, "B:desk", peek=True)] == [fresh["task_id"]]
+
+
+async def _n(hub, n):
+    rows = await tools.inbox(hub, "B:desk", peek=True)
+    return rows if len(rows) >= n else None
+
+
+def test_push_summary_is_short_and_never_empty():
+    long = {"type": "REQUEST", "from": "A:x", "task_id": "T-1", "body": {"objective": "word " * 60}}
+    note = channel_notice(long)
+    assert len(note["meta"]["summary"]) <= SUMMARY_CHARS + 1 and note["meta"]["summary"].endswith("…")
+    odd = {"type": "UPDATE", "from": "A:x", "task_id": "T-2", "body": {"state": "RUNNING", "detail": "halfway"}}
+    assert channel_notice(odd)["meta"]["summary"] == "RUNNING"

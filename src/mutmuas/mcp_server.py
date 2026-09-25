@@ -24,6 +24,7 @@ from mcp_types import JSONRPCNotification
 from . import tools
 from .config import NodeConfig
 from .hub import Hub
+from .ids import now_iso
 
 INSTRUCTIONS = """You are connected to the mutmuas multi-agent network. Other agents live on other machines
 (nodes) and are addressed as NODE:agent (e.g. B:representation). Use these tools instead of asking the
@@ -49,19 +50,32 @@ HEARTBEAT_S = 15.0
 PUSH_POLL_S = 1.0
 
 
+SUMMARY_CHARS = 80
+
+
 def _summary(m: dict[str, Any]) -> str:
     body = m.get("body") or {}
     text = next((body[k] for k in ("objective", "question", "answer", "summary", "message", "reason")
-                 if body.get(k)), "")
+                 if body.get(k)), None)
+    if text is None:            # unknown body shape: the first text value, never an empty summary
+        text = next((v for v in body.values() if isinstance(v, str) and v.strip()), "")
     text = " ".join(str(text).split())
-    return text[:200] + ("…" if len(text) > 200 else "")
+    return text[:SUMMARY_CHARS] + ("…" if len(text) > SUMMARY_CHARS else "")
 
 
 def channel_notice(m: dict[str, Any]) -> dict[str, Any]:
     """The line pushed into the session for one new message (Claude Code channel: {content, meta})."""
-    return {"content": f"mutmuas: new {m['type']} from {m['from']} (task {m['task_id']}): {_summary(m)} "
+    summary = _summary(m)
+    note = f" [{m['note']}]" if m.get("note") else ""
+    return {"content": f"mutmuas: new {m['type']} from {m['from']} (task {m['task_id']}){note}: {summary} "
                        "- read it with the mutmuas inbox tool.",
-            "meta": {"task_id": str(m["task_id"]), "msg_type": m["type"], "sender": m["from"]}}
+            "meta": {"task_id": str(m["task_id"]), "msg_type": m["type"], "sender": m["from"],
+                     "summary": summary}}
+
+
+def reminder_notice(r: dict[str, Any]) -> dict[str, Any]:
+    return {"content": f"mutmuas reminder (set {r['created_at']}): {r['text']}",
+            "meta": {"reminder": str(r["id"]), "due": r["due"]}}
 
 
 def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = None,
@@ -78,12 +92,18 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
     async def push(hub: Hub, addr: str, cursor: int) -> None:
         """Wake the session on new mail that needs it (Claude Code channels). Never marks anything read."""
         await asyncio.sleep(PUSH_POLL_S)          # let the handshake finish before the first notification
+
+        async def send(params: dict[str, Any]) -> None:
+            if io.get("write") is not None:
+                await io["write"].send(SessionMessage(message=JSONRPCNotification(
+                    jsonrpc="2.0", method=CHANNEL, params=params)))
         while True:
             for m in await tools.inbox(hub, addr, peek=True, types=tools.WAKE, since=str(cursor), limit=20):
                 cursor = max(cursor, m["seq"] or cursor)
-                if io.get("write") is not None:
-                    await io["write"].send(SessionMessage(message=JSONRPCNotification(
-                        jsonrpc="2.0", method=CHANNEL, params=channel_notice(m))))
+                await send(channel_notice(m))
+            for r in hub.ledger.due_reminders(addr, now_iso()):
+                await send(reminder_notice(r))
+                hub.ledger.fire_reminder(r["id"])
             await asyncio.sleep(PUSH_POLL_S)
 
     @asynccontextmanager
@@ -161,10 +181,24 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         return dump(await tools.cancel_task(hub(), state["me"], task_id, reason))
 
     @server.tool()
-    async def inbox(include_seen: bool = False, peek: bool = False) -> str:
-        """Messages addressed to you (new requests, questions, answers, results).
-        peek=True leaves them unread (for a watcher that only decides whether to wake you)."""
-        return dump(await tools.inbox(hub(), state["me"], include_seen, peek=peek))
+    async def inbox(include_seen: bool = False, peek: bool = False, only: str = "wake") -> str:
+        """Messages addressed to you. only: "wake" (the default: what needs you - requests, questions, answers,
+        refusals, anything naming you as next), "actionable" (also results of your requests) or "all" (also
+        ACKs and progress). peek=True leaves them unread. A row with "note" (e.g. rejected: ...) is FYI.
+        Old mail you have dealt with elsewhere: look at inbox(only="all", peek=True), then clear_inbox."""
+        types = {"wake": tools.WAKE, "actionable": tools.ACTIONABLE}.get(only)
+        return dump(await tools.inbox(hub(), state["me"], include_seen, peek=peek, types=types))
+
+    @server.tool()
+    async def clear_inbox(before_seq: int) -> str:
+        """Mark all your unread mail up to seq (the "seq" field inbox shows) as read, after you have looked at it."""
+        return dump(await tools.clear_inbox(hub(), state["me"], before_seq))
+
+    @server.tool()
+    async def remind_me(at: str, text: str) -> str:
+        """Come back to something later: at (ISO time with timezone, or +10m / +2h) the text is pushed into this
+        session like new mail. Use it instead of promising to "check again in a while"."""
+        return dump(await tools.remind_me(hub(), state["me"], at, text))
 
     @server.tool()
     async def wait_for_message(timeout_s: float = 600, peek: bool = False, actionable_only: bool = True) -> str:

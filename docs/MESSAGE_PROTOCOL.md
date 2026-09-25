@@ -74,7 +74,8 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
 - **Push.** `agentctl mcp --channel` declares the Claude Code `claude/channel` capability. When a message
   reaches the ledger that would wake the agent (a wake type, or `next` naming it), the MCP server pushes one
   line into the running session:
-  `mutmuas: new REQUEST from A:x (task T-…): <summary>`, with meta `{task_id, msg_type, sender}`.
+  `mutmuas: new REQUEST from A:x (task T-…): <first 80 characters>`, with meta
+  `{task_id, msg_type, sender, summary}`.
   - Start the session with `claude --dangerously-load-development-channels server:mutmuas` until the
     channel is approved.
   - The push never marks anything read. Mail that arrived before the session started is not pushed, so
@@ -95,6 +96,16 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
 
   Nothing is chased while the owner's node is offline (a closed laptop).
 - **Reading.** Only the session marks mail read. Pushes, watchers and scripts use `--peek`.
+  - The MCP `inbox` tool lists only what needs the agent by default (`only="wake"`).
+  - A backlog the session has already dealt with elsewhere is cleared explicitly, after looking at it:
+    `clear_inbox(before_seq)` in MCP, or `agentctl inbox --clear-before SEQ`.
+- **Refused but seen.** A REQUEST that an interactive agent may not take, because of a wrong `kind` or a
+  missing permission, is still refused: the requester gets REJECT and the task is FAILED. But if the sender
+  is in the agent's `accept_from`, the request also shows in the agent's inbox with
+  `note: "rejected: …"`, and it wakes the agent. Requests from senders outside `accept_from` stay invisible.
+- **Later.** `remind_me(at, text)` in MCP stores a reminder in the node ledger. The session's MCP process
+  pushes it into the session when it is due, or at the next session start if no session was running. Use
+  it instead of promising to come back.
 
 ### Example REQUEST
 

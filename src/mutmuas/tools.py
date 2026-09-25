@@ -23,7 +23,7 @@ def _current_task() -> str | None:
 def card_summary(card: dict[str, Any]) -> dict[str, Any]:
     keys = ("address", "display", "role", "mode", "runtime", "provider", "model", "capabilities", "permissions",
             "accept_from", "state", "online", "current_task", "queue", "inbox_unread", "last_heartbeat",
-            "description")
+            "session", "session_seen", "session_cwd", "session_warning", "description")
     return {k: card.get(k) for k in keys if card.get(k) not in (None, "", [])}
 
 
@@ -124,14 +124,45 @@ async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, 
         envs = hub.ledger.unseen(str(addr), limit, mark=not peek, types=types, since=since, next_to=next_to)
         if not peek:
             await _read_receipts(hub, str(addr), envs)
-    meta = {r[0]: (r[1], r[2]) for r in hub.ledger.db.execute(
-        f"SELECT message_id, created_at, rowid FROM messages WHERE direction='in' AND message_id IN "
+    meta = {r[0]: (r[1], r[2], r[3]) for r in hub.ledger.db.execute(
+        f"SELECT message_id, created_at, rowid, last_error FROM messages WHERE direction='in' AND message_id IN "
         f"({','.join('?' * len(envs))})", [e.message_id for e in envs]).fetchall()} if envs else {}
-    return [{"message_id": e.message_id, "type": e.type, "from": e.sender, "task_id": e.task_id,
-             "timestamp": e.timestamp, "received_at": meta.get(e.message_id, (None, None))[0],
-             "seq": meta.get(e.message_id, (None, None))[1], "body": e.body,
-             "artifacts": [a.to_dict() for a in e.artifacts]}
-            for e in envs]
+    rows = []
+    for e in envs:
+        received, seq, note = meta.get(e.message_id, (None, None, None))
+        row = {"message_id": e.message_id, "type": e.type, "from": e.sender, "task_id": e.task_id,
+               "timestamp": e.timestamp, "received_at": received, "seq": seq, "body": e.body,
+               "artifacts": [a.to_dict() for a in e.artifacts]}
+        if note:
+            row["note"] = note          # e.g. "rejected: permission denied: …" — already refused, FYI
+        rows.append(row)
+    return rows
+
+
+async def clear_inbox(hub: Hub, me: str, before_seq: int) -> dict[str, Any]:
+    """Mark every unread message up to seq (the rowid shown by inbox) as read. For the session only, after it
+    has looked at the list: clearing a backlog of old mail it has already dealt with elsewhere."""
+    addr, _ = hub.local_agent(me)
+    return {"marked_read": hub.ledger.mark_seen_before(str(addr), int(before_seq)), "up_to_seq": int(before_seq)}
+
+
+async def remind_me(hub: Hub, me: str, at: str, text: str) -> dict[str, Any]:
+    """Have the session's mutmuas MCP process push `text` into the session at `at` (ISO time with timezone, or
+    +10m/+2h). Needs a session running with the channel; a reminder due while no session runs fires at the next
+    session start."""
+    from datetime import datetime, timedelta, timezone
+
+    from .ids import parse_iso
+    addr, _ = hub.local_agent(me)
+    units = {"m": "minutes", "h": "hours", "d": "days"}
+    if at.startswith("+") and at[-1] in units and at[1:-1].replace(".", "", 1).isdigit():
+        due = datetime.now(timezone.utc) + timedelta(**{units[at[-1]]: float(at[1:-1])})
+    else:
+        due = parse_iso(at)
+        if due.tzinfo is None:
+            raise ValueError("at needs a timezone (e.g. 2026-09-25T18:00:00+09:00) or +10m / +2h")
+    due_iso = due.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+    return {"reminder": hub.ledger.add_reminder(str(addr), due_iso, text), "due": due_iso}
 
 
 async def _read_receipts(hub: Hub, me: str, envs: list[Envelope]) -> None:
