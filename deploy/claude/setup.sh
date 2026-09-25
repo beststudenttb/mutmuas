@@ -2,7 +2,7 @@
 # One-command deploy of the Claude side of a mutmuas node (branch: claude).
 #
 #   deploy/claude/setup.sh --node A --server nats://150.89.170.193:4222 --credentials A.env --ca ca.crt \
-#       [--project mutmuas] [--config PATH] [--agent claude] [--worker] [--workdir DIR] \
+#       [--project mutmuas] [--config PATH] [--agent claude] [--worker] [--workdir DIR] [--worker-workdir DIR] \
 #       [--service] [--notifier] [--mcp] [--skip-install]
 #
 # One machine = one node; several assistants can live on it. This script never overwrites what another
@@ -13,7 +13,7 @@
 #   --mcp       register the mutmuas MCP server in Claude Code (user scope)
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-PROJECT=mutmuas; NODE=""; SERVER=""; CREDS=""; CA=""; CONFIG=""; AGENT=claude; WORKER=0; WORKDIR="$HOME"
+PROJECT=mutmuas; NODE=""; SERVER=""; CREDS=""; CA=""; CONFIG=""; AGENT=claude; WORKER=0; WORKDIR="$HOME"; WWORKDIR=""
 SERVICE=0; NOTIFIER=0; MCP=0; INSTALL=1
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -21,6 +21,7 @@ while [ $# -gt 0 ]; do
     --credentials) CREDS="$2"; shift 2 ;;  --ca) CA="$2"; shift 2 ;;
     --project) PROJECT="$2"; shift 2 ;;    --config) CONFIG="$2"; shift 2 ;;
     --agent) AGENT="$2"; shift 2 ;;        --workdir) WORKDIR="$2"; shift 2 ;;
+    --worker-workdir) WWORKDIR="$2"; shift 2 ;;
     --worker) WORKER=1; shift ;;           --service) SERVICE=1; shift ;;
     --notifier) NOTIFIER=1; shift ;;       --mcp) MCP=1; shift ;;
     --skip-install) INSTALL=0; shift ;;
@@ -75,9 +76,10 @@ say "agents"
 "$BIN/agent-node" add-agent --config "$CONFIG" --id "$AGENT" --mode interactive --provider anthropic \
     --role lead --workdir "$WORKDIR" --permission READ --permission REQUEST_TASK --permission PUBLISH_ARTIFACT
 if [ $WORKER -eq 1 ]; then
-  mkdir -p "$WORKDIR"
+  WWORKDIR="${WWORKDIR:-$WORKDIR}"     # --workdir = where the interactive session runs; the worker may get its own
+  mkdir -p "$WWORKDIR"
   "$BIN/agent-node" add-agent --config "$CONFIG" --id "$AGENT-worker" --mode worker --runtime claude-code \
-      --provider anthropic --role worker --workdir "$WORKDIR" --notify "$NODE:$AGENT" \
+      --provider anthropic --role worker --workdir "$WWORKDIR" --notify "$NODE:$AGENT" \
       --permission READ --permission PUBLISH_ARTIFACT --permission REQUEST_TASK
 fi
 

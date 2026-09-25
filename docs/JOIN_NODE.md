@@ -65,7 +65,7 @@ PYTHON="$(conda run -n mutmuas which python)" scripts/install.sh
 - 同时注册交互式 agent `C:claude`,并跑一遍 doctor 检查。
 - `--service`:把守护进程装成开机服务。macOS 用 launchd,Linux 用 systemd --user。
 - `--mcp`:在 Claude Code 里注册 mutmuas 工具,让笔记本上的 Claude 可以直接收发消息。
-- 需要无人值守的 worker 时,再加上 `--worker --workdir <目录>`。
+- `--workdir` 是交互会话运行的目录,默认 `~`。需要无人值守的 worker 时,再加上 `--worker`;worker 要用别的目录,就加 `--worker-workdir <目录>`,不加则和交互会话共用同一个目录。
 
 完成后删掉临时副本:`rm -rf ~/mutmuas-join`
 
@@ -85,7 +85,7 @@ cd ~/mutmuas/claude
     --config ~/mutmuas/node/node.yaml --as C:claude --wait 600
 ```
 
-收到秘书的回复,就说明接入成功。之后秘书会发入职说明,内容包括职责、手册和沟通规则。
+收到秘书的回复,就说明接入成功。还要再验证一次**唤醒**:请任意另一个节点给 `C:claude` 发一个 query,确认你的会话被叫醒。只看 status 显示 ONLINE,测不出唤醒有没有问题。之后秘书会发入职说明,内容包括职责、手册和沟通规则。
 
 ## 常见问题
 
