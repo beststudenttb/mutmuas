@@ -145,7 +145,7 @@ async def clear_inbox(hub: Hub, me: str, before_seq: int) -> dict[str, Any]:
     has looked at the list: clearing a backlog of old mail it has already dealt with elsewhere."""
     addr, _ = hub.local_agent(me)
     cleared = hub.ledger.mark_seen_before(str(addr), int(before_seq))
-    await _read_receipts(hub, str(addr), cleared)          # cleared notices are read notices: close them too
+    await _read_receipts(hub, str(addr), cleared, read=False)   # close cleared notices, but don't say "read"
     return {"marked_read": len(cleared), "up_to_seq": int(before_seq)}
 
 
@@ -172,15 +172,19 @@ async def remind_me(hub: Hub, me: str, at: str, text: str) -> dict[str, Any]:
     return {"reminder": hub.ledger.add_reminder(str(addr), due_iso, text), "due": due_iso}
 
 
-async def _read_receipts(hub: Hub, me: str, envs: list[Envelope]) -> None:
+async def _read_receipts(hub: Hub, me: str, envs: list[Envelope], read: bool = True) -> None:
     """A REQUEST sent with reply: none is answered by being read: the session has now seen it, so close the
-    task with a read receipt. Only the session reading its mail gets here (peek never does)."""
+    task with a read receipt. Only the session reading its mail gets here (peek never does).
+    read=False (clear_inbox): the notice is closed too, but the receipt says it was cleared without being
+    read, so a sender can tell a blind clear from a real read."""
     for env in envs:
         if env.type != "REQUEST" or (env.body or {}).get("reply") != "none":
             continue
         task = hub.ledger.task(env.task_id, "owner")
         if task and task["owner"] == me and task["status"] not in TERMINAL_STATES:
-            await hub.finish(env.task_id, result_body("complete", f"read by {me} (no reply requested)"))
+            summary = (f"read by {me} (no reply requested)" if read
+                       else f"cleared by {me} without reading (clear_inbox; no reply requested)")
+            await hub.finish(env.task_id, result_body("complete", summary))
 
 
 async def accept_task(hub: Hub, me: str, task_id: str) -> dict[str, Any]:

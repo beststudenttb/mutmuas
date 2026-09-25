@@ -272,7 +272,8 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
 
     @server.tool()
     async def clear_inbox(before_seq: int) -> str:
-        """Mark all your unread mail up to seq (the "seq" field inbox shows) as read, after you have looked at it."""
+        """Mark all your unread mail up to seq (the "seq" field inbox shows) as read, after you have looked at it.
+        Notices among them (reply: none) are closed with a "cleared without reading" receipt, not "read"."""
         return dump(await tools.clear_inbox(hub(), state["me"], before_seq))
 
     @server.tool()

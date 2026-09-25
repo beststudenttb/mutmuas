@@ -398,11 +398,14 @@ async def test_tool_errors_say_why(make_config, cluster):
     pump.cancel()
 
 
-async def test_clear_inbox_sends_read_receipts(make_config, cluster):
-    """C's review: notices cleared with clear_inbox never got their read receipt, so they stayed open."""
+async def test_clear_inbox_closes_notices_without_claiming_they_were_read(make_config, cluster):
+    """C's review: notices cleared with clear_inbox never got a receipt, so they stayed open. But clearing is
+    not reading: a receipt saying "read" would hide a blind clear from the sender (weekend r3b, error E1)."""
     a, b, hub_a, hub_b = await _pair(make_config, cluster)
     sent = await tools.send_request(hub_a, "A:main", "B:desk", "FYI only", "notice", reply="none")
     rows = await eventually(lambda: tools.inbox(hub_b, "B:desk", peek=True), what="notice arrived")
     await tools.clear_inbox(hub_b, "B:desk", max(m["seq"] for m in rows))
     result = await tools.wait_for_result(hub_a, sent["task_id"], 20)
-    assert result["status"] == "COMPLETED" and "read by B:desk" in result["result"]["summary"]
+    summary = result["result"]["summary"]
+    assert result["status"] == "COMPLETED"
+    assert "cleared by B:desk without reading" in summary and "read by" not in summary
