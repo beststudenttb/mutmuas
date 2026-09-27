@@ -232,6 +232,36 @@ class Bus:
         await self.js.delete_consumer(self.names.stream, self.names.consumer(agent))
         return "card and mailbox removed"
 
+    async def pending_messages(self, agent: Address, limit: int = 200) -> list[Envelope]:
+        """The messages still waiting in an agent's mailbox (after its consumer's ack floor), read with an
+        ephemeral ordered consumer: nothing is acknowledged, the mailbox is left as it was."""
+        try:
+            info = await self.js.consumer_info(self.names.stream, self.names.consumer(agent))
+        except NotFoundError:
+            return []
+        waiting = info.num_pending + info.num_ack_pending
+        if not waiting:
+            return []
+        sub = await self.js.subscribe(self.names.inbox_filter(agent), ordered_consumer=True,
+                                      config=api.ConsumerConfig(deliver_policy=api.DeliverPolicy.BY_START_SEQUENCE,
+                                                                opt_start_seq=info.ack_floor.stream_seq + 1))
+        out: list[Envelope] = []
+        try:
+            while len(out) < min(waiting, limit):
+                try:
+                    msg = await sub.next_msg(timeout=1)
+                except Exception as e:  # nats.errors.TimeoutError is not always builtins.TimeoutError
+                    if "Timeout" in type(e).__name__:
+                        break
+                    raise
+                try:
+                    out.append(Envelope.from_json(msg.data))
+                except Exception:
+                    continue
+        finally:
+            await sub.unsubscribe()
+        return out
+
     async def inbox_pending(self, agent: Address) -> int | None:
         try:
             info = await self.js.consumer_info(self.names.stream, self.names.consumer(agent))
