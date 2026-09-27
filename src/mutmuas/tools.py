@@ -119,7 +119,7 @@ async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, 
                and asyncio.get_running_loop().time() < deadline):
             await asyncio.sleep(0.5)
     if include_seen:
-        envs = hub.ledger.recent(str(addr), limit, show=show)
+        envs = hub.ledger.list_recent_inbound(str(addr), limit, show=show)
     else:
         envs = hub.ledger.unseen(str(addr), limit, mark=not peek, types=types, since=since, next_to=next_to,
                                  show=show)

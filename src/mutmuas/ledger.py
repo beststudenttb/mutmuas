@@ -332,17 +332,26 @@ class Ledger:
                            [(r["message_id"],) for r in rows])
         return [Envelope.from_json(r["envelope"]) for r in rows]
 
-    def recent(self, local_agent: str, limit: int = 50, show: bool = True) -> list[Envelope]:
-        """The newest inbound messages, read or not (inbox --all). A foreground listing (show) counts as having
-        shown the unread ones, so clear_inbox may clear them later; it does not mark them read (Codex review of
-        d13ffc8)."""
+    def list_recent_inbound(self, local_agent: str, limit: int = 50, show: bool = True) -> list[Envelope]:
+        """The newest handled inbound messages, read or not (inbox --all): not ones still new, unverified or
+        rejected (Codex review of d98413f). With show (a foreground listing) the unread ones count as shown, so
+        clear_inbox may clear them later; they are not marked read (Codex review of d13ffc8)."""
         with self.tx() as db:
             rows = db.execute("SELECT message_id, envelope FROM messages WHERE direction='in' AND local_agent=?"
-                              " ORDER BY rowid DESC LIMIT ?", (local_agent, limit)).fetchall()
+                              " AND state='handled' ORDER BY rowid DESC LIMIT ?", (local_agent, limit)).fetchall()
             if show and rows:
                 db.executemany("UPDATE messages SET shown=1 WHERE message_id=? AND direction='in' AND seen=0",
                                [(r["message_id"],) for r in rows])
         return [Envelope.from_json(r["envelope"]) for r in rows]
+
+    def inbound_state(self, message_id: str) -> str | None:
+        row = self.db.execute("SELECT state FROM messages WHERE message_id=? AND direction='in'",
+                              (message_id,)).fetchone()
+        return row["state"] if row else None
+
+    def inbound_in_state(self, state: str) -> list[Envelope]:
+        return [Envelope.from_json(r["envelope"]) for r in
+                self.db.execute("SELECT envelope FROM messages WHERE direction='in' AND state=?", (state,))]
 
     def unshown_count(self, local_agent: str, before_seq: int) -> int:
         """Unread mail up to a rowid that no foreground inbox listing has shown (clear_inbox leaves it)."""

@@ -212,6 +212,13 @@ class NodeDaemon:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+        # background jobs (e.g. the unbounded observer-copy verifier) use the Hub too: end them before closing it
+        # (Codex review of d98413f); recover() schedules the verifiers again at the next start
+        background = list(self._background)
+        for task in background:
+            task.cancel()
+        await asyncio.gather(*background, return_exceptions=True)
+        self._background.clear()
         if self.hub:
             with contextlib.suppress(Exception):
                 await self._publish_cards(state_override="offline")
@@ -264,8 +271,8 @@ class NodeDaemon:
         for task in hub.ledger.tasks(role="owner", limit=500):
             await hub.publish_task_record(task["task_id"])
         # observer copies still waiting for their task record when the daemon stopped: look again
-        for row in hub.ledger.db.execute("SELECT envelope FROM messages WHERE direction='in' AND state='unverified'"):
-            self._background_job(self._verify_observer_copy(Envelope.from_json(row["envelope"])))
+        for env in hub.ledger.inbound_in_state("unverified"):
+            self._background_job(self._verify_observer_copy(env))
         await hub.flush_outbox()
 
     # ---- receive ------------------------------------------------------
@@ -382,13 +389,10 @@ class NodeDaemon:
         return "unverified"
 
     def _still_unverified(self, message_id: str) -> bool:
-        row = self.hub.ledger.db.execute("SELECT state FROM messages WHERE message_id=? AND direction='in'",
-                                         (message_id,)).fetchone()
-        return row is None or row["state"] in ("new", "unverified")
+        return self.hub.ledger.inbound_state(message_id) in (None, "new", "unverified")
 
     def _any_task_row(self, task_id: str) -> dict[str, Any]:
-        return dict(self.hub.ledger.db.execute("SELECT requester, owner FROM tasks WHERE task_id=? LIMIT 1",
-                                               (task_id,)).fetchone())
+        return self.hub.ledger.task(task_id)          # every row of a task has the same requester/owner
 
     # The copy and the owner's task record travel separately, so the record may not be there yet: look again
     # with growing gaps, then every last gap until it appears (Codex reviews of 8c018ee and d13ffc8).
@@ -455,7 +459,8 @@ class NodeDaemon:
         return None
 
     def _background_job(self, coro) -> None:
-        """A short-lived job (not one of the daemon's loops, see _spawn): keep a reference, log a failure."""
+        """A job outside the daemon's fixed loops (see _spawn), e.g. an observer-copy verifier that may run as long
+        as the daemon: keep a reference, log a failure; stop() cancels and awaits every one before closing the Hub."""
         task = asyncio.create_task(coro)
         self._background.add(task)
 
