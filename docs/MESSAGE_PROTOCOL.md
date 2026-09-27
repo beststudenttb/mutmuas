@@ -93,7 +93,13 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
     reminders.
   - Its MCP tools (all but `whoami`) refuse to act.
   - `agentctl` commands for that agent are refused too, unless they run inside the holding session: a
-    descendant of the session process, such as its shell.
+    descendant of the session process, such as its shell. The ancestry comes from `/proc` or `ps` by absolute
+    path, and no environment variable exempts a process.
+  - Exceptions, because they show no mail content: `status`, `agents`, `find`, and `watch --headers-only`
+    (a notifier service outside the session: count, type and sender only). `whoami` is exempt only as an MCP
+    tool; `agentctl whoami` needs the session.
+  - Only a foreground `inbox` listing counts as having shown a message; `clear_inbox` marks read only messages
+    shown that way. Notifier reads (`watch`, pushes) do not count.
   - The holder is told about the contender. When the holder closes, the other session takes over at its
     next heartbeat. Two projects on one machine are two agents (e.g. `C:paper` and
   `C:course`), not two sessions of one agent.

@@ -148,7 +148,8 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
                 if disk != state["code"] and not state.get("stale_told"):
                     state["stale_told"] = True
                     await send(stale_notice(state["code"], disk))
-            for m in await tools.inbox(hub, addr, peek=True, types=tools.WAKE, since=str(cursor), limit=20):
+            for m in await tools.inbox(hub, addr, peek=True, types=tools.WAKE, since=str(cursor), limit=20,
+                                       show=False):
                 cursor = max(cursor, m["seq"] or cursor)
                 if not state.get("duplicate_of"):          # only the session holding the agent is woken
                     await send(channel_notice(m))

@@ -88,6 +88,15 @@ CREATE TABLE IF NOT EXISTS session_contenders (
 );
 
 -- "Remind me at …": the session's MCP process pushes the text into the session when it is due.
+-- Artifacts an agent of this node published itself: with inbound mail, the only source of artifact access
+-- (not the URI's path, which the publisher chooses; not outgoing mail, which anyone can fill with any URI).
+CREATE TABLE IF NOT EXISTS artifact_publishers (
+    uri             TEXT NOT NULL,
+    local_agent     TEXT NOT NULL,
+    published_at    TEXT NOT NULL,
+    PRIMARY KEY (uri, local_agent)
+);
+
 CREATE TABLE IF NOT EXISTS reminders (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     local_agent     TEXT NOT NULL,
@@ -228,7 +237,7 @@ class Ledger:
 
     def unseen(self, local_agent: str, limit: int = 50, mark: bool = True,
                types: tuple[str, ...] | None = None, since: str | None = None,
-               next_to: str | None = None) -> list[Envelope]:
+               next_to: str | None = None, show: bool = True) -> list[Envelope]:
         """Inbound messages an interactive agent has not looked at yet.
 
         Only messages the dispatcher has fully handled: a REQUEST shows up once its task exists
@@ -243,9 +252,12 @@ class Ledger:
             rows = db.execute("SELECT message_id, envelope FROM messages WHERE direction='in' AND seen=0"
                               f" AND state='handled' AND local_agent=?{type_sql}{since_sql} ORDER BY rowid LIMIT ?",
                               (local_agent, *type_args, *since_arg, limit)).fetchall()
-            if rows:     # listed = shown to the session (peek too); read only when not peeking
-                db.executemany(f"UPDATE messages SET shown=1{', seen=1' if mark else ''}"
-                               " WHERE message_id=? AND direction='in'", [(r["message_id"],) for r in rows])
+            # show: a foreground listing for the session (peek too) = shown, so clear_inbox may clear it later;
+            # a notifier's read (watch, push) is not (Codex review of 8c018ee). mark: read.
+            sets = [x for x, on in (("shown=1", show), ("seen=1", mark)) if on]
+            if rows and sets:
+                db.executemany(f"UPDATE messages SET {', '.join(sets)} WHERE message_id=? AND direction='in'",
+                               [(r["message_id"],) for r in rows])
         return [Envelope.from_json(r["envelope"]) for r in rows]
 
     def mark_seen(self, task_id: str) -> None:
@@ -319,6 +331,16 @@ class Ledger:
             db.executemany("UPDATE messages SET seen=1 WHERE message_id=? AND direction='in'",
                            [(r["message_id"],) for r in rows])
         return [Envelope.from_json(r["envelope"]) for r in rows]
+
+    def unshown_count(self, local_agent: str, before_seq: int) -> int:
+        """Unread mail up to a rowid that no foreground inbox listing has shown (clear_inbox leaves it)."""
+        return self.db.execute("SELECT COUNT(*) FROM messages WHERE direction='in' AND local_agent=? AND seen=0"
+                               " AND shown=0 AND state='handled' AND rowid <= ?",
+                               (local_agent, before_seq)).fetchone()[0]
+
+    def record_published(self, uri: str, local_agent: str) -> None:
+        self.db.execute("INSERT OR IGNORE INTO artifact_publishers (uri, local_agent, published_at) VALUES (?,?,?)",
+                        (uri, local_agent, now_iso()))
 
     def add_reminder(self, local_agent: str, due: str, text: str) -> int:
         cur = self.db.execute("INSERT INTO reminders (local_agent, due, text, created_at) VALUES (?,?,?,?)",

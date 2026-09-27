@@ -203,8 +203,9 @@ class Hub:
                 log.warning("copy to observer %s failed: %r", observer, e)
 
     async def reply(self, local: str, task_id: str, type: str, body: dict[str, Any] | None = None,
-                    artifacts: list[ArtifactRef] | None = None) -> str:
-        """Send a message about an existing task to the other party. Only its requester or owner may."""
+                    artifacts: list[ArtifactRef] | None = None, to: str | None = None) -> str:
+        """Send a message about an existing task to the other party. Only its requester or owner may.
+        to: the addressee the caller meant; refused unless it is that other party."""
         addr, _ = self.local_agent(local)
         task = next((t for t in (self.ledger.task(task_id, r) for r in ("requester", "owner"))
                      if t and t["local_agent"] == str(addr)), None)
@@ -213,6 +214,8 @@ class Hub:
                 raise KeyError(f"unknown task {task_id}")
             raise PermissionDenied(f"{addr} is not the requester or owner of {task_id}")
         peer = task["requester"] if task["owner"] == str(addr) else task["owner"]
+        if to is not None and to != peer:
+            raise PermissionDenied(f"messages on {task_id} go to {peer}, not {to}")
         env = Envelope(type=type, sender=str(addr), to=peer, body=body or {}, task_id=task_id,
                        conversation_id=task["conversation_id"], artifacts=artifacts or [],
                        reply_to=task.get("last_message"))

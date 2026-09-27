@@ -263,6 +263,9 @@ class NodeDaemon:
             self._enqueue(task["owner"], task["task_id"])
         for task in hub.ledger.tasks(role="owner", limit=500):
             await hub.publish_task_record(task["task_id"])
+        # observer copies still waiting for their task record when the daemon stopped: look again
+        for row in hub.ledger.db.execute("SELECT envelope FROM messages WHERE direction='in' AND state='unverified'"):
+            self._background_job(self._verify_observer_copy(Envelope.from_json(row["envelope"])))
         await hub.flush_outbox()
 
     # ---- receive ------------------------------------------------------
@@ -358,6 +361,12 @@ class NodeDaemon:
         copy = env.body.get("copy_of") or {}
         if copy.get("type") not in ("REQUEST", "RESULT") or not copy.get("from") or not copy.get("to"):
             return "rejected"
+        # Structural check (as documented): the copy lists both its sender and its recipient. It proves nothing
+        # by itself, so the authoritative checks below still decide (Codex review of 8c018ee).
+        people = set(env.body.get("participants") or [])
+        if env.sender not in people or env.to not in people:
+            log.warning("dropped observer copy %s: sender or recipient not in its participant list", env.short())
+            return "rejected"
         known = acl(self.hub.ledger, env.task_id)
         if known:
             if env.sender not in known:
@@ -367,24 +376,35 @@ class NodeDaemon:
             row = self._any_task_row(env.task_id)          # every row of a task has the same requester/owner
             self._record_copy(env, row["requester"], row["owner"])
             return None
-        verify = asyncio.create_task(self._verify_observer_copy(env))
-        self._background.add(verify)
-        verify.add_done_callback(self._background.discard)
+        self._background_job(self._verify_observer_copy(env))
         return "unverified"
 
     def _any_task_row(self, task_id: str) -> dict[str, Any]:
         return dict(self.hub.ledger.db.execute("SELECT requester, owner FROM tasks WHERE task_id=? LIMIT 1",
                                                (task_id,)).fetchone())
 
+    # The copy and the owner's task record travel separately, so the record may not be there yet: look again,
+    # with growing gaps, for about ten minutes (Codex review of 8c018ee); after that it stays unverified.
+    VERIFY_BACKOFF_S = (0.05, 0.2, 1, 3, 10, 30, 60, 120, 300)
+
     async def _verify_observer_copy(self, env: Envelope) -> None:
         """Accept a copy about a task this node does not know only if the shared task record (written by the
-        owner's node) names its sender as requester or owner. No bus, no record: it stays unverified."""
-        try:
-            record = await self.hub._remote_task(env.task_id, None) if self.hub.bus else None
-        except Exception as e:
-            log.warning("could not verify observer copy %s: %r", env.short(), e)
-            return
+        owner's node) names its sender as requester or owner. That is a consistency check, not an authorisation
+        boundary: any node credential can write the task KV (step 2, D-008)."""
+        record = None
+        for delay in (0, *self.VERIFY_BACKOFF_S):
+            await asyncio.sleep(delay)
+            if not self.hub.bus:
+                return
+            try:
+                record = await self.hub._remote_task(env.task_id, None)
+            except Exception as e:
+                log.warning("could not verify observer copy %s: %r", env.short(), e)
+                record = None
+            if record:
+                break
         if not record:
+            log.warning("observer copy %s stays unverified: no task record for %s", env.short(), env.task_id)
             return
         if env.sender not in (record.get("requester"), record.get("owner")):
             log.warning("dropped observer copy %s: the task record does not name %s", env.short(), env.sender)
@@ -406,11 +426,31 @@ class NodeDaemon:
     def _on_observers_added(self, env: Envelope) -> str | None:
         """Another participant added observers: extend our copy of the list, so this side forwards the
         RESULT to them too. Ignored unless the sender takes part in the task on our records."""
-        if env.sender not in acl(self.hub.ledger, env.task_id):
+        before = acl(self.hub.ledger, env.task_id)
+        if env.sender not in before:
             log.warning("ignored observers_add from non-participant %s on %s", env.sender, env.task_id)
             return "rejected"
-        self.hub.ledger.add_observers(env.task_id, [str(o) for o in env.body["observers_add"]])
+        added = [str(o) for o in env.body["observers_add"]]
+        self.hub.ledger.add_observers(env.task_id, added)
+        owned = self.hub.ledger.task(env.task_id, "owner")
+        new = [o for o in added if o not in before]
+        if owned and owned["local_agent"] == env.to and new:
+            # An observer added them: as the owner, relay the copies, so that a node that never saw the task can
+            # check the sender against the task record (Codex review of 8c018ee).
+            from .tools import send_observer_copies
+            self._background_job(send_observer_copies(self.hub, env.to, env.task_id, new))
         return None
+
+    def _background_job(self, coro) -> None:
+        """A short-lived job (not one of the daemon's loops, see _spawn): keep a reference, log a failure."""
+        task = asyncio.create_task(coro)
+        self._background.add(task)
+
+        def done(t: asyncio.Task) -> None:
+            self._background.discard(t)
+            if not t.cancelled() and t.exception():
+                log.error("background job failed: %r", t.exception())
+        task.add_done_callback(done)
 
     async def _on_request(self, agent: AgentConfig, env: Envelope) -> str | None:
         hub = self.hub
@@ -619,9 +659,11 @@ class NodeDaemon:
         refs.append(ArtifactRef(uri=f"git://{self.cfg.node}{wt.repo}@{wt.branch}", id="BRANCH",
                                 description=f"head {summary['head']}"))
         if patch:
-            refs.append(await self.hub.artifacts.publish(
+            ref = await self.hub.artifacts.publish(
                 patch, f"{self.cfg.node}/{agent.id}/{task_id}/changes.patch", id="PATCH",
-                description=f"{len(summary['commits'])} commit(s) on {wt.branch}; apply with git am"))
+                description=f"{len(summary['commits'])} commit(s) on {wt.branch}; apply with git am")
+            self.hub.ledger.record_published(ref.uri, str(Address(self.cfg.node, agent.id)))
+            refs.append(ref)
         if summary["uncommitted_changes"]:
             body.setdefault("limitations", []).append("worktree has uncommitted changes that are not in the patch")
         if not summary["commits"] and body.get("status") == "complete":
@@ -773,7 +815,7 @@ def _result_from(draft: dict[str, Any] | None, outcome) -> tuple[dict[str, Any],
         summary += f"; errors in its log: {', '.join(kinds)}"
     return result_body(status, summary, outputs=outputs or None,
                        limitations=["no submit_result call; outcome could not be verified",
-                                    f"log: {outcome.log_path}"]), []
+                                    "the run log stays on the owner's node"]), []
 
 
 def _error_kinds(log_path: str | None) -> list[str]:

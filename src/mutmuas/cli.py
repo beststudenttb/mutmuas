@@ -24,7 +24,7 @@ import yaml
 from . import __version__, tools
 from .bus import Bus, BusUnavailable
 from .config import ConfigError, NodeConfig, dump_config, find_config, load_config
-from .hub import Hub, is_online
+from .hub import Hub, is_online, PermissionDenied
 from .ids import Address, parse_iso
 from .protocol import ArtifactRef, Envelope, ProtocolError
 
@@ -82,11 +82,11 @@ async def _with_hub(args, fn, *, require_bus: bool = True, watch: bool = False):
         await hub.close()
 
 
-# Commands that only read public state or the caller's own details: allowed while another session holds the
-# agent. Not `watch`: it shows mail content (objective, summary, ...), so a second session could read the
+# Commands that only read public state: allowed while another session holds the agent. Not `watch`: it shows mail content (objective, summary, ...), so a second session could read the
 # holder's mail through it (Codex review of dfdd719). `watch --headers-only` shows no content (count, type,
 # sender) and stays lease-free, for notifier services that run outside the session.
-LEASE_FREE = {"cmd_status", "cmd_agents", "cmd_find", "cmd_whoami"}
+LEASE_FREE = {"cmd_status", "cmd_agents", "cmd_find"}      # not whoami: MCP whoami is exempt in the MCP layer
+                                                          # only (Codex review of 8c018ee)
 
 
 def _parse_kv(pairs: list[str] | None) -> dict[str, Any]:
@@ -213,16 +213,12 @@ async def cmd_send(args, hub: Hub):
             raise SystemExit(f"{msg_type} needs --task")
         # Through Hub.reply: only the task's requester or owner may send on it, and only to the other one
         # (Codex review of dfdd719: a direct send skipped the participant check).
-        addr, _ = hub.local_agent(_me(args))
-        mine = next((t for t in (hub.ledger.task(args.task, r) for r in ("requester", "owner"))
-                     if t and t["local_agent"] == str(addr)), None)
-        if mine is None:
-            raise SystemExit(f"error: {addr} is not the requester or owner of {args.task}")
-        peer = mine["requester"] if mine["owner"] == str(addr) else mine["owner"]
-        if args.to and await hub.resolve(args.to) != peer:
-            raise SystemExit(f"error: messages on {args.task} go to {peer}, not {args.to}")
-        out = {"task_id": args.task, "to": peer, "delivery": await hub.reply(
-            str(addr), args.task, msg_type, body, [ArtifactRef.from_dict(a) for a in artifacts])}
+        try:
+            delivery = await hub.reply(_me(args), args.task, msg_type, body,
+                                       [ArtifactRef.from_dict(a) for a in artifacts], to=await hub.resolve(args.to))
+        except (PermissionDenied, KeyError) as e:
+            raise SystemExit(f"error: {e}")
+        out = {"task_id": args.task, "delivery": delivery}
     _print(out, args.json)
 
 
@@ -315,7 +311,7 @@ async def cmd_watch(args, hub: Hub):
     while True:
         try:
             rows = await tools.inbox(hub, me, peek=True, wait_s=args.interval, types=tools.ACTIONABLE,
-                                     since=cursor_file.read_text().strip())
+                                     since=cursor_file.read_text().strip(), show=False)
         except Exception as e:
             print(f"{datetime.now():%F %T} inbox failed: {e!r}", flush=True)
             await asyncio.sleep(30)

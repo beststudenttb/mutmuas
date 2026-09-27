@@ -78,15 +78,16 @@ def accepts_kinds(permissions: list[str]) -> list[str]:
 
 
 def artifact_visible(ledger: Ledger, viewer: str, uri: str) -> bool:
-    """An artifact is for whoever published it and whoever it was sent to (its URI in their mail)."""
-    parts = uri.removeprefix("artifact://").split("/")
-    if len(parts) >= 3 and f"{parts[1]}:{parts[2]}" == viewer:
+    """An artifact is for whoever published it (recorded when it was published on this node) and whoever received
+    exactly that ArtifactRef in their inbound mail. Not the URI's path (the publisher picks it), not a substring
+    of the message text (LIKE wildcards), not outgoing mail (anyone can send any URI): Codex reviews of dfdd719
+    and 8c018ee."""
+    if ledger.db.execute("SELECT 1 FROM artifact_publishers WHERE uri=? AND local_agent=?", (uri, viewer)).fetchone():
         return True
-    # Exactly that ArtifactRef in the viewer's mail: not a substring of the message text, where a LIKE pattern
-    # would treat % and _ in the URI as wildcards (Codex review of dfdd719).
     row = ledger.db.execute(
         "SELECT 1 FROM messages, json_each(messages.envelope, '$.artifacts') AS a"
-        " WHERE messages.local_agent=? AND json_extract(a.value, '$.uri') = ? LIMIT 1", (viewer, uri)).fetchone()
+        " WHERE messages.direction='in' AND messages.local_agent=? AND json_extract(a.value, '$.uri') = ?"
+        " LIMIT 1", (viewer, uri)).fetchone()
     return row is not None
 
 

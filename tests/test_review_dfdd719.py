@@ -61,6 +61,8 @@ async def test_default_object_key_keeps_the_extension_but_not_the_name(make_conf
     src.write_text("x")
     ref = await tools.publish_artifact(hub, "A:main", str(src), task_id="T-key")
     assert "layoff-plan" not in ref["uri"] and ref["uri"].endswith(".md")
+    from mutmuas.visibility import artifact_visible
+    assert artifact_visible(hub.ledger, "A:main", ref["uri"])          # the publisher, from its own record
     named = await tools.publish_artifact(hub, "A:main", str(src), key="A/main/T-key/report.md")
     assert named["uri"].endswith("/report.md")                  # a readable name only when asked for
 
@@ -138,3 +140,50 @@ async def test_send_on_a_task_only_by_its_participants_and_only_to_the_other_one
     assert wrong_peer.returncode != 0 and "go to B:desk" in wrong_peer.stderr
     ok = send("A:main", "B:desk")
     assert ok.returncode == 0, ok.stderr
+
+
+
+# Second round (A:codex's review of 8c018ee): behaviour its tests do not reach.
+
+async def test_unverified_copies_are_checked_again_after_a_daemon_restart(tmp_path, monkeypatch):
+    from mutmuas.config import AgentConfig, NodeConfig
+    from mutmuas.hub import Hub
+    from mutmuas.ledger import Ledger
+    from mutmuas.node import NodeDaemon
+    from mutmuas.visibility import is_participant
+    cfg = NodeConfig(project="testproj", node="A", data_dir=str(tmp_path / "data"),
+                     agents=[AgentConfig(id="peer", mode="interactive")]).validate()
+    ledger = Ledger(cfg.db_path)
+    hub = Hub(cfg, None, ledger)
+    daemon = NodeDaemon(cfg)
+    daemon.hub = hub
+    copy = Envelope(type="UPDATE", sender="A:main", to="A:peer", task_id="T-restart", body={
+        "message": "observer copy", "fyi": True, "participants": ["A:main", "A:peer", "B:desk"],
+        "copy_of": {"type": "REQUEST", "from": "A:main", "to": "B:desk", "body": {"objective": "x"}}})
+    ledger.ingest(copy)
+    ledger.mark_handled(copy.message_id, "unverified")          # the daemon stopped while it waited
+    hub.bus = object()
+
+    async def record(task_id, owner):
+        return {"task_id": task_id, "requester": "A:main", "owner": "B:desk"}
+    monkeypatch.setattr(hub, "_remote_task", record)
+    monkeypatch.setattr(hub, "flush_outbox", lambda: asyncio.sleep(0))
+    try:
+        await daemon.recover()
+        await asyncio.sleep(0.2)
+        assert is_participant(ledger, "A:peer", "T-restart")
+    finally:
+        ledger.close()
+
+
+async def test_a_notifier_read_does_not_count_as_shown(make_config, cluster):
+    a = make_config("A", [interactive("main")])
+    b = make_config("B", [interactive("desk")])
+    await cluster.start(a)
+    await cluster.start(b)
+    hub_a, hub_b = await cluster.client(a), await cluster.client(b)
+    await tools.send_request(hub_a, "A:main", "B:desk", "pushed, not listed", "shown test")
+    await eventually(lambda: tools.inbox(hub_b, "B:desk", peek=True, show=False), what="arrived")  # e.g. push
+    top = hub_b.ledger.db.execute("SELECT MAX(rowid) FROM messages").fetchone()[0]
+    assert (await tools.clear_inbox(hub_b, "B:desk", top))["marked_read"] == 0
+    assert len(await tools.inbox(hub_b, "B:desk", peek=True)) == 1

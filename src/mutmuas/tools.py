@@ -102,11 +102,12 @@ WAKE = ("REQUEST", "QUESTION", "ANSWER", "BLOCKED", "REJECT", "CANCEL", "ERROR")
 
 async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, peek: bool = False,
                 wait_s: float | None = None, types: tuple[str, ...] | None = None,
-                since: str | None = None) -> list[dict[str, Any]]:
+                since: str | None = None, show: bool = True) -> list[dict[str, Any]]:
     """Unread messages for ``me``. peek: do not mark them read. wait_s: block until one arrives (or timeout).
     types: only these message types (e.g. ACTIONABLE), for both waiting and listing.
     since: only messages that reached this node's ledger after this ISO timestamp (a notifier's cursor,
-    so --peek does not report the same unread message again and again)."""
+    so --peek does not report the same unread message again and again).
+    show=False: a notifier's read (watch, push), which does not count as showing the mail to the session."""
     addr, _ = hub.local_agent(me)
     # A message that hands me the baton (body.next == me) needs me as much as a REQUEST does.
     next_to = str(addr) if types == WAKE else None
@@ -122,7 +123,8 @@ async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, 
                                      " ORDER BY rowid DESC LIMIT ?", (str(addr), limit)).fetchall()
         envs = [Envelope.from_json(r["envelope"]) for r in rows]
     else:
-        envs = hub.ledger.unseen(str(addr), limit, mark=not peek, types=types, since=since, next_to=next_to)
+        envs = hub.ledger.unseen(str(addr), limit, mark=not peek, types=types, since=since, next_to=next_to,
+                                 show=show)
         if not peek:
             await _read_receipts(hub, str(addr), envs)
     meta = {r[0]: (r[1], r[2], r[3]) for r in hub.ledger.db.execute(
@@ -146,9 +148,7 @@ async def clear_inbox(hub: Hub, me: str, before_seq: int) -> dict[str, Any]:
     addr, _ = hub.local_agent(me)
     cleared = hub.ledger.mark_seen_before(str(addr), int(before_seq))
     await _read_receipts(hub, str(addr), cleared, read=False)   # close cleared notices, but don't say "read"
-    not_shown = hub.ledger.db.execute(
-        "SELECT COUNT(*) FROM messages WHERE direction='in' AND local_agent=? AND seen=0 AND shown=0"
-        " AND state='handled' AND rowid <= ?", (str(addr), int(before_seq))).fetchone()[0]
+    not_shown = hub.ledger.unshown_count(str(addr), int(before_seq))
     out = {"marked_read": len(cleared), "up_to_seq": int(before_seq)}
     if not_shown:
         out["left_unread"] = f"{not_shown} message(s) never listed by inbox: look at them first"
@@ -284,6 +284,7 @@ async def publish_artifact(hub: Hub, me: str, path: str, *, key: str | None = No
         suffix = src.suffix if src.is_file() and len(src.suffix) <= 8 and src.suffix[1:].isalnum() else ""
         key = f"{addr.node}/{addr.agent}/{task_id or _current_task() or 'adhoc'}/{secrets.token_hex(8)}{suffix}"
     ref = await hub.artifacts.publish(src, key, id=id, description=description, backend=backend)
+    hub.ledger.record_published(ref.uri, str(addr))
     return ref.to_dict()
 
 
@@ -301,14 +302,11 @@ async def add_observer(hub: Hub, me: str, task_id: str, observer: str) -> dict[s
                         ("requester", "owner", f"observer:{me_s}")) if r]
     base = rows[0]
     copies = []
-    request = next((r["request"] for r in rows if r.get("request")), None)
-    result = next((r["result"] for r in rows if r.get("result")), None)
-    for kind, body, frm, to in (("REQUEST", request, base["requester"], base["owner"]),
-                                ("RESULT", result, base["owner"], base["requester"])):
-        if body:
-            env = Envelope(type=kind, sender=frm, to=to, task_id=task_id, body=body)
-            await hub.copy_to_observers(me_s, env, [observer])
-            copies.append(kind)
+    if me_s in (base["requester"], base["owner"]):
+        copies = await send_observer_copies(hub, me_s, task_id, [observer])
+    # An observer does not send copies itself: a node that never saw the task could only check the sender
+    # against the task record, which names requester and owner. The owner relays them when it hears of the
+    # new observer below (Codex review of 8c018ee).
     for other in sorted({base["requester"], base["owner"]} - {me_s}):
         try:          # so the requester's side forwards a later RESULT, and every side knows the ACL
             await hub.send(Envelope(type="UPDATE", sender=me_s, to=other, task_id=task_id,
@@ -316,7 +314,27 @@ async def add_observer(hub: Hub, me: str, task_id: str, observer: str) -> dict[s
                                           "observers_add": [observer]}))
         except Exception:
             pass
-    return {"task_id": task_id, "observer": observer, "copies_sent": copies}
+    out = {"task_id": task_id, "observer": observer, "copies_sent": copies}
+    if not copies and me_s not in (base["requester"], base["owner"]):
+        out["copies_relayed_by"] = base["owner"]
+    return out
+
+
+async def send_observer_copies(hub: Hub, sender: str, task_id: str, observers: list[str]) -> list[str]:
+    """Copies of a task's REQUEST and (if there is one) RESULT for new observers, from one of its parties."""
+    rows = [r for r in (hub.ledger.task(task_id, role) for role in ("requester", "owner")) if r]
+    if not rows:
+        return []
+    base, sent = rows[0], []
+    request = next((r["request"] for r in rows if r.get("request")), None)
+    result = next((r["result"] for r in rows if r.get("result")), None)
+    for kind, body, frm, to in (("REQUEST", request, base["requester"], base["owner"]),
+                                ("RESULT", result, base["owner"], base["requester"])):
+        if body:
+            await hub.copy_to_observers(sender, Envelope(type=kind, sender=frm, to=to, task_id=task_id,
+                                                         body=body), observers)
+            sent.append(kind)
+    return sent
 
 
 async def list_tasks(hub: Hub, me: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
