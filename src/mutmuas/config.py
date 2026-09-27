@@ -13,7 +13,7 @@ from typing import Any
 
 import yaml
 
-from .ids import Address, InvalidAddress, check_token
+from .ids import Address, InvalidAddress, check_node_id, check_token
 
 PERMISSIONS = ("READ", "WRITE_WORKTREE", "RUN_EXPERIMENT", "PUBLISH_ARTIFACT", "REQUEST_TASK", "MERGE", "ADMIN")
 RUNTIMES = ("claude-code", "codex", "script")
@@ -121,7 +121,7 @@ class NodeConfig:
 
     def validate(self) -> NodeConfig:
         check_token(self.project, "project")
-        check_token(self.node, "node id")
+        check_node_id(self.node)
         seen = set()
         for agent in self.agents:
             agent.validate()
