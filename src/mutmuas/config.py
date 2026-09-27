@@ -52,6 +52,11 @@ class AgentConfig:
     notify: list[str] = field(default_factory=list)   # e.g. ["B:main"]: told whenever this worker takes or
                                                       # finishes a task, so a node's lead knows what runs there
     env: dict[str, str] = field(default_factory=dict)
+    # Whether the RESULT of this agent's own request (one that wants a reply) wakes its session (no-stall
+    # design, G2). Per agent, not per node: a lead may want it while the leader's project seat on the same node
+    # does not (C's review of 6a5e2f1). Off by default: the leader found RESULT wake-ups disruptive while
+    # chatting (test_wake_filter_ignores_results_of_my_own_requests); turning it on is the leader's decision.
+    wake_on_own_results: bool = False
 
     def validate(self) -> None:
         check_token(self.id, "agent id")
@@ -119,10 +124,6 @@ class NodeConfig:
     # A request that needs a reply but names no deadline gets this one (seconds from sending), so the overdue
     # follow-up can chase it (no-stall design, G3). 0 = no default.
     default_reply_deadline_s: float = 4 * 3600
-    # Whether the RESULT of an agent's own request (one that wants a reply) wakes its session (no-stall design,
-    # G2). Off by default: the leader found RESULT wake-ups disruptive while chatting (test
-    # test_wake_filter_ignores_results_of_my_own_requests). Turning it on is the leader's decision.
-    wake_on_own_results: bool = False
     agents: list[AgentConfig] = field(default_factory=list)
     path: Path | None = None              # where this config was loaded from
 

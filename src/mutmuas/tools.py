@@ -41,6 +41,9 @@ async def find_agent(hub: Hub, capability: str) -> dict[str, Any]:
             "alternatives": [c["address"] for c in candidates[1:]]}
 
 
+DEADLINE_MARGIN_S = 1800     # a default deadline comes at least this long after the task's timeout_s
+
+
 async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, *, kind: str = "query",
                        inputs: Any = None, expected_outputs: Any = None, constraints: Any = None,
                        acceptance_criteria: Any = None, timeout_s: float | None = None,
@@ -49,12 +52,18 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                        reply: str | None = None, observers: list[str] | None = None) -> dict[str, Any]:
     default_deadline = None
     if not deadline and reply != "none" and hub.cfg.default_reply_deadline_s > 0:
-        # Without a deadline nothing ever chases a missing reply (no-stall design, G3): take the node's default.
-        default_deadline = (datetime.now(timezone.utc) + timedelta(seconds=hub.cfg.default_reply_deadline_s)
-                            ).isoformat(timespec="seconds")
+        # Without a deadline nothing ever chases a missing reply (no-stall design, G3): take the node's default,
+        # but never before the task's own run limit plus a margin, or a long task would be chased while it
+        # still runs normally (C's review of 6a5e2f1).
+        wait_s = hub.cfg.default_reply_deadline_s
+        if timeout_s:
+            wait_s = max(wait_s, timeout_s + DEADLINE_MARGIN_S)
+        default_deadline = (datetime.now(timezone.utc) + timedelta(seconds=wait_s)).isoformat(timespec="seconds")
     body = request_body(objective, reason, kind=kind, inputs=inputs, expected_outputs=expected_outputs,
                         constraints=constraints, acceptance_criteria=acceptance_criteria,
                         deadline=deadline or default_deadline, timeout_s=timeout_s, reply=reply, observers=observers)
+    if default_deadline:
+        body["deadline_default"] = True      # the owner can tell it from a deadline the requester chose
     target = await hub.card_or_none(to)
     task_id, delivery = await hub.request(
         me, to, body, artifacts=[ArtifactRef.from_dict(a) for a in artifacts or []],
@@ -120,7 +129,8 @@ async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, 
     addr, _ = hub.local_agent(me)
     # A message that hands me the baton (body.next == me) needs me as much as a REQUEST does.
     next_to = str(addr) if types == WAKE else None
-    own_results = bool(next_to) and hub.cfg.wake_on_own_results      # no-stall G2, off unless the leader turns it on
+    own_results = bool(next_to) and hub.local_agent(me)[1].wake_on_own_results   # no-stall G2, per agent, off
+                                                                                 # unless the leader turns it on
     if wait_s and not include_seen:
         # Messages reach this node's ledger through the daemon, so waiting on the ledger is enough
         # (a second JetStream consumer on the same mailbox would split the messages).
