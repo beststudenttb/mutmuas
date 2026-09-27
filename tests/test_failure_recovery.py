@@ -52,9 +52,11 @@ async def test_agent_process_crash_is_reported_failed(make_config, cluster):
     result = await tools.wait_for_result(hub, await _request(hub, "B:lab", {"action": "crash"}), 30)
     assert result["status"] == "FAILED" and result["result_status"] == "failed"
     assert "exit code 3" in result["result"]["summary"]
-    # the reason from the process's stderr reaches the requester (e.g. a CLI out of credits)
-    assert "about to crash" in result["result"]["summary"]
-    assert "about to crash" in " ".join(result["result"]["outputs"]["error_lines"])
+    # the kind of error reaches the requester (e.g. "quota" for a CLI out of credits), but not the log's text:
+    # run logs are private (visibility design; Codex review of dfdd719)
+    assert set(result["result"]["outputs"]) == {"error_kinds"}
+    assert {"error", "crash"} <= set(result["result"]["outputs"]["error_kinds"])
+    assert "about to crash" not in json.dumps(result["result"])
 
 
 async def test_unstructured_or_dishonest_results_are_not_complete(make_config, cluster):
@@ -66,6 +68,8 @@ async def test_unstructured_or_dishonest_results_are_not_complete(make_config, c
     silent = await tools.wait_for_result(hub, await _request(hub, "B:lab", {"action": "noresult"}), 30)
     assert silent["result_status"] == "partial"
     assert any("no submit_result" in x for x in silent["result"]["limitations"])
+    # its stdout ("did some things ...") is raw output: private, not in the RESULT (Codex review of dfdd719)
+    assert "did some things" not in json.dumps(silent["result"])
     liar = await tools.wait_for_result(hub, await _request(hub, "B:lab", {"action": "lie"}), 30)
     assert liar["result_status"] == "partial"
     assert any("exited with code 1" in x for x in liar["result"]["limitations"])

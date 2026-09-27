@@ -82,8 +82,11 @@ def artifact_visible(ledger: Ledger, viewer: str, uri: str) -> bool:
     parts = uri.removeprefix("artifact://").split("/")
     if len(parts) >= 3 and f"{parts[1]}:{parts[2]}" == viewer:
         return True
-    row = ledger.db.execute("SELECT 1 FROM messages WHERE local_agent=? AND envelope LIKE ? LIMIT 1",
-                            (viewer, f"%{uri}%")).fetchone()
+    # Exactly that ArtifactRef in the viewer's mail: not a substring of the message text, where a LIKE pattern
+    # would treat % and _ in the URI as wildcards (Codex review of dfdd719).
+    row = ledger.db.execute(
+        "SELECT 1 FROM messages, json_each(messages.envelope, '$.artifacts') AS a"
+        " WHERE messages.local_agent=? AND json_extract(a.value, '$.uri') = ? LIMIT 1", (viewer, uri)).fetchone()
     return row is not None
 
 

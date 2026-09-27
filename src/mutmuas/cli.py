@@ -72,7 +72,7 @@ async def _with_hub(args, fn, *, require_bus: bool = True, watch: bool = False):
             delay = min(delay * 2, 30)
     try:
         command = getattr(getattr(args, "fn", None), "__name__", "")
-        if command not in LEASE_FREE:
+        if command not in LEASE_FREE and not (command == "cmd_watch" and getattr(args, "headers_only", False)):
             from .node import lease_refusal
             refusal = lease_refusal(hub.ledger, str(hub.local_agent(_me(args))[0]))
             if refusal:
@@ -82,8 +82,11 @@ async def _with_hub(args, fn, *, require_bus: bool = True, watch: bool = False):
         await hub.close()
 
 
-# Commands that only read public state or never mark mail read: allowed while another session holds the agent.
-LEASE_FREE = {"cmd_status", "cmd_agents", "cmd_find", "cmd_watch", "cmd_whoami"}
+# Commands that only read public state or the caller's own details: allowed while another session holds the
+# agent. Not `watch`: it shows mail content (objective, summary, ...), so a second session could read the
+# holder's mail through it (Codex review of dfdd719). `watch --headers-only` shows no content (count, type,
+# sender) and stays lease-free, for notifier services that run outside the session.
+LEASE_FREE = {"cmd_status", "cmd_agents", "cmd_find", "cmd_whoami"}
 
 
 def _parse_kv(pairs: list[str] | None) -> dict[str, Any]:
@@ -208,10 +211,18 @@ async def cmd_send(args, hub: Hub):
     else:
         if not args.task:
             raise SystemExit(f"{msg_type} needs --task")
+        # Through Hub.reply: only the task's requester or owner may send on it, and only to the other one
+        # (Codex review of dfdd719: a direct send skipped the participant check).
         addr, _ = hub.local_agent(_me(args))
-        env = Envelope(type=msg_type, sender=str(addr), to=await hub.resolve(args.to), body=body,
-                       task_id=args.task, artifacts=[ArtifactRef.from_dict(a) for a in artifacts])
-        out = {"message_id": env.message_id, "delivery": await hub.send(env)}
+        mine = next((t for t in (hub.ledger.task(args.task, r) for r in ("requester", "owner"))
+                     if t and t["local_agent"] == str(addr)), None)
+        if mine is None:
+            raise SystemExit(f"error: {addr} is not the requester or owner of {args.task}")
+        peer = mine["requester"] if mine["owner"] == str(addr) else mine["owner"]
+        if args.to and await hub.resolve(args.to) != peer:
+            raise SystemExit(f"error: messages on {args.task} go to {peer}, not {args.to}")
+        out = {"task_id": args.task, "to": peer, "delivery": await hub.reply(
+            str(addr), args.task, msg_type, body, [ArtifactRef.from_dict(a) for a in artifacts])}
     _print(out, args.json)
 
 
@@ -312,9 +323,11 @@ async def cmd_watch(args, hub: Hub):
         if not rows:
             continue
         first = rows[0]
-        body = first["body"]
-        note = body.get("objective") or body.get("summary") or body.get("question") or body.get("reason") or ""
-        text = f"{len(rows)} new: {first['type']} from {first['from']}: {str(note)[:120]}"
+        text = f"{len(rows)} new: {first['type']} from {first['from']}"
+        if not args.headers_only:
+            body = first["body"]
+            note = body.get("objective") or body.get("summary") or body.get("question") or body.get("reason") or ""
+            text += f": {str(note)[:120]}"
         _desktop_notify(f"mutmuas → {addr}", text, dry_run=args.dry_run)
         cursor_file.write_text(str(max(r["seq"] for r in rows)))
 
@@ -550,7 +563,7 @@ def node_service(args):
         cfg.agent(watched.agent)                                    # must be configured on this node
         ctl = venv_bin / "agentctl"
         argv = ([str(ctl)] if ctl.exists() else [sys.executable, "-m", "mutmuas.cli"]) + [
-            "watch", "--config", str(cfg_path), "--as", str(watched)]
+            "watch", "--headers-only", "--config", str(cfg_path), "--as", str(watched)]
         suffix, what = f".watch-{watched.agent}", f"notifier for {watched}"
     # A minimal PATH: the venv, wherever the agent CLIs live, and system dirs. Copying the caller's PATH
     # would leak e.g. an activated conda env into every worker.
@@ -750,6 +763,9 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p = add("watch", cmd_watch, "run forever: desktop notification per new actionable message (launchd/systemd)")
     p.add_argument("--interval", type=float, default=3600, help="max seconds per wait cycle")
     p.add_argument("--dry-run", action="store_true", help="log notifications instead of showing them")
+    p.add_argument("--headers-only", action="store_true",
+                   help="announce count, type and sender only, no content; works without holding the session "
+                        "(for notifier services)")
     p = add("cancel", cmd_cancel, "cancel a task I requested", bus=False)
     p.add_argument("task_id")
     p.add_argument("--reason")

@@ -121,6 +121,8 @@ class Ledger:
         self._migrate_v1()
         self.db.executescript(SCHEMA)
         self._add_column("sessions", "session_pid", "INTEGER")    # ledgers created by exp/wake e2fb5d1
+        # 1 once an inbox listing has shown the message to the session: clear_inbox may only mark those read
+        self._add_column("messages", "shown", "INTEGER NOT NULL DEFAULT 0")
 
     def _add_column(self, table: str, column: str, decl: str) -> None:
         if column not in [r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")]:
@@ -241,9 +243,9 @@ class Ledger:
             rows = db.execute("SELECT message_id, envelope FROM messages WHERE direction='in' AND seen=0"
                               f" AND state='handled' AND local_agent=?{type_sql}{since_sql} ORDER BY rowid LIMIT ?",
                               (local_agent, *type_args, *since_arg, limit)).fetchall()
-            if mark and rows:
-                db.executemany("UPDATE messages SET seen=1 WHERE message_id=? AND direction='in'",
-                               [(r["message_id"],) for r in rows])
+            if rows:     # listed = shown to the session (peek too); read only when not peeking
+                db.executemany(f"UPDATE messages SET shown=1{', seen=1' if mark else ''}"
+                               " WHERE message_id=? AND direction='in'", [(r["message_id"],) for r in rows])
         return [Envelope.from_json(r["envelope"]) for r in rows]
 
     def mark_seen(self, task_id: str) -> None:
@@ -307,11 +309,13 @@ class Ledger:
         return dict(row) if row else None
 
     def mark_seen_before(self, local_agent: str, before_seq: int) -> list[Envelope]:
-        """Mark everything up to a rowid as read (the session's explicit 'clear the backlog'); returns what
-        was marked, so read receipts can follow."""
+        """Mark everything up to a rowid as read (the session's explicit 'clear the backlog') that an inbox
+        listing has shown: never mail the session has not seen (STANDARD item 8; Codex review of dfdd719).
+        Returns what was marked, so receipts can follow."""
         with self.tx() as db:
             rows = db.execute("SELECT message_id, envelope FROM messages WHERE direction='in' AND local_agent=?"
-                              " AND seen=0 AND state='handled' AND rowid <= ?", (local_agent, before_seq)).fetchall()
+                              " AND seen=0 AND shown=1 AND state='handled' AND rowid <= ?",
+                              (local_agent, before_seq)).fetchall()
             db.executemany("UPDATE messages SET seen=1 WHERE message_id=? AND direction='in'",
                            [(r["message_id"],) for r in rows])
         return [Envelope.from_json(r["envelope"]) for r in rows]

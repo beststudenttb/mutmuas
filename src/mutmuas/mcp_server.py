@@ -164,7 +164,8 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         state["code"] = await asyncio.to_thread(_code_version)
         state["me"] = str(hub.local_agent(me)[0])
         background = []
-        if not os.environ.get("MUTMUAS_TASK_ID"):          # an interactive session, not a daemon-run task
+        if hub.local_agent(me)[1].mode == "interactive":   # a session holds the lease; a worker's task does not
+                                                          # (decided by the config, not by an environment variable)
             background.append(asyncio.create_task(heartbeat(hub, state["me"])))
             if channel:
                 background.append(asyncio.create_task(push(hub, state["me"], hub.ledger.last_rowid())))

@@ -63,17 +63,38 @@ def session_alive(session: dict[str, Any]) -> bool:
     return session_fields(session, Path("/")).get("session") == "online"
 
 
-def _ancestors(pid: int) -> list[int]:
-    """pid's parent chain (via ps: works on macOS and Linux)."""
+# The lease decision trusts the process tree, so the tree must not come from anything the caller controls:
+# not a PATH-resolved `ps` (Codex review of dfdd719). Linux: /proc; elsewhere: ps by absolute path.
+_PS = next((p for p in ("/bin/ps", "/usr/bin/ps") if os.path.exists(p)), None)
+
+
+def _ppid(pid: int) -> int | None:
+    stat = Path(f"/proc/{pid}/stat")
+    if stat.exists():
+        try:
+            return int(stat.read_text().rsplit(")", 1)[1].split()[1])   # field 4; the name may contain ")"
+        except (OSError, IndexError, ValueError):
+            return None
+    if _PS is None:
+        return None
     import subprocess
+    out = subprocess.run([_PS, "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True,
+                         env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+    try:
+        return int(out.stdout.strip())
+    except ValueError:
+        return None
+
+
+def _ancestors(pid: int) -> list[int]:
+    """pid's parent chain, from /proc or an absolute-path ps (never PATH)."""
     chain, seen = [], set()
     while pid > 1 and pid not in seen:
         seen.add(pid)
-        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True)
-        try:
-            pid = int(out.stdout.strip())
-        except ValueError:
+        parent = _ppid(pid)
+        if parent is None:
             break
+        pid = parent
         chain.append(pid)
     return chain
 
@@ -81,9 +102,8 @@ def _ancestors(pid: int) -> list[int]:
 def lease_refusal(ledger, agent: str) -> str | None:
     """Why this process may not act as `agent` now, or None. A live session holds the agent: only that session
     (its MCP process, or anything the session itself started, e.g. agentctl from its shell) may use it.
-    Daemon-run tasks (MUTMUAS_TASK_ID) are not sessions and are never refused."""
-    if os.environ.get("MUTMUAS_TASK_ID"):
-        return None
+    No environment variable exempts a process: MUTMUAS_TASK_ID is set by whoever starts the process, so it
+    proves nothing (Codex review of dfdd719). Daemon-run tasks act as worker agents, which hold no lease."""
     row = ledger.session_of(agent)
     if not row or row["pid"] in (0, os.getpid()) or not session_alive(row):
         return None
@@ -144,6 +164,7 @@ class NodeDaemon:
         self._queued: dict[str, set[str]] = {}               # task ids queued or running, per agent
         self._running: dict[str, asyncio.Task] = {}          # task_id -> runner task
         self._cancel_requested: set[str] = set()
+        self._background: set[asyncio.Task] = set()          # e.g. observer-copy checks against the task KV
         self._outbox_wake = asyncio.Event()
         self.started = asyncio.Event()
         self.code_version = _code_version()
@@ -326,23 +347,61 @@ class NodeDaemon:
         elif env.type == "ANSWER":
             pass   # surfaced to the agent through its inbox (MCP/CLI); see technical debt in docs
         else:
-            await self._on_reply(env)
+            return await self._on_reply(env)
 
     def _on_observer_copy(self, env: Envelope) -> str | None:
-        """A copy of a task's REQUEST or RESULT for an observer. Kept only if a participant sent it and the
-        recipient is among the participants it lists; then the recipient has an observer row (its ACL)."""
-        copy, people = env.body.get("copy_of") or {}, set(env.body.get("participants") or [])
-        if env.sender not in people or env.to not in people or not copy.get("from") or not copy.get("to"):
-            log.warning("dropped observer copy %s: sender or recipient not among its participants", env.short())
+        """A copy of a task's REQUEST or RESULT for an observer. Who takes part is never taken from the copy
+        itself (a sender could list itself: Codex review of dfdd719):
+        - this node knows the task: the sender must be in the persisted ACL, else rejected;
+        - this node has never heard of it (a cross-node observer): kept unverified, not shown, until the shared
+          task record names the sender as its requester or owner (_verify_observer_copy)."""
+        copy = env.body.get("copy_of") or {}
+        if copy.get("type") not in ("REQUEST", "RESULT") or not copy.get("from") or not copy.get("to"):
             return "rejected"
-        requester, owner = ((copy["from"], copy["to"]) if copy.get("type") == "REQUEST"
-                            else (copy["to"], copy["from"]))
+        known = acl(self.hub.ledger, env.task_id)
+        if known:
+            if env.sender not in known:
+                log.warning("dropped observer copy %s: %s is not a participant on our records", env.short(),
+                            env.sender)
+                return "rejected"
+            row = self._any_task_row(env.task_id)          # every row of a task has the same requester/owner
+            self._record_copy(env, row["requester"], row["owner"])
+            return None
+        verify = asyncio.create_task(self._verify_observer_copy(env))
+        self._background.add(verify)
+        verify.add_done_callback(self._background.discard)
+        return "unverified"
+
+    def _any_task_row(self, task_id: str) -> dict[str, Any]:
+        return dict(self.hub.ledger.db.execute("SELECT requester, owner FROM tasks WHERE task_id=? LIMIT 1",
+                                               (task_id,)).fetchone())
+
+    async def _verify_observer_copy(self, env: Envelope) -> None:
+        """Accept a copy about a task this node does not know only if the shared task record (written by the
+        owner's node) names its sender as requester or owner. No bus, no record: it stays unverified."""
+        try:
+            record = await self.hub._remote_task(env.task_id, None) if self.hub.bus else None
+        except Exception as e:
+            log.warning("could not verify observer copy %s: %r", env.short(), e)
+            return
+        if not record:
+            return
+        if env.sender not in (record.get("requester"), record.get("owner")):
+            log.warning("dropped observer copy %s: the task record does not name %s", env.short(), env.sender)
+            self.hub.ledger.mark_handled(env.message_id, "rejected")
+            return
+        self._record_copy(env, record["requester"], record["owner"])
+        self.hub.ledger.mark_handled(env.message_id, "handled")
+
+    def _record_copy(self, env: Envelope, requester: str, owner: str) -> None:
+        """The observer's own row: requester and owner from our records or the task record, never from the
+        copy; the only observer it adds is the recipient itself."""
+        copy = env.body["copy_of"]
         self.hub.ledger.record_observed(
             env.task_id, env.to, requester, owner,
-            request=copy.get("body") if copy.get("type") == "REQUEST" else None,
-            result=copy.get("body") if copy.get("type") == "RESULT" else None,
-            observers=sorted(people - {requester, owner}))
-        return None
+            request=copy.get("body") if copy["type"] == "REQUEST" else None,
+            result=copy.get("body") if copy["type"] == "RESULT" else None,
+            observers=[env.to])
 
     def _on_observers_added(self, env: Envelope) -> str | None:
         """Another participant added observers: extend our copy of the list, so this side forwards the
@@ -401,6 +460,10 @@ class NodeDaemon:
         task = self.hub.ledger.task(env.task_id, "owner")
         if task is None or task["status"] in TERMINAL_STATES:
             return None
+        if env.sender != task["requester"]:         # only the persisted requester may cancel its task
+            log.warning("ignored CANCEL of %s from %s: not its requester %s", env.task_id, env.sender,
+                        task["requester"])
+            return "rejected"
         if task["status"] == "PENDING":
             # Withdrawn before anyone picked it up: close it and keep it out of the interactive inbox
             # (both the REQUEST and this CANCEL are noise to someone who never saw the request).
@@ -416,7 +479,7 @@ class NodeDaemon:
             await self.hub.owner_transition(env.task_id, "CANCELLED",
                                             env.body.get("reason") or "cancelled by requester")
 
-    async def _on_reply(self, env: Envelope) -> None:
+    async def _on_reply(self, env: Envelope) -> str | None:
         """A message about a task *we* requested."""
         ledger = self.hub.ledger
         task = ledger.task(env.task_id, "requester")
@@ -424,7 +487,13 @@ class NodeDaemon:
             # Not a reply to this agent's own request: e.g. an FYI copy to a node lead about a task that
             # another agent on the same node requested. It stays in the recipient's inbox only.
             log.info("message about task %s (%s) kept in inbox only", env.task_id, env.type)
-            return
+            return None
+        if env.sender != task["owner"]:
+            # Only the persisted owner speaks for the task: anyone else's RESULT/UPDATE must not change it
+            # (Codex review of dfdd719: a RESULT from an unrelated sender completed the task).
+            log.warning("ignored %s about %s from %s: not its owner %s", env.type, env.task_id, env.sender,
+                        task["owner"])
+            return "rejected"
         fields: dict[str, Any] = {"last_message": env.message_id}
         status = REQUESTER_TRANSITIONS.get(env.type)
         if env.type == "UPDATE":
@@ -695,27 +764,27 @@ def _result_from(draft: dict[str, Any] | None, outcome) -> tuple[dict[str, Any],
             body.setdefault("limitations", []).append(f"agent process exited with code {outcome.exit_code}")
         return body, refs
     status = "failed" if outcome.exit_code != 0 else "partial"
-    outputs = {"raw_output_tail": outcome.output_tail[-2000:]}
-    errors = _error_lines(outcome.log_path)
-    if errors:   # the CLI's own stderr usually says why (e.g. "workspace is out of credits")
-        outputs["error_lines"] = errors
+    # The raw output and run log are private (visibility design; Codex review of dfdd719): the requester gets
+    # the kind of error only (e.g. "quota"), the text stays in the log on the owner's node.
+    kinds = _error_kinds(outcome.log_path)
+    outputs = {"error_kinds": kinds} if kinds else {}
     summary = f"agent finished without a structured result (exit code {outcome.exit_code})"
-    if errors:
-        summary += f": {errors[-1][:200]}"
-    return result_body(status, summary, outputs=outputs,
+    if kinds:
+        summary += f"; errors in its log: {', '.join(kinds)}"
+    return result_body(status, summary, outputs=outputs or None,
                        limitations=["no submit_result call; outcome could not be verified",
                                     f"log: {outcome.log_path}"]), []
 
 
-def _error_lines(log_path: str | None, limit: int = 8) -> list[str]:
-    """Error-looking lines from a run log (stderr goes there), so the requester sees why a run failed."""
+def _error_kinds(log_path: str | None) -> list[str]:
+    """Which kinds of error a run log shows (stderr goes there), so the requester learns why a run failed
+    without receiving the log's text."""
     if not log_path:
         return []
     try:
-        lines = Path(log_path).read_text(errors="replace").splitlines()[1:]    # skip the "$ command" line
+        text = "\n".join(Path(log_path).read_text(errors="replace").splitlines()[1:]).lower()  # skip "$ cmd"
     except OSError:
         return []
     keys = ("error", "exception", "traceback", "denied", "not found", "failed", "out of credits", "quota",
             "rate limit", "unauthorized", "crash")
-    hits = [ln.strip() for ln in lines if any(k in ln.lower() for k in keys)]
-    return list(dict.fromkeys(hits))[-limit:]
+    return [k for k in keys if k in text]

@@ -146,7 +146,13 @@ async def clear_inbox(hub: Hub, me: str, before_seq: int) -> dict[str, Any]:
     addr, _ = hub.local_agent(me)
     cleared = hub.ledger.mark_seen_before(str(addr), int(before_seq))
     await _read_receipts(hub, str(addr), cleared, read=False)   # close cleared notices, but don't say "read"
-    return {"marked_read": len(cleared), "up_to_seq": int(before_seq)}
+    not_shown = hub.ledger.db.execute(
+        "SELECT COUNT(*) FROM messages WHERE direction='in' AND local_agent=? AND seen=0 AND shown=0"
+        " AND state='handled' AND rowid <= ?", (str(addr), int(before_seq))).fetchone()[0]
+    out = {"marked_read": len(cleared), "up_to_seq": int(before_seq)}
+    if not_shown:
+        out["left_unread"] = f"{not_shown} message(s) never listed by inbox: look at them first"
+    return out
 
 
 async def remind_me(hub: Hub, me: str, at: str, text: str) -> dict[str, Any]:
@@ -270,7 +276,13 @@ async def publish_artifact(hub: Hub, me: str, path: str, *, key: str | None = No
     src = Path(path).expanduser()
     if not src.is_absolute():
         src = (Path.cwd() / src)
-    key = key or f"{addr.node}/{addr.agent}/{task_id or _current_task() or 'adhoc'}/{src.name}"
+    if not key:
+        # The key is shared metadata (object-store listings), so by default it names no local file: a random id,
+        # keeping only a short extension so a fetched copy still opens with the right tool (Codex review of
+        # dfdd719). Pass key= to publish under a readable name on purpose.
+        import secrets
+        suffix = src.suffix if src.is_file() and len(src.suffix) <= 8 and src.suffix[1:].isalnum() else ""
+        key = f"{addr.node}/{addr.agent}/{task_id or _current_task() or 'adhoc'}/{secrets.token_hex(8)}{suffix}"
     ref = await hub.artifacts.publish(src, key, id=id, description=description, backend=backend)
     return ref.to_dict()
 
