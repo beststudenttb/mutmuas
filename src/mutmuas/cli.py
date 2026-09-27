@@ -25,7 +25,7 @@ from . import __version__, tools
 from .bus import Bus, BusUnavailable
 from .config import ConfigError, NodeConfig, dump_config, find_config, load_config
 from .hub import Hub, is_online, PermissionDenied
-from .ids import Address, parse_iso
+from .ids import Address, InvalidAddress, check_token, parse_iso
 from .protocol import ArtifactRef, Envelope, ProtocolError
 
 # --------------------------------------------------------------------------- helpers
@@ -652,9 +652,15 @@ def node_retire(args):
 
 def node_retire_agent(args):
     """Take ONE agent off the network (e.g. a seat): its registry card and its mailbox. The node's other agents
-    are not touched. HR removes the agent from node.yaml first; otherwise the running daemon would publish its
-    card again at once. Refuses while the agent still has open tasks on this node's ledger (--force: anyway)."""
+    are not touched. HR removes the agent from node.yaml and the daemon is restarted first; otherwise the
+    running daemon would publish its card again at its next heartbeat. Refuses while the agent has open tasks
+    on this node's ledger (--ignore-open-tasks: anyway). Waiting mail is kept unless --drop-mail, and is listed
+    (sender, task) so the senders can be told (R11.4): dropping it cannot be undone."""
     cfg = _cfg(args)
+    try:
+        check_token(args.id, "agent id")
+    except InvalidAddress as e:
+        raise SystemExit(f"error: {e}")
     if any(a.id == args.id for a in cfg.agents):
         raise SystemExit(f"error: {cfg.node}:{args.id} is still in {cfg.path}; HR removes it from node.yaml "
                          "first (and the daemon is restarted), then run retire-agent")
@@ -667,20 +673,58 @@ def node_retire_agent(args):
                                                                    "BLOCKED"))]
     finally:
         ledger.close()
-    if open_tasks and not args.force:
+    if open_tasks and not args.ignore_open_tasks:
         raise SystemExit(f"error: {addr} still has {len(open_tasks)} open task(s): {', '.join(open_tasks)}; "
-                         "close or hand them over first (R11.4), or --force")
+                         "close or hand them over first (R11.4), or --ignore-open-tasks")
+    running = _session_processes(str(addr))
+    if running:
+        print(f"warning: {addr} still has process(es) here: {', '.join(map(str, running))} "
+              "(stop them first, one PID at a time, R4.1)")
 
-    async def run():
+    async def run() -> int:
         bus = await Bus.open(cfg.nats, cfg.project, f"mutmuas:{cfg.node}:retire-agent", reconnect=False)
         try:
-            print(f"{addr}: {await bus.remove_agent(addr, force=args.force)}")
+            node = await bus.kv_get(bus.names.nodes_kv, cfg.node)
+            if node and is_online(node) and args.id in (node.get("agents") or []):
+                print(f"error: the running daemon of node {cfg.node} still has {addr} (it would publish the card "
+                      "again): restart it after the node.yaml change, then run retire-agent", file=sys.stderr)
+                return 1
+            card = await bus.kv_get(bus.names.agents_kv, f"{cfg.node}.{args.id}")
+            pending = await bus.inbox_pending(addr)
+            if card is None and pending is None:
+                print(f"error: no card and no mailbox for {addr}: nothing to retire (wrong id?)", file=sys.stderr)
+                return 1
+            waiting = await bus.pending_messages(addr) if pending else []
+            for env in waiting:
+                print(f"{addr}: waiting mail {env.type} from {env.sender} task {env.task_id}")
+            print(f"{addr}: {await bus.remove_agent(addr, force=args.drop_mail)}")
+            if waiting and args.drop_mail:
+                print(f"{addr}: dropped {len(waiting)} waiting message(s) listed above: tell their senders (R11.4)")
             if open_tasks:
-                print(f"{addr}: {len(open_tasks)} open task(s) left behind (--force): {', '.join(open_tasks)}")
+                print(f"{addr}: {len(open_tasks)} open task(s) left behind: {', '.join(open_tasks)}")
+            return 0
         finally:
             await bus.close()
 
-    asyncio.run(run())
+    code = asyncio.run(run())
+    if code:
+        raise SystemExit(code)
+
+
+def _session_processes(address: str) -> list[int]:
+    """PIDs of agentctl processes on this machine acting as `address` (e.g. a seat's MCP server)."""
+    try:
+        ps = subprocess.run(["/bin/ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    pids = []
+    for line in ps.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        argv = cmd.split()
+        if "agentctl" in cmd and any(a == "--as" and i + 1 < len(argv) and argv[i + 1] == address
+                                     or a == f"--as={address}" for i, a in enumerate(argv)):
+            pids.append(int(pid))
+    return pids
 
 
 def node_doctor(args):
@@ -919,7 +963,9 @@ def agent_node_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("retire-agent", help="take one agent off the network (card + mailbox); others untouched")
     p.add_argument("--config")
     p.add_argument("--id", required=True, help="the agent id on this node, e.g. guest-1")
-    p.add_argument("--force", action="store_true", help="also with open tasks / drop waiting messages")
+    p.add_argument("--ignore-open-tasks", action="store_true", help="retire although it still has open tasks")
+    p.add_argument("--drop-mail", action="store_true",
+                   help="also delete its mailbox with waiting messages (listed first; cannot be undone)")
     p.set_defaults(sync=node_retire_agent)
     p = sub.add_parser("doctor", help="check config, CLIs and connectivity")
     p.add_argument("--config")
