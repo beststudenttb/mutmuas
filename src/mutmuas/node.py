@@ -369,43 +369,54 @@ class NodeDaemon:
             return "rejected"
         known = acl(self.hub.ledger, env.task_id)
         if known:
-            if env.sender not in known:
-                log.warning("dropped observer copy %s: %s is not a participant on our records", env.short(),
+            row = self._any_task_row(env.task_id)          # every row of a task has the same requester/owner
+            if env.sender not in (row["requester"], row["owner"]):
+                # Content copies come from the requester or owner only; an observer's grant is relayed by the
+                # owner (Codex reviews of 8c018ee and d13ffc8), so an observer never authors one.
+                log.warning("dropped observer copy %s: %s is not the task's requester or owner", env.short(),
                             env.sender)
                 return "rejected"
-            row = self._any_task_row(env.task_id)          # every row of a task has the same requester/owner
             self._record_copy(env, row["requester"], row["owner"])
             return None
         self._background_job(self._verify_observer_copy(env))
         return "unverified"
 
+    def _still_unverified(self, message_id: str) -> bool:
+        row = self.hub.ledger.db.execute("SELECT state FROM messages WHERE message_id=? AND direction='in'",
+                                         (message_id,)).fetchone()
+        return row is None or row["state"] in ("new", "unverified")
+
     def _any_task_row(self, task_id: str) -> dict[str, Any]:
         return dict(self.hub.ledger.db.execute("SELECT requester, owner FROM tasks WHERE task_id=? LIMIT 1",
                                                (task_id,)).fetchone())
 
-    # The copy and the owner's task record travel separately, so the record may not be there yet: look again,
-    # with growing gaps, for about ten minutes (Codex review of 8c018ee); after that it stays unverified.
+    # The copy and the owner's task record travel separately, so the record may not be there yet: look again
+    # with growing gaps, then every last gap until it appears (Codex reviews of 8c018ee and d13ffc8).
     VERIFY_BACKOFF_S = (0.05, 0.2, 1, 3, 10, 30, 60, 120, 300)
 
     async def _verify_observer_copy(self, env: Envelope) -> None:
         """Accept a copy about a task this node does not know only if the shared task record (written by the
         owner's node) names its sender as requester or owner. That is a consistency check, not an authorisation
         boundary: any node credential can write the task KV (step 2, D-008)."""
-        record = None
-        for delay in (0, *self.VERIFY_BACKOFF_S):
-            await asyncio.sleep(delay)
+        record, attempt = None, 0
+        while not record:
+            # growing gaps at first, then the last gap for as long as the copy is still waiting: an owner that is
+            # offline may publish its record much later (Codex review of d13ffc8)
+            await asyncio.sleep(0 if attempt == 0 else
+                                self.VERIFY_BACKOFF_S[min(attempt, len(self.VERIFY_BACKOFF_S)) - 1])
+            attempt += 1
             if not self.hub.bus:
                 return
+            if attempt > 1 and not self._still_unverified(env.message_id):
+                return                                     # decided elsewhere (e.g. a second verifier)
             try:
                 record = await self.hub._remote_task(env.task_id, None)
             except Exception as e:
                 log.warning("could not verify observer copy %s: %r", env.short(), e)
                 record = None
-            if record:
-                break
-        if not record:
-            log.warning("observer copy %s stays unverified: no task record for %s", env.short(), env.task_id)
-            return
+            if not record and attempt == len(self.VERIFY_BACKOFF_S) + 1:
+                log.warning("observer copy %s still unverified: no task record for %s yet; checking every %ss",
+                            env.short(), env.task_id, self.VERIFY_BACKOFF_S[-1])
         if env.sender not in (record.get("requester"), record.get("owner")):
             log.warning("dropped observer copy %s: the task record does not name %s", env.short(), env.sender)
             self.hub.ledger.mark_handled(env.message_id, "rejected")
@@ -434,7 +445,9 @@ class NodeDaemon:
         self.hub.ledger.add_observers(env.task_id, added)
         owned = self.hub.ledger.task(env.task_id, "owner")
         new = [o for o in added if o not in before]
-        if owned and owned["local_agent"] == env.to and new:
+        from_observer = owned is not None and env.sender not in (owned["requester"], owned["owner"])
+        if owned and owned["local_agent"] == env.to and new and from_observer:
+            # (a requester that adds an observer sends the copies itself: relaying would duplicate them)
             # An observer added them: as the owner, relay the copies, so that a node that never saw the task can
             # check the sender against the task record (Codex review of 8c018ee).
             from .tools import send_observer_copies
