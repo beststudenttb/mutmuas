@@ -61,9 +61,8 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
         default_deadline = (datetime.now(timezone.utc) + timedelta(seconds=wait_s)).isoformat(timespec="seconds")
     body = request_body(objective, reason, kind=kind, inputs=inputs, expected_outputs=expected_outputs,
                         constraints=constraints, acceptance_criteria=acceptance_criteria,
-                        deadline=deadline or default_deadline, timeout_s=timeout_s, reply=reply, observers=observers)
-    if default_deadline:
-        body["deadline_default"] = True      # the owner can tell it from a deadline the requester chose
+                        deadline=deadline or default_deadline, timeout_s=timeout_s, reply=reply, observers=observers,
+                        deadline_default=bool(default_deadline))  # the owner can tell it from a chosen one
     target = await hub.card_or_none(to)
     task_id, delivery = await hub.request(
         me, to, body, artifacts=[ArtifactRef.from_dict(a) for a in artifacts or []],
@@ -114,7 +113,9 @@ async def wait_for_result(hub: Hub, task_id: str, timeout_s: float = 600, me: st
 # Messages that need a decision from the recipient; ACKs and progress UPDATEs are informational.
 ACTIONABLE = ("REQUEST", "QUESTION", "ANSWER", "RESULT", "BLOCKED", "REJECT", "CANCEL", "ERROR")
 # What should interrupt an interactive session right away: someone needs *me* to act. RESULTs of my own
-# requests are not in it: they are read when I next look, or when I explicitly wait on that task.
+# requests are not in it: they are read when I next look, or when I explicitly wait on that task. Exception:
+# an agent with wake_on_own_results (node.yaml, per agent, default off) is also woken by the RESULT of its own
+# request that wants a reply (ledger._type_filter; docs/MESSAGE_PROTOCOL.md "Waking").
 WAKE = ("REQUEST", "QUESTION", "ANSWER", "BLOCKED", "REJECT", "CANCEL", "ERROR")
 
 

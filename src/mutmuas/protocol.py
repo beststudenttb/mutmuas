@@ -266,13 +266,18 @@ def reply_required(request: dict[str, Any] | None) -> bool:
 def request_body(objective: str, reason: str, *, kind: str = "query", inputs: Any = None,
                  expected_outputs: Any = None, constraints: Any = None, acceptance_criteria: Any = None,
                  deadline: str | None = None, timeout_s: float | None = None,
-                 reply: str | None = None, observers: list[str] | None = None) -> dict[str, Any]:
+                 reply: str | None = None, observers: list[str] | None = None,
+                 deadline_default: bool = False) -> dict[str, Any]:
+    """deadline_default: the deadline was filled in by the requester's node (default_reply_deadline_s), not
+    chosen by the requester (docs/MESSAGE_PROTOCOL.md, "Replies, deadlines and the baton")."""
     body: dict[str, Any] = {"objective": objective, "reason": reason, "kind": kind}
     for key, value in (("inputs", inputs), ("expected_outputs", expected_outputs), ("constraints", constraints),
                        ("acceptance_criteria", acceptance_criteria), ("deadline", deadline), ("timeout_s", timeout_s),
                        ("reply", reply), ("observers", observers)):
         if value not in (None, "", [], {}):
             body[key] = value
+    if deadline_default and deadline:
+        body["deadline_default"] = True
     return body
 
 

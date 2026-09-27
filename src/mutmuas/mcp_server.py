@@ -260,7 +260,8 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
     @server.tool()
     async def inbox(include_seen: bool = False, peek: bool = False, only: str = "wake") -> str:
         """Messages addressed to you. only: "wake" (the default: what needs you - requests, questions, answers,
-        refusals, anything naming you as next), "actionable" (also results of your requests) or "all" (also
+        refusals, anything naming you as next; with wake_on_own_results in node.yaml also the results of your
+        requests that want a reply), "actionable" (also results of your requests) or "all" (also
         ACKs and progress). peek=True leaves them unread. A row with "note" (e.g. rejected: ...) is FYI.
         Old mail you have dealt with elsewhere: look at inbox(only="all", peek=True), then clear_inbox."""
         types = {"wake": tools.WAKE, "actionable": tools.ACTIONABLE}.get(only)

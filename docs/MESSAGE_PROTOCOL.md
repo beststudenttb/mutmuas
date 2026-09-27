@@ -27,7 +27,7 @@ Addresses and ids used in subjects allow `[A-Za-z0-9_-]` only.
 
 | type | direction | required body | optional body | effect on task |
 |---|---|---|---|---|
-| `REQUEST` | requester → owner | `objective`, `reason` | `kind`, `inputs`, `expected_outputs`, `constraints`, `acceptance_criteria`, `deadline`, `timeout_s`, `parent_task`, `reply` | creates task (PENDING) |
+| `REQUEST` | requester → owner | `objective`, `reason` | `kind`, `inputs`, `expected_outputs`, `constraints`, `acceptance_criteria`, `deadline`, `deadline_default`, `timeout_s`, `parent_task`, `reply` | creates task (PENDING) |
 | `ACK` | owner → requester | – | `state`, `message` | ACCEPTED (or RUNNING when an interactive agent accepts) |
 | `UPDATE` | owner → requester | `message` | `state` (task state), `progress` | `state` if given |
 | `QUESTION` | either | `question` | – | requester side: WAITING |
@@ -65,14 +65,23 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   The receiving session reading it, with a plain `inbox` and not `--peek`, closes the task with a read receipt
   (`RESULT complete "read by X (no reply requested)"`).
 - `deadline` (ISO 8601 with a timezone) says when the reply is needed. Use `agentctl ask --due +2h`.
+  - A REQUEST that wants a reply but names no deadline gets one from the requester's node:
+    `default_reply_deadline_s` in node.yaml (default 4 h; `0` = no default). With `timeout_s` it is never
+    earlier than `timeout_s` + 30 min, so a long task is not chased while it still runs.
+  - Such a filled-in deadline is marked `deadline_default: true` in the REQUEST body, so the owner can tell it
+    from one the requester chose. An explicit `deadline` is kept as given; notices (`reply: none`) get none.
 - `next: <address>` on RESULT, UPDATE, QUESTION or ANSWER names whose move it is. That agent is woken exactly
   as by a REQUEST, even by an UPDATE. Put it on the last message of every thread whose next step belongs to
   someone.
 
 ### Waking, presence and follow-ups
 
+- **Wake view.** What wakes a session (`inbox --only wake`, a waiting watcher, the push): REQUEST, QUESTION,
+  ANSWER, BLOCKED, REJECT, CANCEL, ERROR, and any message whose `next` names the agent. The RESULT of one's own
+  request does not, unless the agent has `wake_on_own_results: true` in node.yaml (per agent, default off); then
+  the RESULT of its own request that wants a reply (`reply` not `none`) wakes it too.
 - **Push.** `agentctl mcp --channel` declares the Claude Code `claude/channel` capability. When a message
-  reaches the ledger that would wake the agent (a wake type, or `next` naming it), the MCP server pushes one
+  reaches the ledger that would wake the agent (see the wake view), the MCP server pushes one
   line into the running session:
   `mutmuas: new REQUEST from A:x (task T-…): <first 80 characters>`, with meta
   `{task_id, msg_type, sender, summary}`.
