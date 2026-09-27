@@ -116,6 +116,13 @@ class NodeConfig:
     artifact_max_mb: float = 2048         # upload cap for the NATS object store backend
     escalate_to: list[str] = field(default_factory=list)   # copied on follow-ups (overdue reply, session gone)
     coordinators: list[str] = field(default_factory=list)  # may see every task's status layer (visibility.py)
+    # A request that needs a reply but names no deadline gets this one (seconds from sending), so the overdue
+    # follow-up can chase it (no-stall design, G3). 0 = no default.
+    default_reply_deadline_s: float = 4 * 3600
+    # Whether the RESULT of an agent's own request (one that wants a reply) wakes its session (no-stall design,
+    # G2). Off by default: the leader found RESULT wake-ups disruptive while chatting (test
+    # test_wake_filter_ignores_results_of_my_own_requests). Turning it on is the leader's decision.
+    wake_on_own_results: bool = False
     agents: list[AgentConfig] = field(default_factory=list)
     path: Path | None = None              # where this config was loaded from
 
