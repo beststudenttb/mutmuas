@@ -650,6 +650,39 @@ def node_retire(args):
     asyncio.run(run())
 
 
+def node_retire_agent(args):
+    """Take ONE agent off the network (e.g. a seat): its registry card and its mailbox. The node's other agents
+    are not touched. HR removes the agent from node.yaml first; otherwise the running daemon would publish its
+    card again at once. Refuses while the agent still has open tasks on this node's ledger (--force: anyway)."""
+    cfg = _cfg(args)
+    if any(a.id == args.id for a in cfg.agents):
+        raise SystemExit(f"error: {cfg.node}:{args.id} is still in {cfg.path}; HR removes it from node.yaml "
+                         "first (and the daemon is restarted), then run retire-agent")
+    addr = Address(cfg.node, args.id)
+    from .ledger import Ledger
+    ledger = Ledger(cfg.db_path)
+    try:
+        open_tasks = [t["task_id"] for t in ledger.tasks(local_agent=str(addr), limit=None,
+                                                         statuses=("PENDING", "ACCEPTED", "RUNNING", "WAITING",
+                                                                   "BLOCKED"))]
+    finally:
+        ledger.close()
+    if open_tasks and not args.force:
+        raise SystemExit(f"error: {addr} still has {len(open_tasks)} open task(s): {', '.join(open_tasks)}; "
+                         "close or hand them over first (R11.4), or --force")
+
+    async def run():
+        bus = await Bus.open(cfg.nats, cfg.project, f"mutmuas:{cfg.node}:retire-agent", reconnect=False)
+        try:
+            print(f"{addr}: {await bus.remove_agent(addr, force=args.force)}")
+            if open_tasks:
+                print(f"{addr}: {len(open_tasks)} open task(s) left behind (--force): {', '.join(open_tasks)}")
+        finally:
+            await bus.close()
+
+    asyncio.run(run())
+
+
 def node_doctor(args):
     cfg = _cfg(args)
     print(f"config    {cfg.path}\nproject   {cfg.project}\nnode      {cfg.node}\ndata      {cfg.data_path}")
@@ -883,6 +916,11 @@ def agent_node_parser() -> argparse.ArgumentParser:
     p.add_argument("--config")
     p.add_argument("--force", action="store_true", help="also while online / drop waiting messages")
     p.set_defaults(sync=node_retire)
+    p = sub.add_parser("retire-agent", help="take one agent off the network (card + mailbox); others untouched")
+    p.add_argument("--config")
+    p.add_argument("--id", required=True, help="the agent id on this node, e.g. guest-1")
+    p.add_argument("--force", action="store_true", help="also with open tasks / drop waiting messages")
+    p.set_defaults(sync=node_retire_agent)
     p = sub.add_parser("doctor", help="check config, CLIs and connectivity")
     p.add_argument("--config")
     p.set_defaults(sync=node_doctor)
