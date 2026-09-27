@@ -680,9 +680,11 @@ def node_retire_agent(args):
         raise SystemExit(f"error: {addr} still has {len(open_tasks)} open task(s): {', '.join(open_tasks)}; "
                          "close or hand them over first (R11.4), or --ignore-open-tasks")
     running = _session_processes(str(addr))
+    if running is None:          # fail closed: an unknown process list is not an empty one
+        raise SystemExit(f"error: could not list this machine's processes to check that {addr} has none left")
     if running:
-        print(f"warning: {addr} still has process(es) here: {', '.join(map(str, running))} "
-              "(stop them first, one PID at a time, R4.1)")
+        raise SystemExit(f"error: {addr} still has process(es) here: {', '.join(map(str, running))}; stop them "
+                         "first, one PID at a time (R4.1), then run retire-agent again (seat design: count must be 0)")
 
     async def run() -> int:
         bus = await Bus.open(cfg.nats, cfg.project, f"mutmuas:{cfg.node}:retire-agent", reconnect=False)
@@ -697,14 +699,30 @@ def node_retire_agent(args):
             if card is None and pending is None:
                 print(f"error: no card and no mailbox for {addr}: nothing to retire (wrong id?)", file=sys.stderr)
                 return 1
-            waiting = await bus.pending_messages(addr, limit=PENDING_LIST_LIMIT) if pending else []
+            if pending and args.drop_mail:
+                # Every message that is dropped must have been listed: list them all, then check right before the
+                # deletion that nothing new arrived meanwhile; if mail keeps arriving, do not delete (Codex review
+                # of retire-agent-v4). A message landing in the milliseconds between the last check and the
+                # deletion is the remaining window.
+                for _ in range(3):
+                    waiting = await bus.pending_messages(addr, limit=pending)
+                    now = await bus.inbox_pending(addr) or 0
+                    if len(waiting) == pending == now:
+                        break
+                    pending = now
+                else:
+                    print(f"error: mail for {addr} is still arriving ({pending} waiting, {len(waiting)} listed); "
+                          "nothing was deleted: try again", file=sys.stderr)
+                    return 1
+            else:
+                waiting = await bus.pending_messages(addr, limit=PENDING_LIST_LIMIT) if pending else []
             for env in waiting:
                 print(f"{addr}: waiting mail {env.type} from {env.sender} task {env.task_id}")
             if pending and len(waiting) < pending:
                 print(f"{addr}: listed {len(waiting)} of {pending} waiting message(s)")
             print(f"{addr}: {await bus.remove_agent(addr, force=args.drop_mail)}")
             if pending and args.drop_mail:
-                print(f"{addr}: dropped {pending} waiting message(s): tell their senders (R11.4)")
+                print(f"{addr}: dropped {pending} waiting message(s), all listed above: tell their senders (R11.4)")
             if open_tasks:
                 print(f"{addr}: {len(open_tasks)} open task(s) left behind: {', '.join(open_tasks)}")
             return 0
@@ -716,12 +734,16 @@ def node_retire_agent(args):
         raise SystemExit(code)
 
 
-def _session_processes(address: str) -> list[int]:
-    """PIDs of agentctl processes on this machine acting as `address` (e.g. a seat's MCP server)."""
+def _session_processes(address: str) -> list[int] | None:
+    """PIDs of agentctl processes on this machine acting as `address` (e.g. a seat's MCP server); None if the
+    process list could not be read (callers must treat that as "unknown", not as "none")."""
     try:
-        ps = subprocess.run(["/bin/ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=10).stdout
+        out = subprocess.run(["/bin/ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
-        return []
+        return None
+    if out.returncode != 0:
+        return None
+    ps = out.stdout
     pids = []
     for line in ps.splitlines():
         pid, _, cmd = line.strip().partition(" ")

@@ -250,7 +250,10 @@ class NodeDaemon:
         for key in await bus.kv_keys(bus.names.agents_kv, [f"{self.cfg.node}.*"]):
             agent_id = key.split(".", 1)[1]
             if agent_id not in configured:
-                outcome = await bus.remove_agent(Address(self.cfg.node, agent_id))
+                try:
+                    outcome = await bus.remove_agent(Address(self.cfg.node, agent_id))
+                except Exception as e:           # a registry hiccup must not keep the daemon from starting
+                    outcome = f"could not remove it: {e!r}"
                 log.warning("agent %s:%s is no longer configured: %s", self.cfg.node, agent_id, outcome)
 
     # ---- recovery -----------------------------------------------------

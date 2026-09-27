@@ -221,9 +221,9 @@ class Bus:
         return await self.js.pull_subscribe_bind(durable=durable, stream=self.names.stream)
 
     async def remove_agent(self, agent: Address, force: bool = False) -> str:
-        """Forget an agent that no longer exists: its registry card, and its mailbox if nothing is waiting in it."""
-        with contextlib.suppress(Exception):
-            await self.kv_delete(self.names.agents_kv, f"{agent.node}.{agent.agent}")
+        """Forget an agent that no longer exists: its registry card, and its mailbox if nothing is waiting in it.
+        A failed card deletion raises: this never reports "card removed" for a card that is still registered."""
+        await self.kv_delete(self.names.agents_kv, f"{agent.node}.{agent.agent}")
         pending = await self.inbox_pending(agent)
         if pending is None:
             return "card removed"

@@ -48,7 +48,7 @@ class Address:
         node, sep, agent = (text or "").partition(":")
         if not sep:
             raise InvalidAddress(f"invalid address {text!r}: expected NODE:agent, e.g. B:representation")
-        return cls(check_token(node, "node id"), check_token(agent, "agent id"))
+        return cls(check_node_id(node), check_token(agent, "agent id"))      # no "_" in node ids (see below)
 
     def __str__(self) -> str:
         return f"{self.node}:{self.agent}"

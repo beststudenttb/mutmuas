@@ -123,10 +123,16 @@ async def test_waiting_mail_beyond_the_listing_limit_is_still_counted(make_confi
     await asyncio.sleep(0.5)
     total = await hub.bus.inbox_pending(Address("C", "guest"))
     assert total >= 2
+    # keeping the mail: the listing is capped, the count is exact
+    assert await asyncio.to_thread(_run, "retire-agent", "--config", str(c.path), "--id", "guest",
+                                   "--ignore-open-tasks") == 0
+    out = capsys.readouterr().out
+    assert f"listed 1 of {total}" in out and "mailbox kept" in out
+    # dropping it: every dropped message is listed first, whatever the cap (Codex review of retire-agent-v4)
     assert await asyncio.to_thread(_run, "retire-agent", "--config", str(c.path), "--id", "guest",
                                    "--ignore-open-tasks", "--drop-mail") == 0
     out = capsys.readouterr().out
-    assert f"listed 1 of {total}" in out and f"dropped {total}" in out
+    assert out.count("waiting mail") == total and f"dropped {total}" in out
 
 
 def test_node_ids_may_not_contain_an_underscore(tmp_path):
@@ -139,3 +145,22 @@ def test_node_ids_may_not_contain_an_underscore(tmp_path):
     with pytest.raises((ConfigError, InvalidAddress)):
         generate("p", ["A", "C_a"], tmp_path / "server")
     NodeConfig(project="p", node="C-a", data_dir=str(tmp_path), agents=[AgentConfig(id="x_y", mode="interactive")]).validate()
+
+
+def test_an_unreadable_process_list_refuses_instead_of_passing(make_config, monkeypatch):
+    """Fail closed (Codex review of retire-agent-v4): if ps cannot run, 'no processes' is not known."""
+    import subprocess
+    cfg = make_config("C", [interactive("main")])
+
+    def broken(*args, **kwargs):
+        raise OSError("ps not available")
+    monkeypatch.setattr(subprocess, "run", broken)
+    assert cli._session_processes("C:guest") is None
+    opened = False
+
+    async def fake_open(*args, **kwargs):
+        nonlocal opened
+        opened = True
+    monkeypatch.setattr(cli.Bus, "open", fake_open)
+    assert _run("retire-agent", "--config", str(cfg.path), "--id", "guest") != 0
+    assert not opened
