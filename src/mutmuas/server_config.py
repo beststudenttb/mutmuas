@@ -18,7 +18,7 @@ import secrets
 import subprocess
 from pathlib import Path
 
-from .ids import check_token
+from .ids import check_node_id, check_token
 
 
 def node_permissions(project: str, node: str) -> dict[str, list[str]]:
@@ -104,7 +104,7 @@ def render(project: str, nodes: list[str], passwords: dict[str, str], admin_pass
     check_token(project, "project")
     users = [f'    {{ user: "admin", password: "{admin_password}" }}']
     for node in nodes:
-        check_token(node, "node id")
+        check_node_id(node)
         users.append(f'    {{ user: "node_{node}", password: "{passwords[node]}",\n'
                      f'{_perm_block(node_permissions(project, node), "      ")} }}')
     if reception_password:

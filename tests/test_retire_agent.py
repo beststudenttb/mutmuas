@@ -111,3 +111,31 @@ async def test_open_tasks_and_waiting_mail_are_separate_switches(make_config, cl
     out = capsys.readouterr().out
     assert late["task_id"] in out and "dropped" in out
     assert await hub.bus.inbox_pending(Address("C", "guest")) is None
+
+
+# C's second look at 0554ca1 (T-20260927192812-da4847f1): two small suggestions
+
+async def test_waiting_mail_beyond_the_listing_limit_is_still_counted(make_config, cluster, capsys, monkeypatch):
+    monkeypatch.setattr(cli, "PENDING_LIST_LIMIT", 1)
+    a, c, hub, for_guest, for_main = await _setup(make_config, cluster)
+    await tools.send_request(hub, "A:main", "C:guest", "late 1", "retire test")
+    await tools.send_request(hub, "A:main", "C:guest", "late 2", "retire test")
+    await asyncio.sleep(0.5)
+    total = await hub.bus.inbox_pending(Address("C", "guest"))
+    assert total >= 2
+    assert await asyncio.to_thread(_run, "retire-agent", "--config", str(c.path), "--id", "guest",
+                                   "--ignore-open-tasks", "--drop-mail") == 0
+    out = capsys.readouterr().out
+    assert f"listed 1 of {total}" in out and f"dropped {total}" in out
+
+
+def test_node_ids_may_not_contain_an_underscore(tmp_path):
+    import pytest
+    from mutmuas.config import AgentConfig, ConfigError, NodeConfig
+    from mutmuas.ids import InvalidAddress
+    from mutmuas.server_config import generate
+    with pytest.raises((ConfigError, InvalidAddress)):
+        NodeConfig(project="p", node="C_a", data_dir=str(tmp_path), agents=[AgentConfig(id="b", mode="interactive")]).validate()
+    with pytest.raises((ConfigError, InvalidAddress)):
+        generate("p", ["A", "C_a"], tmp_path / "server")
+    NodeConfig(project="p", node="C-a", data_dir=str(tmp_path), agents=[AgentConfig(id="x_y", mode="interactive")]).validate()

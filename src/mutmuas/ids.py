@@ -27,6 +27,15 @@ def check_token(value: str, what: str) -> str:
     return value
 
 
+def check_node_id(value: str) -> str:
+    """A node id is a token without "_": mailbox consumers are named inbox_<node>_<agent>, and agent ids may
+    contain "_", so node "C_a" with agent "b" and node "C" with agent "a_b" would share one mailbox."""
+    check_token(value, "node id")
+    if "_" in value:
+        raise InvalidAddress(f"invalid node id {value!r}: no '_' in node ids (mailbox names would collide)")
+    return value
+
+
 @dataclass(frozen=True, order=True)
 class Address:
     node: str

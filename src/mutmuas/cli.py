@@ -650,6 +650,9 @@ def node_retire(args):
     asyncio.run(run())
 
 
+PENDING_LIST_LIMIT = 200       # retire-agent lists at most this many waiting messages (the count is always exact)
+
+
 def node_retire_agent(args):
     """Take ONE agent off the network (e.g. a seat): its registry card and its mailbox. The node's other agents
     are not touched. HR removes the agent from node.yaml and the daemon is restarted first; otherwise the
@@ -694,12 +697,14 @@ def node_retire_agent(args):
             if card is None and pending is None:
                 print(f"error: no card and no mailbox for {addr}: nothing to retire (wrong id?)", file=sys.stderr)
                 return 1
-            waiting = await bus.pending_messages(addr) if pending else []
+            waiting = await bus.pending_messages(addr, limit=PENDING_LIST_LIMIT) if pending else []
             for env in waiting:
                 print(f"{addr}: waiting mail {env.type} from {env.sender} task {env.task_id}")
+            if pending and len(waiting) < pending:
+                print(f"{addr}: listed {len(waiting)} of {pending} waiting message(s)")
             print(f"{addr}: {await bus.remove_agent(addr, force=args.drop_mail)}")
-            if waiting and args.drop_mail:
-                print(f"{addr}: dropped {len(waiting)} waiting message(s) listed above: tell their senders (R11.4)")
+            if pending and args.drop_mail:
+                print(f"{addr}: dropped {pending} waiting message(s): tell their senders (R11.4)")
             if open_tasks:
                 print(f"{addr}: {len(open_tasks)} open task(s) left behind: {', '.join(open_tasks)}")
             return 0
