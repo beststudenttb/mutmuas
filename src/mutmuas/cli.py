@@ -718,10 +718,11 @@ def node_retire_agent(args):
                 print(f"{addr}: waiting mail {env.type} from {env.sender} task {env.task_id}", flush=True)
             if pending and len(waiting) < pending:
                 print(f"{addr}: listed {len(waiting)} of {pending} waiting message(s)", flush=True)
-            if pending and args.drop_mail:
+            if args.drop_mail:
                 # The listing above may take long (a big mailbox, a slow terminal): check once more right at
                 # the deletion, after all output, and delete nothing if mail came in meanwhile (Codex review
-                # of 18509e2). Nothing else happens between this check and the deletion.
+                # of 18509e2). Also when the first count was 0: mail may arrive after it (Codex review of
+                # d0aa8db). Nothing else happens between this check and the deletion.
                 now = await bus.inbox_pending(addr) or 0
                 if now != len(waiting):
                     print(f"error: {now - len(waiting)} message(s) for {addr} arrived while listing; nothing was "
