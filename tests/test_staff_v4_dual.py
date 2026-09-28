@@ -75,18 +75,45 @@ async def test_while_the_session_is_there_requests_are_listed_not_run(make_confi
 
 async def test_after_the_session_ends_the_worker_takes_over_after_a_grace_period(make_config, cluster, holder,
                                                                               monkeypatch, tmp_path):
-    monkeypatch.setattr(node_mod, "AUTO_WORKER_GRACE_S", 2.0)
+    """Condition-driven, no fixed sleeps against the grace period (it flaked under load on B, 5576ad5): while
+    the grace period lasts the task waits; once it is over the heartbeat hands it to the worker."""
+    monkeypatch.setattr(node_mod, "AUTO_WORKER_GRACE_S", 3600.0)
     hub_a, hub_b = await _two_nodes(make_config, cluster)
     _session_on(hub_b, "B:desk", holder)
     hub_b.ledger.session_end("B:desk", holder.pid)                    # the leader just closed it
     marker = tmp_path / "ran"
     sent = await tools.send_request(hub_a, "A:main", "B:desk", "echo", "grace",
                                     inputs={"action": "echo", "marker": str(marker)})
-    await eventually(lambda: hub_b.ledger.task(sent["task_id"], "owner"), what="owner task")
-    await asyncio.sleep(0.5)
-    assert await _status(hub_b, sent["task_id"]) == "PENDING"        # maybe only a terminal restart
+    await eventually(lambda: "UPDATE" in [m["type"] for m in hub_a.ledger.thread(sent["task_id"])],
+                     what="delivered to the inbox (the interactive path)")
+    await asyncio.sleep(1.5)                                           # three heartbeats inside the grace period
+    assert await _status(hub_b, sent["task_id"]) == "PENDING" and not marker.exists()
+    monkeypatch.setattr(node_mod, "AUTO_WORKER_GRACE_S", 0.0)         # the grace period is over
     result = await tools.wait_for_result(hub_a, sent["task_id"], 30)
     assert result["result_status"] == "complete" and marker.read_text().count("\n") == 1
+    assert [m["type"] for m in hub_a.ledger.thread(sent["task_id"])].count("ACK") == 1
+
+
+async def test_a_request_being_handled_is_not_also_taken_by_the_heartbeat(make_config, cluster, monkeypatch,
+                                                                         tmp_path):
+    """_on_request awaits the task record's publication after creating the PENDING task; the heartbeat's
+    _auto_dispatch must not accept it meanwhile, or it is accepted twice (two ACKs)."""
+    monkeypatch.setattr(node_mod, "AUTO_WORKER_GRACE_S", 0.0)
+    hub_a, hub_b = await _two_nodes(make_config, cluster)
+    daemon = cluster.daemons["B"]
+    publish = daemon.hub.publish_task_record
+
+    async def slow_publish(task_id):
+        await asyncio.sleep(1.5)                                       # > heartbeat_s (0.5): the heartbeat runs
+        return await publish(task_id)
+
+    monkeypatch.setattr(daemon.hub, "publish_task_record", slow_publish)
+    marker = tmp_path / "ran"
+    sent = await tools.send_request(hub_a, "A:main", "B:desk", "echo", "race",
+                                    inputs={"action": "echo", "marker": str(marker)})
+    result = await tools.wait_for_result(hub_a, sent["task_id"], 30)
+    assert result["result_status"] == "complete" and marker.read_text().count("\n") == 1
+    assert [m["type"] for m in hub_a.ledger.thread(sent["task_id"])].count("ACK") == 1
 
 
 async def test_a_running_worker_is_not_interrupted_and_its_task_is_never_done_twice(make_config, cluster, holder,

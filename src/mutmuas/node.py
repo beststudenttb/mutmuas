@@ -182,6 +182,7 @@ class NodeDaemon:
         self._queues: dict[str, asyncio.Queue[str]] = {}
         self._queued: dict[str, set[str]] = {}               # task ids queued or running, per agent
         self._running: dict[str, asyncio.Task] = {}          # task_id -> runner task
+        self._arriving: set[str] = set()                     # REQUESTs _on_request is still deciding about
         self._cancel_requested: set[str] = set()
         self._background: set[asyncio.Task] = set()          # e.g. observer-copy checks against the task KV
         self._outbox_wake = asyncio.Event()
@@ -492,6 +493,15 @@ class NodeDaemon:
         task.add_done_callback(done)
 
     async def _on_request(self, agent: AgentConfig, env: Envelope) -> str | None:
+        # While it decides (it awaits the task record's publication), the heartbeat's _auto_dispatch must not
+        # also take the new PENDING task, or it is accepted twice (found in the flaky-test review of 5576ad5).
+        self._arriving.add(env.task_id)
+        try:
+            return await self._decide_request(agent, env)
+        finally:
+            self._arriving.discard(env.task_id)
+
+    async def _decide_request(self, agent: AgentConfig, env: Envelope) -> str | None:
         hub = self.hub
         existing = hub.ledger.task(env.task_id, "owner")
         if existing:
@@ -800,7 +810,8 @@ class NodeDaemon:
             if not agent.auto_worker or session_present(hub.ledger, addr):
                 continue
             for task in hub.ledger.tasks(role="owner", local_agent=addr, statuses=("PENDING",), limit=None):
-                if task.get("runner") is None and task["task_id"] not in self._queued[addr]:
+                if (task.get("runner") is None and task["task_id"] not in self._queued[addr]
+                        and task["task_id"] not in self._arriving):
                     await self._accept(task["task_id"])
                     self._enqueue(addr, task["task_id"])
 
