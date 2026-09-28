@@ -610,7 +610,7 @@ class NodeDaemon:
         hub.ledger.update_task(task_id, "owner", result_draft=None)
         ctx = TaskContext(task_id, request, agent, self.cfg, attempt)
         wt = None
-        if request.body.get("kind") == "code" and agent.repo:
+        if request.body.get("kind") == "code" and agent.copies_code:
             inputs = request.body.get("inputs")
             base_ref = inputs.get("base_ref", "HEAD") if isinstance(inputs, dict) else "HEAD"
             try:

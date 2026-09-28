@@ -178,6 +178,9 @@ daemon (`launchctl kickstart -k …` / `systemctl --user restart mutmuas-agent-n
   model: opus                   # optional; empty = CLI default
   workdir: ~/work/visual_rl
   repo: ~/work/visual_rl        # optional: kind=code tasks get their own git worktree
+  code_mode: copy               # copy (default): kind=code works on a private worktree of repo;
+                                # direct: edit code_dirs in place and commit (project-level work, D-031)
+  code_dirs: []                 # direct mode: the project code, reached with --add-dir
   capabilities: [isaac_lab, gpu_training]
   permissions: [READ, RUN_EXPERIMENT, PUBLISH_ARTIFACT, REQUEST_TASK]
   accept_from: ["A:*", "B:*"]
@@ -187,6 +190,13 @@ daemon (`launchctl kickstart -k …` / `systemctl --user restart mutmuas-agent-n
 Runtime notes:
 - `claude-code` runs `claude -p` with only the mutmuas MCP server (`--strict-mcp-config`) and the tools
   allowed by the agent's permissions (ARCHITECTURE_V1 §5). `extra_args` are appended to the command line.
+  Tools come from node.yaml only (D-032): it loads setting sources `user,project` (not `local`, where a
+  session's "don't ask again" approvals are saved), may not edit `<workdir>/HANDOFF.md`, and refuses to run
+  if the project's `.claude/settings.json` grants tools.
+- Staff system v4 (D-029..D-031): workdir is the function x project directory, e.g.
+  `~/mutmuas/work/paper/visualrl/` (not inside any git repo). LLM workers start there, so the function's
+  `CLAUDE.md` one level up and the project's auto memory load; a code task's worktree (copy) or `code_dirs`
+  (direct) are added with `--add-dir`. A workdir inside `repo` keeps the old behaviour (start in the worktree).
 - `codex` runs `codex exec` with `--ignore-user-config` (your `~/.codex/config.toml` model and MCP servers
   are not loaded; set `inherit_user_config: true` to change that), sandbox `read-only`/`workspace-write`,
   and the mutmuas tools pre-approved.

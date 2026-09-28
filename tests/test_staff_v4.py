@@ -83,3 +83,83 @@ def test_worker_refuses_a_project_settings_file_that_grants_tools(tmp_path):
         runtime.command(ctx)
     (workdir / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"deny": ["Bash"]}}))
     runtime.command(ctx)                                              # restricting is fine
+
+
+# --------------------------------------------------------------------------- C3: start in the project directory
+
+
+def _code_ctx(tmp_path, runtime="claude-code", code_mode="copy", workdir=None, code_dirs=(), kind="code"):
+    from mutmuas.config import AgentConfig, NodeConfig
+    from mutmuas.protocol import Envelope, request_body
+    from mutmuas.runtime import TaskContext
+    node = NodeConfig(project="p", node="C", data_dir=str(tmp_path / "data"))
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    workdir = workdir or tmp_path / "work" / "paper" / "visualrl"
+    workdir.mkdir(parents=True, exist_ok=True)
+    agent = AgentConfig(id="paper-visualrl", runtime=runtime, workdir=str(workdir), repo=str(repo),
+                        code_mode=code_mode, code_dirs=[str(d) for d in code_dirs],
+                        permissions=["READ", "WRITE_WORKTREE"])
+    agent.validate()
+    req = Envelope(type="REQUEST", sender="B:sec", to="C:paper-visualrl", task_id="T-1",
+                   body=request_body("x", "y", kind=kind))
+    wt = tmp_path / "worktrees" / "C-paper-visualrl-T-1"
+    ctx = TaskContext("T-1", req, agent, node, workdir=wt if code_mode == "copy" else None,
+                      git_branch="mm/C-paper-visualrl/T-1" if code_mode == "copy" else None)
+    return agent, node, ctx, workdir, repo, wt
+
+
+def _add_dirs(argv):
+    return [argv[i + 1] for i, a in enumerate(argv) if a == "--add-dir"]
+
+
+def test_copy_mode_worker_starts_in_the_project_directory_with_the_worktree_added(tmp_path):
+    """The function CLAUDE.md and the project's memory belong to the start directory (D-031): a code task starts
+    there and reaches its private worktree through --add-dir, never the main repo."""
+    from mutmuas.runtime import ClaudeCodeRuntime, CodexRuntime
+    agent, node, ctx, workdir, repo, wt = _code_ctx(tmp_path)
+    for runtime in (ClaudeCodeRuntime(agent, node), CodexRuntime(agent, node)):
+        assert runtime.start_dir(ctx) == workdir
+        argv, _ = runtime.command(ctx)
+        assert _add_dirs(argv) == [str(wt)]
+    argv, _ = CodexRuntime(agent, node).command(ctx)
+    assert argv[argv.index("-C") + 1] == str(workdir)
+
+
+def test_workdir_inside_the_repo_keeps_starting_in_the_worktree(tmp_path):
+    """Starting in (or below) the main repo would open it to the task (the b461307 MERGE bypass)."""
+    from mutmuas.runtime import ClaudeCodeRuntime, CodexRuntime
+    inside = tmp_path / "repo" / "sub"
+    agent, node, ctx, _, repo, wt = _code_ctx(tmp_path, workdir=inside)
+    for runtime in (ClaudeCodeRuntime(agent, node), CodexRuntime(agent, node)):
+        assert runtime.start_dir(ctx) == wt
+        assert _add_dirs(runtime.command(ctx)[0]) == []
+
+
+def test_direct_mode_adds_the_project_code_and_its_claude_md(tmp_path):
+    """Project-level work edits the project code in place (D-031); its CLAUDE.md/AGENTS.md load as well."""
+    from mutmuas.runtime import ClaudeCodeRuntime
+    code = tmp_path / "paper-src"
+    code.mkdir()
+    agent, node, ctx, workdir, _, _ = _code_ctx(tmp_path, code_mode="direct", code_dirs=[code])
+    runtime = ClaudeCodeRuntime(agent, node)
+    assert runtime.start_dir(ctx) == workdir and not agent.copies_code
+    assert _add_dirs(runtime.command(ctx)[0]) == [str(code)]
+    assert ctx.env()["CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD"] == "1"
+
+
+def test_code_mode_is_validated(tmp_path):
+    import pytest
+
+    from mutmuas.config import ConfigError
+    with pytest.raises(ConfigError, match="code_mode"):
+        _code_ctx(tmp_path, code_mode="sometimes")
+    with pytest.raises(ConfigError, match="code_dirs"):
+        _code_ctx(tmp_path, code_mode="direct")
+
+
+def test_worker_prompt_names_the_code_and_the_worker_log(tmp_path):
+    from mutmuas.runtime import worker_prompt
+    _, _, ctx, workdir, _, wt = _code_ctx(tmp_path)
+    prompt = worker_prompt(ctx)
+    assert str(wt) in prompt and "worker-log.md" in prompt and "HANDOFF.md" in prompt

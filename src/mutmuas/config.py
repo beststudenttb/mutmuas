@@ -18,6 +18,7 @@ from .ids import Address, InvalidAddress, check_token
 PERMISSIONS = ("READ", "WRITE_WORKTREE", "RUN_EXPERIMENT", "PUBLISH_ARTIFACT", "REQUEST_TASK", "MERGE", "ADMIN")
 RUNTIMES = ("claude-code", "codex", "script")
 MODES = ("worker", "interactive")
+CODE_MODES = ("copy", "direct")
 
 DEFAULT_HOME = Path(os.environ.get("MUTMUAS_HOME", "~/.mutmuas")).expanduser()
 
@@ -39,6 +40,9 @@ class AgentConfig:
     description: str = ""
     workdir: str = "."
     repo: str = ""                       # git repo for kind=code tasks (each task gets its own worktree)
+    code_mode: str = "copy"              # copy: kind=code works on a private worktree of `repo` (the mutmuas kernel);
+                                         # direct: the worker edits code_dirs in place and commits (D-031)
+    code_dirs: list[str] = field(default_factory=list)            # project code a worker reaches via --add-dir
     capabilities: list[str] = field(default_factory=list)
     permissions: list[str] = field(default_factory=lambda: ["READ", "REQUEST_TASK"])
     accept_from: list[str] = field(default_factory=lambda: ["*"])   # glob patterns over "NODE:agent"
@@ -67,6 +71,10 @@ class AgentConfig:
                 raise ConfigError(f"agent {self.id}: worker agents need runtime in {RUNTIMES}")
             if self.runtime == "script" and not self.command:
                 raise ConfigError(f"agent {self.id}: script runtime needs 'command'")
+        if self.code_mode not in CODE_MODES:
+            raise ConfigError(f"agent {self.id}: code_mode must be one of {CODE_MODES}")
+        if self.code_mode == "direct" and not self.code_dirs:
+            raise ConfigError(f"agent {self.id}: code_mode direct needs code_dirs (the project code to edit)")
         bad = [p for p in self.permissions if p not in PERMISSIONS]
         if bad:
             raise ConfigError(f"agent {self.id}: unknown permission(s) {bad}; known: {PERMISSIONS}")
@@ -80,6 +88,15 @@ class AgentConfig:
     @property
     def workdir_path(self) -> Path:
         return Path(os.path.expandvars(self.workdir)).expanduser().resolve()
+
+    @property
+    def copies_code(self) -> bool:
+        """kind=code works on a private worktree of `repo` (not in place)."""
+        return self.code_mode == "copy" and bool(self.repo)
+
+    @property
+    def code_paths(self) -> list[Path]:
+        return [Path(os.path.expandvars(d)).expanduser().resolve() for d in self.code_dirs]
 
 
 @dataclass
