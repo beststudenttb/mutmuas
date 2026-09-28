@@ -186,7 +186,8 @@ async def cmd_ask(args, hub: Hub):
         hub, _me(args), args.to, args.objective, args.reason or "requested via agentctl", kind=args.kind,
         inputs=_parse_kv(args.input) or None, expected_outputs=args.expect, acceptance_criteria=args.accept,
         constraints=args.constraint, timeout_s=args.timeout, priority=args.priority,
-        reply=args.reply, deadline=_parse_due(args.due), observers=args.observer)
+        reply=args.reply, deadline=_parse_due(args.due), observers=args.observer,
+        artifacts=[{"uri": uri} for uri in args.artifact or []])
     if args.wait is not None:
         out = await tools.wait_for_result(hub, out["task_id"], args.wait, me=_me(args))
     _print(out, args.json)
@@ -728,6 +729,9 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--due", metavar="WHEN", help="reply needed by: +90m, +2h, +1d or ISO time; overdue is followed up")
     p.add_argument("--observer", action="append", metavar="ADDR",
                    help="may also read this task's request and result (repeatable)")
+    p.add_argument("--artifact", action="append", metavar="URI",
+                   help="attach an artifact you published or received (repeatable): only an attached one may be "
+                        "fetched by the recipient, not a URI written in the text")
     p.add_argument("--wait", type=float, nargs="?", const=600, help="wait for the result (s)")
     p = add("send", cmd_send, "send a message from a YAML file", bus=False)
     p.add_argument("to")
