@@ -65,7 +65,9 @@ class TaskContext:
         env.update(self.agent.env)
         env.update(MUTMUAS_CONFIG=str(self.node.path or ""), MUTMUAS_AGENT=self.address,
                    MUTMUAS_TASK_ID=self.task_id, MUTMUAS_PROJECT=self.node.project,
-                   CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD="1")   # the project code's own CLAUDE.md/AGENTS.md
+                   CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD="1")   # the project code's own CLAUDE.md
+        # (the documented files are CLAUDE.md, .claude/CLAUDE.md, .claude/rules/*.md, CLAUDE.local.md; an
+        # AGENTS.md is read only if one of them imports it)
         return env
 
     def payload(self) -> dict[str, Any]:

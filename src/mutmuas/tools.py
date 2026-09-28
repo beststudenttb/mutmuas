@@ -16,7 +16,7 @@ from typing import Any
 from .hub import Hub
 from .ids import parse_iso
 from .visibility import acl, artifact_visible, is_participant, message_visible, short
-from .protocol import TERMINAL_STATES, ArtifactRef, Envelope, request_body, result_body
+from .protocol import OPEN_STATES, TERMINAL_STATES, ArtifactRef, Envelope, request_body, result_body
 
 
 def _current_task() -> str | None:
@@ -221,7 +221,7 @@ async def _read_receipts(hub: Hub, me: str, envs: list[Envelope], read: bool = T
 
 
 async def accept_task(hub: Hub, me: str, task_id: str) -> dict[str, Any]:
-    _owned(hub, me, task_id)
+    _check_actor(_owned(hub, me, task_id))
     refused = hub.ledger.claim_task(task_id, "session", OPEN_STATES)
     if refused and "worker" in refused:
         raise PermissionError(f"{task_id} is being done by the worker the daemon started before this session; "
@@ -232,7 +232,7 @@ async def accept_task(hub: Hub, me: str, task_id: str) -> dict[str, Any]:
 
 
 async def reject_task(hub: Hub, me: str, task_id: str, reason: str) -> dict[str, Any]:
-    _owned(hub, me, task_id)
+    _check_actor(_owned(hub, me, task_id))
     ok = await hub.owner_transition(task_id, "FAILED", reason, msg_type="REJECT", body={"reason": reason})
     return {"task_id": task_id, "rejected": ok}
 
@@ -243,6 +243,7 @@ async def report_progress(hub: Hub, me: str, message: str, task_id: str | None =
     if not task_id:
         raise ValueError("task_id is required outside of a delegated task")
     task = _owned(hub, me, task_id)
+    _check_actor(task)
     new_state = state or task["status"]
     if new_state not in ("RUNNING", "WAITING", "BLOCKED"):
         new_state = "RUNNING"
@@ -263,7 +264,7 @@ async def submit_result(hub: Hub, me: str, status: str, summary: str, *, task_id
     task = _owned(hub, me, task_id)
     if task["status"] in TERMINAL_STATES:
         return {"task_id": task_id, "error": f"task already {task['status']}; result not changed"}
-    _check_runner(task)
+    _check_actor(task)
     body = result_body(status, summary, outputs=outputs, evidence=evidence, limitations=limitations,
                        follow_up=follow_up)
     if next:
@@ -381,7 +382,7 @@ async def whoami(hub: Hub, me: str | None = None) -> dict[str, Any]:
     from .node import session_fields
     addr, agent = hub.local_agent(me)
     open_tasks = hub.ledger.tasks(role="owner", local_agent=str(addr),
-                                  statuses=("PENDING", "ACCEPTED", "RUNNING", "WAITING", "BLOCKED"))
+                                  statuses=OPEN_STATES)
     out = {"address": str(addr), "project": hub.cfg.project, "role": agent.role, "mode": agent.mode,
            "workdir": str(agent.workdir_path), "permissions": agent.permissions,
            "capabilities": agent.capabilities, "open_tasks": [t["task_id"] for t in open_tasks],
@@ -435,17 +436,24 @@ async def fetch_artifact(hub: Hub, uri: str, dest_dir: str | None = None, sha256
     return {"uri": uri, "path": str(path), "size": path.stat().st_size if path.is_file() else None}
 
 
-OPEN_STATES = ("PENDING", "ACCEPTED", "RUNNING", "WAITING", "BLOCKED")
-
-
-def _check_runner(task: dict[str, Any]) -> None:
-    """auto_worker: only whoever holds the task may deliver its result, so it is never done twice (D-032)."""
+def _check_actor(task: dict[str, Any]) -> None:
+    """Every owner-side change (accept, reject, progress, result) is made by whoever holds the task, so a task is
+    never done twice and a running worker is not interrupted (D-032, D-032a; Codex review of 6116466).
+    - A daemon-run worker process (MUTMUAS_TASK_ID, set by the daemon) acts on its own task only. Setting that
+      variable can only narrow what a process may do, so it needs no proof.
+    - A task held by the worker is changed only by the worker's processes (descendants of the recorded pid).
+    - A task held by the session is not changed by a worker process (covered by the first rule)."""
     from .node import _ancestors
+    current = _current_task()
+    if current and task["task_id"] != current:
+        raise PermissionError(f"a worker process (task {current}) acts only on its own task, not on "
+                              f"{task['task_id']}, which belongs to the session or to another run")
     in_worker = task.get("runner_pid") in {os.getpid(), *_ancestors(os.getpid())} - {None}
     if task.get("runner") == "worker" and not in_worker:
-        raise PermissionError(f"{task['task_id']} is being done by the worker; only it delivers the result")
-    if task.get("runner") == "session" and task["task_id"] == _current_task():
-        raise PermissionError(f"{task['task_id']} was taken by the session; a worker may not deliver it")
+        raise PermissionError(f"{task['task_id']} is being done by the worker the daemon started; it is not "
+                              "interrupted (D-032a): wait for its result (whoami: worker_running)")
+    if task.get("runner") == "session" and current == task["task_id"]:
+        raise PermissionError(f"{task['task_id']} was taken by the session; a worker may not act on it")
 
 
 def _owned(hub: Hub, me: str, task_id: str) -> dict[str, Any]:

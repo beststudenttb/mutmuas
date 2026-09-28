@@ -162,7 +162,7 @@ def test_workdir_inside_the_repo_keeps_starting_in_the_worktree(tmp_path):
 
 
 def test_direct_mode_adds_the_project_code_and_its_claude_md(tmp_path):
-    """Project-level work edits the project code in place (D-031); its CLAUDE.md/AGENTS.md load as well."""
+    """Project-level work edits the project code in place (D-031); its CLAUDE.md loads as well."""
     from mutmuas.runtime import ClaudeCodeRuntime
     code = tmp_path / "paper-src"
     code.mkdir()
@@ -188,3 +188,32 @@ def test_worker_prompt_names_the_code_and_the_worker_log(tmp_path):
     _, _, ctx, workdir, _, wt = _code_ctx(tmp_path)
     prompt = worker_prompt(ctx)
     assert str(wt) in prompt and "worker-log.md" in prompt and "HANDOFF.md" in prompt
+
+
+# --------------------------------------------------------------------------- C4: every owner-side change checks the actor
+
+
+async def test_session_cannot_report_progress_on_a_worker_task(tmp_path):
+    """Codex review of 6116466: report_progress lacked the holder check that submit_result had."""
+    import pytest
+
+    from mutmuas import tools
+    from mutmuas.config import AgentConfig, NodeConfig
+    from mutmuas.hub import Hub
+    from mutmuas.ledger import Ledger
+    from mutmuas.protocol import Envelope, request_body
+    agent = AgentConfig(id="desk", mode="interactive", auto_worker=True, runtime="script", command=["true"],
+                        workdir=str(tmp_path / "work"))
+    cfg = NodeConfig(project="p", node="B", data_dir=str(tmp_path / "data"), agents=[agent])
+    ledger = Ledger(cfg.db_path)
+    hub = Hub(cfg, None, ledger)
+    ledger.create_owned_task(Envelope(type="REQUEST", sender="A:x", to="B:desk", task_id="T-w",
+                                      body=request_body("t", "t")))
+    ledger.update_task("T-w", "owner", status="RUNNING")
+    assert ledger.claim_task("T-w", "worker", ("RUNNING",)) is None
+    try:
+        with pytest.raises(PermissionError, match="worker"):
+            await tools.report_progress(hub, "B:desk", "the session speaks for the worker", task_id="T-w")
+        assert ledger.task("T-w", "owner")["status"] == "RUNNING"
+    finally:
+        ledger.close()

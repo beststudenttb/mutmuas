@@ -176,7 +176,7 @@ daemon (`launchctl kickstart -k …` / `systemctl --user restart mutmuas-agent-n
   mode: worker
   runtime: claude-code          # claude-code | codex | script
   model: opus                   # optional; empty = CLI default
-  workdir: ~/work/visual_rl
+  workdir: ~/mutmuas/work/representation/visual-rl   # function x project directory (v4), not in a repo
   repo: ~/work/visual_rl        # optional: kind=code tasks get their own git worktree
   code_mode: copy               # copy (default): kind=code works on a private worktree of repo;
                                 # direct: edit code_dirs in place and commit (project-level work, D-031)

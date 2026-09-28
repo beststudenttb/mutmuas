@@ -34,8 +34,8 @@ from .bus import Names
 from .config import AgentConfig, NodeConfig
 from .hub import Hub
 from .ids import Address, now_iso, parse_iso
-from .protocol import (REQUEST_KINDS, TERMINAL_STATES, ArtifactRef, Envelope, ProtocolError, reply_required,
-                       result_body, task_state_for_result)
+from .protocol import (OPEN_STATES, REQUEST_KINDS, TERMINAL_STATES, ArtifactRef, Envelope, ProtocolError,
+                       reply_required, result_body, task_state_for_result)
 from .runtime import TaskContext, make_runtime
 from .visibility import CARD_KEYS, accepts_kinds, acl, short
 from .worktree import GitError, Worktree
@@ -47,7 +47,6 @@ log = logging.getLogger(__name__)
 AUTO_WORKER_GRACE_S = 120
 SESSION_STALE_S = 50          # the session's MCP process beats every 15 s (mcp_server.HEARTBEAT_S)
 FOLLOW_UP_EVERY_S = 30
-OPEN_STATES = ("PENDING", "ACCEPTED", "RUNNING", "WAITING", "BLOCKED")
 
 
 def _pid_alive(pid: int) -> bool:
@@ -282,8 +281,11 @@ class NodeDaemon:
             agent = self._agent_cfg(task["owner"])
             if agent is None or (agent.mode != "worker" and not agent.auto_worker):
                 continue
-            if agent.auto_worker and (task["status"] == "PENDING" or task.get("runner") != "worker"):
-                continue        # the session's, or not taken yet: _auto_dispatch decides
+            # auto_worker: PENDING is for _auto_dispatch (it checks the session) and a session's task stays its
+            # own; an ACCEPTED task nobody claimed yet (the daemon stopped between the ACK and the queue: Codex
+            # review of 6116466) is queued again, and the runner's claim still checks the session.
+            if agent.auto_worker and (task["status"] == "PENDING" or task.get("runner") == "session"):
+                continue
             if task["status"] == "RUNNING":
                 await hub.owner_transition(task["task_id"], "ACCEPTED",
                                            f"node {self.cfg.node} restarted; task will be resumed")
@@ -832,7 +834,7 @@ class NodeDaemon:
             addr = str(Address(self.cfg.node, agent.id))
             running = [t for t in self._running if t in self._queued.get(addr, set())]
             owned_open = hub.ledger.tasks(role="owner", local_agent=addr,
-                                          statuses=("PENDING", "ACCEPTED", "RUNNING", "WAITING", "BLOCKED"))
+                                          statuses=OPEN_STATES)
             if agent.mode == "interactive":      # an accepted task is RUNNING until its result is submitted
                 running = [t["task_id"] for t in owned_open if t["status"] == "RUNNING"]
             state = state_override or ("working" if running else "idle")
