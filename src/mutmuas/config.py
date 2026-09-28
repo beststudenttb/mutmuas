@@ -40,6 +40,8 @@ class AgentConfig:
     description: str = ""
     workdir: str = "."
     repo: str = ""                       # git repo for kind=code tasks (each task gets its own worktree)
+    auto_worker: bool = False            # interactive only: while no session holds the agent, the daemon runs its
+                                         # tasks as a worker (runtime); the leader's session always comes first
     code_mode: str = "copy"              # copy: kind=code works on a private worktree of `repo` (the mutmuas kernel);
                                          # direct: the worker edits code_dirs in place and commits (D-031)
     code_dirs: list[str] = field(default_factory=list)            # project code a worker reaches via --add-dir
@@ -66,7 +68,9 @@ class AgentConfig:
         check_token(self.id, "agent id")
         if self.mode not in MODES:
             raise ConfigError(f"agent {self.id}: mode must be one of {MODES}")
-        if self.mode == "worker":
+        if self.auto_worker and self.mode != "interactive":
+            raise ConfigError(f"agent {self.id}: auto_worker is for interactive agents (a worker always runs its tasks)")
+        if self.mode == "worker" or self.auto_worker:
             if self.runtime not in RUNTIMES:
                 raise ConfigError(f"agent {self.id}: worker agents need runtime in {RUNTIMES}")
             if self.runtime == "script" and not self.command:

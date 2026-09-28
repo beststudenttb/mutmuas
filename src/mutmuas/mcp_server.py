@@ -103,8 +103,15 @@ def reminder_notice(r: dict[str, Any]) -> dict[str, Any]:
             "meta": {"reminder": str(r["id"]), "due": r["due"]}}
 
 
+def holds_session(agent, worker_task: str | None) -> bool:
+    """Does this MCP server beat as the agent's session (and so hold its lease)? A session of an interactive
+    agent does; a worker's task does not (decided by the config and by how the daemon started it, not by an
+    environment variable). Claiming --worker-task only gives up the lease, so it cannot be abused to take one."""
+    return agent.mode == "interactive" and not worker_task
+
+
 def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = None,
-                 channel: bool = False) -> MCPServer:
+                 channel: bool = False, worker_task: str | None = None) -> MCPServer:
     state: dict[str, Any] = {}
     io = io if io is not None else {}
 
@@ -165,8 +172,7 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         state["code"] = await asyncio.to_thread(_code_version)
         state["me"] = str(hub.local_agent(me)[0])
         background = []
-        if hub.local_agent(me)[1].mode == "interactive":   # a session holds the lease; a worker's task does not
-                                                          # (decided by the config, not by an environment variable)
+        if holds_session(hub.local_agent(me)[1], worker_task):
             background.append(asyncio.create_task(heartbeat(hub, state["me"])))
             if channel:
                 background.append(asyncio.create_task(push(hub, state["me"], hub.ledger.last_rowid())))
@@ -347,16 +353,17 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
     return server
 
 
-def run(cfg: NodeConfig, me: str | None, channel: bool = False) -> None:
+def run(cfg: NodeConfig, me: str | None, channel: bool = False, worker_task: str | None = None) -> None:
     """channel: declare the Claude Code channel capability and push new mail into the session
-    (start the session with --channels / --dangerously-load-development-channels server:mutmuas)."""
+    (start the session with --channels / --dangerously-load-development-channels server:mutmuas).
+    worker_task: this server serves a daemon-run task (auto_worker), not a session."""
     logging.basicConfig(level=logging.WARNING)   # stdout belongs to the MCP protocol
-    anyio.run(serve_stdio, cfg, me, channel)
+    anyio.run(serve_stdio, cfg, me, channel, worker_task)
 
 
-async def serve_stdio(cfg: NodeConfig, me: str | None, channel: bool = False) -> None:
+async def serve_stdio(cfg: NodeConfig, me: str | None, channel: bool = False, worker_task: str | None = None) -> None:
     io: dict[str, Any] = {}
-    server = build_server(cfg, me, io=io, channel=channel)
+    server = build_server(cfg, me, io=io, channel=channel, worker_task=worker_task)
     low = server._lowlevel_server
     options = low.create_initialization_options(
         experimental_capabilities={"claude/channel": {}} if channel else None)

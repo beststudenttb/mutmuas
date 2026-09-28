@@ -40,6 +40,7 @@ class TaskContext:
     attempt: int = 1
     workdir: Path | None = None          # isolated git worktree for code tasks
     git_branch: str | None = None
+    on_spawn: Any = None                 # called with the process id once the agent process exists
 
     @property
     def cwd(self) -> Path:
@@ -112,6 +113,8 @@ class SubprocessRuntime:
             proc = await asyncio.create_subprocess_exec(
                 *argv, cwd=str(workdir), env=ctx.env(), stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=logf, start_new_session=True)
+            if ctx.on_spawn:
+                ctx.on_spawn(proc.pid)
             tail = bytearray()
             try:
                 if stdin is not None:
@@ -143,7 +146,8 @@ class ScriptRuntime(SubprocessRuntime):
 
 
 def _mcp_server_spec(ctx: TaskContext) -> dict[str, Any]:
-    return {"command": sys.executable, "args": ["-m", "mutmuas.cli", "mcp"],
+    # --worker-task: this MCP server serves a daemon-run task, not a session (it must not hold the session)
+    return {"command": sys.executable, "args": ["-m", "mutmuas.cli", "mcp", "--worker-task", ctx.task_id],
             "env": {"MUTMUAS_CONFIG": str(ctx.node.path or ""), "MUTMUAS_AGENT": ctx.address,
                     "MUTMUAS_TASK_ID": ctx.task_id}}
 

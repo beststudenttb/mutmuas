@@ -42,6 +42,9 @@ from .worktree import GitError, Worktree
 
 log = logging.getLogger(__name__)
 
+# auto_worker (D-030): after a session ends, wait this long before running tasks as a worker again (it may only
+# be the leader restarting his terminal).
+AUTO_WORKER_GRACE_S = 120
 SESSION_STALE_S = 50          # the session's MCP process beats every 15 s (mcp_server.HEARTBEAT_S)
 FOLLOW_UP_EVERY_S = 30
 OPEN_STATES = ("PENDING", "ACCEPTED", "RUNNING", "WAITING", "BLOCKED")
@@ -61,6 +64,18 @@ def _pid_alive(pid: int) -> bool:
 
 def session_alive(session: dict[str, Any]) -> bool:
     return session_fields(session, Path("/")).get("session") == "online"
+
+
+def session_present(ledger, agent: str) -> str | None:
+    """auto_worker: why the leader's session counts as there (live, or gone less than AUTO_WORKER_GRACE_S ago),
+    or None when the daemon may run the agent's tasks as a worker."""
+    row = ledger.session_of(agent)
+    if not row:
+        return None
+    if session_alive(row):
+        return "a session holds the agent"
+    age = (datetime.now(timezone.utc) - parse_iso(row["last_seen"])).total_seconds()
+    return "a session ended moments ago (grace period)" if age < AUTO_WORKER_GRACE_S else None
 
 
 # The lease decision trusts the process tree, so the tree must not come from anything the caller controls:
@@ -111,6 +126,9 @@ def lease_refusal(ledger, agent: str) -> str | None:
     # an upgrade: then the MCP process's own parent is the session.
     session = row.get("session_pid") or next(iter(_ancestors(row["pid"])[:1]), None)
     allowed = {row["pid"], session} - {None, 0}
+    # auto_worker: a task the daemon started before the session came is finished, not interrupted (D-032a);
+    # its processes descend from the pid the daemon recorded when it spawned them.
+    allowed |= ledger.worker_pids(agent)
     if allowed & {os.getpid(), *_ancestors(os.getpid())}:
         return None
     return (f"{agent} is held by another session (process {row['pid']}, directory {row.get('cwd')}); this process "
@@ -183,7 +201,7 @@ class NodeDaemon:
             sub = await hub.bus.ensure_inbox(Address(self.cfg.node, agent.id))
             self._spawn(self._receiver(addr, sub), f"recv:{addr}")
             self._spawn(self._dispatcher(agent, addr), f"dispatch:{addr}")
-            if agent.mode == "worker":
+            if agent.mode == "worker" or agent.auto_worker:
                 self._queues[addr] = asyncio.Queue()
                 for i in range(max(1, agent.max_concurrent)):
                     self._spawn(self._runner(agent, addr), f"run:{addr}:{i}")
@@ -261,8 +279,10 @@ class NodeDaemon:
         # every open task, not just the newest page (A:codex: a backlog > 200 left old tasks stuck)
         for task in hub.ledger.tasks(role="owner", statuses=("PENDING", "ACCEPTED", "RUNNING"), limit=None):
             agent = self._agent_cfg(task["owner"])
-            if agent is None or agent.mode != "worker":
+            if agent is None or (agent.mode != "worker" and not agent.auto_worker):
                 continue
+            if agent.auto_worker and (task["status"] == "PENDING" or task.get("runner") != "worker"):
+                continue        # the session's, or not taken yet: _auto_dispatch decides
             if task["status"] == "RUNNING":
                 await hub.owner_transition(task["task_id"], "ACCEPTED",
                                            f"node {self.cfg.node} restarted; task will be resumed")
@@ -491,7 +511,7 @@ class NodeDaemon:
                 return "handled", f"rejected: {denial}"
             return "rejected"
         await hub.publish_task_record(env.task_id)
-        if agent.mode == "worker":
+        if agent.mode == "worker" or (agent.auto_worker and not session_present(hub.ledger, env.to)):
             await self._accept(env.task_id)
             self._enqueue(env.to, env.task_id)
             await self._notify(agent, env.to, env.task_id,      # status layer only: the lead is no participant
@@ -599,6 +619,18 @@ class NodeDaemon:
         task = hub.ledger.task(task_id, "owner")
         if task is None or task["status"] in TERMINAL_STATES:
             return
+        if agent.auto_worker:
+            # Claim it for the worker in one transaction with the session check: never done twice, and while
+            # the leader's session is there, a task that has not started yet is his to decide (D-032a).
+            addr = task["owner"]
+            refused = hub.ledger.claim_task(task_id, "worker", ("ACCEPTED", "RUNNING"),
+                                            refuse_if=lambda: session_present(hub.ledger, addr))
+            if refused:
+                if "session" in refused and task["status"] == "ACCEPTED":
+                    await hub.owner_transition(task_id, "PENDING", f"{addr}'s session is online: left for it")
+                    hub.ledger.release_task(task_id, "worker")
+                log.info("task %s not run as a worker: %s", task_id, refused)
+                return
         attempt = hub.ledger.bump_attempts(task_id)
         if attempt > agent.max_attempts:
             await hub.finish(task_id, result_body(
@@ -609,6 +641,8 @@ class NodeDaemon:
         timeout = float(request.body.get("timeout_s") or agent.task_timeout_s)
         hub.ledger.update_task(task_id, "owner", result_draft=None)
         ctx = TaskContext(task_id, request, agent, self.cfg, attempt)
+        if agent.auto_worker:
+            ctx.on_spawn = lambda pid: hub.ledger.set_runner_pid(task_id, pid)
         wt = None
         if request.body.get("kind") == "code" and agent.copies_code:
             inputs = request.body.get("inputs")
@@ -697,6 +731,7 @@ class NodeDaemon:
             await asyncio.sleep(self.cfg.heartbeat_s)
             try:
                 await self._publish_cards()
+                await self._auto_dispatch()
                 if asyncio.get_running_loop().time() - last_follow_up >= FOLLOW_UP_EVERY_S:
                     last_follow_up = asyncio.get_running_loop().time()
                     await self._follow_ups()
@@ -740,7 +775,8 @@ class NodeDaemon:
                 if deadline and parse_iso(deadline) < now and hub.ledger.notice_once(t["task_id"], "overdue"):
                     await self._follow_up(t, "overdue", f"{t['owner']} has not replied to {t['task_id']} "
                                                         f"(deadline {deadline}, status {t['status']})")
-            if (card.get("mode") == "interactive" and card.get("session") == "offline" and t["status"] == "PENDING"
+            if (card.get("mode") == "interactive" and not card.get("auto_worker")    # auto_worker: a worker takes it
+                    and card.get("session") == "offline" and t["status"] == "PENDING"
                     and hub.ledger.notice_once(t["task_id"], "session_offline")):
                 await self._follow_up(t, "session_offline", f"{t['owner']}'s node is up but its session is "
                                                             f"offline: {t['task_id']} waits unread")
@@ -755,6 +791,18 @@ class NodeDaemon:
                                                    "follow_up": reason, **extra}))
             except Exception as e:
                 log.warning("follow-up to %s failed: %r", target, e)
+
+    async def _auto_dispatch(self) -> None:
+        """auto_worker agents with no session (past the grace period): run the tasks still waiting for one."""
+        hub = self.hub
+        for agent in self.cfg.agents:
+            addr = str(Address(self.cfg.node, agent.id))
+            if not agent.auto_worker or session_present(hub.ledger, addr):
+                continue
+            for task in hub.ledger.tasks(role="owner", local_agent=addr, statuses=("PENDING",), limit=None):
+                if task.get("runner") is None and task["task_id"] not in self._queued[addr]:
+                    await self._accept(task["task_id"])
+                    self._enqueue(addr, task["task_id"])
 
     async def _publish_cards(self, state_override: str | None = None) -> None:
         hub = self.hub
@@ -783,6 +831,7 @@ class NodeDaemon:
             card = {
                 "address": addr, "node": self.cfg.node, "agent_id": agent.id, "display": agent.display,
                 "role": agent.role, "provider": agent.provider, "mode": agent.mode,
+                **({"auto_worker": True} if agent.auto_worker else {}),
                 "capabilities": agent.capabilities, "accepts_kinds": accepts_kinds(agent.permissions),
                 # Public layer only (visibility.py): coarse availability, no current task, queue or inbox
                 # counts, no session directory. The agent reads its own details locally (whoami).

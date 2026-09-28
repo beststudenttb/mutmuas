@@ -78,6 +78,16 @@ elif action == "sleep":
     time.sleep(float(inputs.get("seconds", 5)))
     print(json.dumps({"status": "complete", "summary": "slept"}))
 
+elif action == "wait_file":
+    # Runs until the test creates inputs["release"]; then reports progress through agentctl (which goes through
+    # the lease check: a session may hold the agent meanwhile) and finishes.
+    release = Path(inputs["release"])
+    deadline = time.time() + float(inputs.get("max_s", 30))
+    while not release.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    agentctl("update", "released, finishing")
+    print(json.dumps({"status": "complete", "summary": f"waited for {release.name}"}))
+
 elif action == "crash":
     print("fatal error: about to crash", file=sys.stderr)
     sys.exit(3)

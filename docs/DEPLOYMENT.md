@@ -229,6 +229,27 @@ Then just say it in the session: *"Ask B for last week's representation experime
 calls `find_agent`, `send_request`, `wait_for_result` and `fetch_artifact` by itself. Use one
 interactive agent id per concurrently open session, because sessions that share an id share an inbox.
 
+**One address, two ways of working** (`auto_worker`, staff system v4, D-030/D-032a): an interactive agent
+with `auto_worker: true` and a worker `runtime` is run by the daemon as a worker while no session holds it.
+
+```yaml
+- id: paper-visualrl
+  mode: interactive
+  auto_worker: true
+  runtime: claude-code
+  workdir: ~/mutmuas/work/paper/visualrl
+```
+
+- No session (and none for `AUTO_WORKER_GRACE_S`, 120 s, so a restarted terminal does not count as gone):
+  a REQUEST is accepted and run as a worker task.
+- The leader's session is there: requests are listed in its inbox and not run; the leader decides.
+  A task queued for the worker but not started yet goes back to PENDING for the session.
+- A worker already running when the session comes is not interrupted. The session sees it in
+  `whoami` (`worker_running`: task, since, latest end) and may neither accept it nor deliver its result;
+  the worker's own processes keep acting as the agent (the lease admits the pid the daemon recorded).
+- Who does a task is claimed in the ledger (`tasks.runner`: worker | session) in one transaction with the
+  session check, so a task is never done twice.
+
 ## 6. Test A → B
 
 1. Add a self-test worker to B's `node.yaml` and restart B's daemon:

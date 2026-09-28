@@ -14,7 +14,8 @@ from pathlib import Path
 from typing import Any
 
 from .hub import Hub
-from .visibility import acl, artifact_visible, is_participant, message_visible
+from .ids import parse_iso
+from .visibility import acl, artifact_visible, is_participant, message_visible, short
 from .protocol import TERMINAL_STATES, ArtifactRef, Envelope, request_body, result_body
 
 
@@ -221,6 +222,10 @@ async def _read_receipts(hub: Hub, me: str, envs: list[Envelope], read: bool = T
 
 async def accept_task(hub: Hub, me: str, task_id: str) -> dict[str, Any]:
     _owned(hub, me, task_id)
+    refused = hub.ledger.claim_task(task_id, "session", OPEN_STATES)
+    if refused and "worker" in refused:
+        raise PermissionError(f"{task_id} is being done by the worker the daemon started before this session; "
+                              "it is not interrupted (D-032a): wait for its result (whoami: worker_running)")
     ok = await hub.owner_transition(task_id, "RUNNING", f"accepted by {me}", msg_type="ACK",
                                     body={"state": "RUNNING", "message": f"accepted by {me}"})
     return {"task_id": task_id, "accepted": ok}
@@ -258,6 +263,7 @@ async def submit_result(hub: Hub, me: str, status: str, summary: str, *, task_id
     task = _owned(hub, me, task_id)
     if task["status"] in TERMINAL_STATES:
         return {"task_id": task_id, "error": f"task already {task['status']}; result not changed"}
+    _check_runner(task)
     body = result_body(status, summary, outputs=outputs, evidence=evidence, limitations=limitations,
                        follow_up=follow_up)
     if next:
@@ -383,7 +389,20 @@ async def whoami(hub: Hub, me: str | None = None) -> dict[str, Any]:
            "coordinator": str(addr) in (hub.cfg.coordinators or [])}
     if agent.mode == "interactive":
         out.update(session_fields(hub.ledger.session_of(str(addr)), agent.workdir_path))
+    if agent.auto_worker:
+        out["auto_worker"] = True
+        out["worker_running"] = [_worker_run(hub, t, agent) for t in hub.ledger.tasks(
+            role="owner", local_agent=str(addr), statuses=("ACCEPTED", "RUNNING")) if t.get("runner") == "worker"]
     return out
+
+
+def _worker_run(hub: Hub, task: dict[str, Any], agent) -> dict[str, Any]:
+    """What the session sees of a task the worker is doing: which, since when, and when it ends at the latest."""
+    timeout = float((task.get("request") or {}).get("timeout_s") or agent.task_timeout_s)
+    since = parse_iso(task["updated_at"])
+    return {"task_id": task["task_id"], "status": task["status"], "requester": task["requester"],
+            "objective": short((task.get("request") or {}).get("objective")), "since": task["updated_at"],
+            "latest_end": (since + timedelta(seconds=timeout)).isoformat(timespec="seconds")}
 
 
 async def list_artifacts(hub: Hub, me: str | None = None) -> list[dict[str, Any]]:
@@ -414,6 +433,19 @@ async def fetch_artifact(hub: Hub, uri: str, dest_dir: str | None = None, sha256
     ref = ArtifactRef(uri=uri, sha256=sha256)
     path = await hub.artifacts.fetch(ref, dest)
     return {"uri": uri, "path": str(path), "size": path.stat().st_size if path.is_file() else None}
+
+
+OPEN_STATES = ("PENDING", "ACCEPTED", "RUNNING", "WAITING", "BLOCKED")
+
+
+def _check_runner(task: dict[str, Any]) -> None:
+    """auto_worker: only whoever holds the task may deliver its result, so it is never done twice (D-032)."""
+    from .node import _ancestors
+    in_worker = task.get("runner_pid") in {os.getpid(), *_ancestors(os.getpid())} - {None}
+    if task.get("runner") == "worker" and not in_worker:
+        raise PermissionError(f"{task['task_id']} is being done by the worker; only it delivers the result")
+    if task.get("runner") == "session" and task["task_id"] == _current_task():
+        raise PermissionError(f"{task['task_id']} was taken by the session; a worker may not deliver it")
 
 
 def _owned(hub: Hub, me: str, task_id: str) -> dict[str, Any]:
