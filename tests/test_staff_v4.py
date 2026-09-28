@@ -217,3 +217,54 @@ async def test_session_cannot_report_progress_on_a_worker_task(tmp_path):
         assert ledger.task("T-w", "owner")["status"] == "RUNNING"
     finally:
         ledger.close()
+
+
+async def test_an_adopted_worker_delivers_its_result_after_it_ends(tmp_path):
+    """Codex review of ba28e70: after an unclean restart the old worker is watched, not run again nor handed
+    to the session; when it ends, the result it submitted (the draft) is delivered."""
+    import asyncio
+    import subprocess
+    import sys
+
+    from mutmuas.config import AgentConfig, NodeConfig
+    from mutmuas.hub import Hub
+    from mutmuas.ledger import Ledger
+    from mutmuas.node import NodeDaemon, proc_start
+    from mutmuas.protocol import Envelope, request_body
+    agent = AgentConfig(id="desk", mode="interactive", auto_worker=True, runtime="script", command=["true"],
+                        workdir=str(tmp_path / "work"))
+    cfg = NodeConfig(project="p", node="B", data_dir=str(tmp_path / "data"), agents=[agent])
+    ledger = Ledger(cfg.db_path)
+    hub = Hub(cfg, None, ledger)
+    ledger.create_owned_task(Envelope(type="REQUEST", sender="A:x", to="B:desk", task_id="T-orphan",
+                                      body=request_body("t", "t")))
+    ledger.update_task("T-orphan", "owner", status="RUNNING")
+    assert ledger.claim_task("T-orphan", "worker", ("RUNNING",)) is None
+    orphan = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    ledger.set_runner_pid("T-orphan", orphan.pid, proc_start(orphan.pid))
+    ledger.update_task("T-orphan", "owner", result_draft={"status": "complete", "summary": "done by the orphan"})
+    daemon = NodeDaemon(cfg)
+    daemon.hub = hub
+    daemon._queues["B:desk"] = asyncio.Queue()
+    daemon._queued["B:desk"] = set()
+    try:
+        await daemon.recover()
+        assert daemon._background and not daemon._queued["B:desk"]        # watched, not queued again
+        orphan.terminate()
+        orphan.wait(5)
+        await asyncio.wait_for(asyncio.gather(*daemon._background), 10)
+        task = ledger.task("T-orphan", "owner")
+        assert task["status"] == "COMPLETED" and task["result"]["summary"] == "done by the orphan"
+    finally:
+        if orphan.poll() is None:
+            orphan.kill()
+        ledger.close()
+
+
+def test_a_reused_pid_is_not_the_recorded_worker():
+    import os
+
+    from mutmuas.node import proc_start, same_process
+    assert same_process(os.getpid(), proc_start(os.getpid()))
+    assert not same_process(os.getpid(), "a start time of another process")
+    assert not same_process(None, None)

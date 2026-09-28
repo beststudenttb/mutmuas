@@ -136,6 +136,7 @@ class Ledger:
         # Claimed in one transaction, so a task is never done twice (D-032).
         self._add_column("tasks", "runner", "TEXT")
         self._add_column("tasks", "runner_pid", "INTEGER")
+        self._add_column("tasks", "runner_start", "TEXT")          # the process's start time: pids get reused
 
     def _add_column(self, table: str, column: str, decl: str) -> None:
         if column not in [r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")]:
@@ -343,17 +344,18 @@ class Ledger:
         self.db.execute("UPDATE tasks SET runner=NULL, runner_pid=NULL WHERE task_id=? AND role='owner'"
                         " AND runner=?", (task_id, runner))
 
-    def set_runner_pid(self, task_id: str, pid: int | None) -> None:
-        self.db.execute("UPDATE tasks SET runner_pid=? WHERE task_id=? AND role='owner' AND runner='worker'",
-                        (pid, task_id))
+    def set_runner_pid(self, task_id: str, pid: int | None, start: str | None = None) -> None:
+        self.db.execute("UPDATE tasks SET runner_pid=?, runner_start=? WHERE task_id=? AND role='owner'"
+                        " AND runner='worker'", (pid, start, task_id))
 
-    def worker_pids(self, local_agent: str) -> set[int]:
-        """Processes the daemon started for this agent's unfinished tasks (they act as the agent)."""
+    def worker_runs(self, local_agent: str) -> list[tuple[int, str | None, str]]:
+        """(pid, start time, task id) of the processes the daemon started for this agent's unfinished tasks."""
         rows = self.db.execute(
-            "SELECT runner_pid FROM tasks WHERE role='owner' AND local_agent=? AND runner='worker'"
-            f" AND runner_pid IS NOT NULL AND status NOT IN ({','.join('?' * len(TERMINAL_STATES))})",
+            "SELECT runner_pid, runner_start, task_id FROM tasks WHERE role='owner' AND local_agent=?"
+            " AND runner='worker' AND runner_pid IS NOT NULL"
+            f" AND status NOT IN ({','.join('?' * len(TERMINAL_STATES))})",
             (local_agent, *TERMINAL_STATES)).fetchall()
-        return {r[0] for r in rows}
+        return [(r[0], r[1], r[2]) for r in rows]
 
     def session_contenders(self, local_agent: str) -> list[dict[str, Any]]:
         return [dict(r) for r in self.db.execute("SELECT * FROM session_contenders WHERE local_agent=?",

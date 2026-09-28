@@ -21,6 +21,7 @@ import contextlib
 import json
 import logging
 import os
+import signal
 import platform
 import socket
 from datetime import datetime, timezone
@@ -100,6 +101,32 @@ def _ppid(pid: int) -> int | None:
         return None
 
 
+def proc_start(pid: int) -> str | None:
+    """When a process started (identifies it across pid reuse), from /proc or an absolute-path ps."""
+    stat = Path(f"/proc/{pid}/stat")
+    if stat.exists():
+        try:
+            return stat.read_text().rsplit(")", 1)[1].split()[19]            # field 22: starttime
+        except (OSError, IndexError):
+            return None
+    if _PS is None:
+        return None
+    import subprocess
+    out = subprocess.run([_PS, "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                         env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+    return out.stdout.strip() or None
+
+
+def same_process(pid: int | None, start: str | None) -> bool:
+    """The recorded process is still running (not a new process that got the same pid)."""
+    return bool(pid) and _pid_alive(pid) and (start is None or proc_start(pid) == start)
+
+
+def live_worker_runs(ledger, agent: str) -> dict[int, str]:
+    """pid -> task id of the daemon-started worker processes of `agent` that are still running."""
+    return {pid: task_id for pid, start, task_id in ledger.worker_runs(agent) if same_process(pid, start)}
+
+
 def _ancestors(pid: int) -> list[int]:
     """pid's parent chain, from /proc or an absolute-path ps (never PATH)."""
     chain, seen = [], set()
@@ -127,7 +154,7 @@ def lease_refusal(ledger, agent: str) -> str | None:
     allowed = {row["pid"], session} - {None, 0}
     # auto_worker: a task the daemon started before the session came is finished, not interrupted (D-032a);
     # its processes descend from the pid the daemon recorded when it spawned them.
-    allowed |= ledger.worker_pids(agent)
+    allowed |= set(live_worker_runs(ledger, agent))
     if allowed & {os.getpid(), *_ancestors(os.getpid())}:
         return None
     return (f"{agent} is held by another session (process {row['pid']}, directory {row.get('cwd')}); this process "
@@ -285,6 +312,12 @@ class NodeDaemon:
             # own; an ACCEPTED task nobody claimed yet (the daemon stopped between the ACK and the queue: Codex
             # review of 6116466) is queued again, and the runner's claim still checks the session.
             if agent.auto_worker and (task["status"] == "PENDING" or task.get("runner") == "session"):
+                continue
+            if agent.auto_worker and same_process(task.get("runner_pid"), task.get("runner_start")):
+                # The daemon stopped uncleanly and the worker (its own process group) still runs: never run it
+                # a second time nor hand it to the session; watch it and deliver what it leaves (Codex review
+                # of ba28e70).
+                self._background_job(self._adopt(agent, task))
                 continue
             if task["status"] == "RUNNING":
                 await hub.owner_transition(task["task_id"], "ACCEPTED",
@@ -631,6 +664,9 @@ class NodeDaemon:
         task = hub.ledger.task(task_id, "owner")
         if task is None or task["status"] in TERMINAL_STATES:
             return
+        if agent.auto_worker and same_process(task.get("runner_pid"), task.get("runner_start")):
+            log.info("task %s: its worker from before a restart still runs; adopted, not started again", task_id)
+            return
         if agent.auto_worker:
             # Claim it for the worker in one transaction with the session check: never done twice, and while
             # the leader's session is there, a task that has not started yet is his to decide (D-032a).
@@ -654,7 +690,7 @@ class NodeDaemon:
         hub.ledger.update_task(task_id, "owner", result_draft=None)
         ctx = TaskContext(task_id, request, agent, self.cfg, attempt)
         if agent.auto_worker:
-            ctx.on_spawn = lambda pid: hub.ledger.set_runner_pid(task_id, pid)
+            ctx.on_spawn = lambda pid: hub.ledger.set_runner_pid(task_id, pid, proc_start(pid))
         wt = None
         if request.body.get("kind") == "code" and agent.copies_code:
             inputs = request.body.get("inputs")
@@ -803,6 +839,31 @@ class NodeDaemon:
                                                    "follow_up": reason, **extra}))
             except Exception as e:
                 log.warning("follow-up to %s failed: %r", target, e)
+
+    async def _adopt(self, agent: AgentConfig, task: dict[str, Any]) -> None:
+        """A worker that outlived the daemon: wait for it to end (stop its process group at the task's time
+        limit), then deliver the result it submitted, or queue the task again if it left none."""
+        hub, task_id = self.hub, task["task_id"]
+        pid, start = task["runner_pid"], task.get("runner_start")
+        timeout = float((task.get("request") or {}).get("timeout_s") or agent.task_timeout_s)
+        deadline = parse_iso(task["updated_at"]).timestamp() + timeout
+        while same_process(pid, start):
+            if datetime.now(timezone.utc).timestamp() > deadline:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(pid, signal.SIGTERM)
+            await asyncio.sleep(1)
+        current = hub.ledger.task(task_id, "owner")
+        if current is None or current["status"] in TERMINAL_STATES:
+            return
+        draft = current.get("result_draft")
+        if draft:
+            draft = dict(draft)
+            refs = [ArtifactRef.from_dict(a) for a in draft.pop("artifacts", None) or []]
+            await hub.finish(task_id, draft, refs)
+            return
+        hub.ledger.set_runner_pid(task_id, None)
+        await hub.owner_transition(task_id, "ACCEPTED", "its worker ended without a result; will run again")
+        self._enqueue(task["owner"], task_id)
 
     async def _auto_dispatch(self) -> None:
         """auto_worker agents with no session (past the grace period): run the tasks still waiting for one."""
