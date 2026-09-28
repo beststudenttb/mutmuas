@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -40,20 +41,36 @@ async def find_agent(hub: Hub, capability: str) -> dict[str, Any]:
             "alternatives": [c["address"] for c in candidates[1:]]}
 
 
+DEADLINE_MARGIN_S = 1800     # a default deadline comes at least this long after the task's timeout_s
+
+
 async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, *, kind: str = "query",
                        inputs: Any = None, expected_outputs: Any = None, constraints: Any = None,
                        acceptance_criteria: Any = None, timeout_s: float | None = None,
                        deadline: str | None = None, artifacts: list[dict] | None = None,
                        parent_task: str | None = None, priority: str = "normal",
                        reply: str | None = None, observers: list[str] | None = None) -> dict[str, Any]:
+    default_deadline = None
+    if not deadline and reply != "none" and hub.cfg.default_reply_deadline_s > 0:
+        # Without a deadline nothing ever chases a missing reply (no-stall design, G3): take the node's default,
+        # but never before the task's own run limit plus a margin, or a long task would be chased while it
+        # still runs normally (C's review of 6a5e2f1).
+        wait_s = hub.cfg.default_reply_deadline_s
+        if timeout_s:
+            wait_s = max(wait_s, timeout_s + DEADLINE_MARGIN_S)
+        default_deadline = (datetime.now(timezone.utc) + timedelta(seconds=wait_s)).isoformat(timespec="seconds")
     body = request_body(objective, reason, kind=kind, inputs=inputs, expected_outputs=expected_outputs,
                         constraints=constraints, acceptance_criteria=acceptance_criteria,
-                        deadline=deadline, timeout_s=timeout_s, reply=reply, observers=observers)
+                        deadline=deadline or default_deadline, timeout_s=timeout_s, reply=reply, observers=observers,
+                        deadline_default=bool(default_deadline))  # the owner can tell it from a chosen one
     target = await hub.card_or_none(to)
     task_id, delivery = await hub.request(
         me, to, body, artifacts=[ArtifactRef.from_dict(a) for a in artifacts or []],
         parent_task=parent_task or _current_task(), priority=priority)
     out = {"task_id": task_id, "to": await hub.resolve(to), "delivery": delivery}
+    if default_deadline:
+        out["note_deadline"] = (f"default deadline {default_deadline} (node.yaml default_reply_deadline_s); "
+                                "pass deadline= to set your own")
     if delivery == "queued":
         out["note"] = "message bus unreachable; kept in the local outbox and sent automatically on reconnect"
     elif target is None:
@@ -96,7 +113,9 @@ async def wait_for_result(hub: Hub, task_id: str, timeout_s: float = 600, me: st
 # Messages that need a decision from the recipient; ACKs and progress UPDATEs are informational.
 ACTIONABLE = ("REQUEST", "QUESTION", "ANSWER", "RESULT", "BLOCKED", "REJECT", "CANCEL", "ERROR")
 # What should interrupt an interactive session right away: someone needs *me* to act. RESULTs of my own
-# requests are not in it: they are read when I next look, or when I explicitly wait on that task.
+# requests are not in it: they are read when I next look, or when I explicitly wait on that task. Exception:
+# an agent with wake_on_own_results (node.yaml, per agent, default off) is also woken by the RESULT of its own
+# request that wants a reply (ledger._type_filter; docs/MESSAGE_PROTOCOL.md "Waking").
 WAKE = ("REQUEST", "QUESTION", "ANSWER", "BLOCKED", "REJECT", "CANCEL", "ERROR")
 
 
@@ -111,18 +130,20 @@ async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, 
     addr, _ = hub.local_agent(me)
     # A message that hands me the baton (body.next == me) needs me as much as a REQUEST does.
     next_to = str(addr) if types == WAKE else None
+    own_results = bool(next_to) and hub.local_agent(me)[1].wake_on_own_results   # no-stall G2, per agent, off
+                                                                                 # unless the leader turns it on
     if wait_s and not include_seen:
         # Messages reach this node's ledger through the daemon, so waiting on the ledger is enough
         # (a second JetStream consumer on the same mailbox would split the messages).
         deadline = asyncio.get_running_loop().time() + wait_s
-        while (hub.ledger.unseen_count(str(addr), types, since, next_to=next_to) == 0
+        while (hub.ledger.unseen_count(str(addr), types, since, next_to=next_to, own_results=own_results) == 0
                and asyncio.get_running_loop().time() < deadline):
             await asyncio.sleep(0.5)
     if include_seen:
         envs = hub.ledger.list_recent_inbound(str(addr), limit, show=show)
     else:
         envs = hub.ledger.unseen(str(addr), limit, mark=not peek, types=types, since=since, next_to=next_to,
-                                 show=show)
+                                 show=show, own_results=own_results)
         if not peek:
             await _read_receipts(hub, str(addr), envs)
     meta = {r[0]: (r[1], r[2], r[3]) for r in hub.ledger.db.execute(

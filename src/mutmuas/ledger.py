@@ -226,25 +226,34 @@ class Ledger:
                         (state, error, now_iso(), message_id))
 
     @staticmethod
-    def _type_filter(types: tuple[str, ...] | None, next_to: str | None) -> tuple[str, tuple]:
-        """types, plus (with next_to) any message that hands the baton to that agent (body.next)."""
+    def _type_filter(types: tuple[str, ...] | None, next_to: str | None,
+                     own_results: bool = False) -> tuple[str, tuple]:
+        """types, plus (with next_to, i.e. the wake view of that agent) any message that hands it the baton
+        (body.next); with own_results also the RESULT of a request it made itself that wants a reply
+        (no-stall design, G2: decided here on the requester's node, whatever version the owner runs)."""
         if not types:
             return "", ()
         in_types = f"type IN ({','.join('?' * len(types))})"
+        if next_to and own_results:
+            own_result = ("(type = 'RESULT' AND EXISTS (SELECT 1 FROM tasks t WHERE t.task_id = messages.task_id"
+                          " AND t.role = 'requester' AND t.local_agent = ?"
+                          " AND COALESCE(json_extract(t.request, '$.reply'), 'required') != 'none'))")
+            return (f" AND ({in_types} OR json_extract(envelope, '$.body.next') = ? OR {own_result})",
+                    (*types, next_to, next_to))
         if next_to:
             return f" AND ({in_types} OR json_extract(envelope, '$.body.next') = ?)", (*types, next_to)
         return f" AND {in_types}", tuple(types)
 
     def unseen(self, local_agent: str, limit: int = 50, mark: bool = True,
                types: tuple[str, ...] | None = None, since: str | None = None,
-               next_to: str | None = None, show: bool = True) -> list[Envelope]:
+               next_to: str | None = None, show: bool = True, own_results: bool = False) -> list[Envelope]:
         """Inbound messages an interactive agent has not looked at yet.
 
         Only messages the dispatcher has fully handled: a REQUEST shows up once its task exists
         (so accept_task always works), and requests rejected by policy never show up.
         """
         with self.tx() as db:
-            type_sql, type_args = self._type_filter(types, next_to)
+            type_sql, type_args = self._type_filter(types, next_to, own_results)
             # a digit-only `since` is a rowid cursor (monotonic; timestamps collide within a millisecond)
             by_row = since is not None and str(since).isdigit()
             since_sql = (" AND rowid > ?" if by_row else " AND created_at > ?") if since else ""
@@ -264,13 +273,13 @@ class Ledger:
         self.db.execute("UPDATE messages SET seen=1 WHERE direction='in' AND task_id=?", (task_id,))
 
     def unseen_count(self, local_agent: str, types: tuple[str, ...] | None = None, since: str | None = None,
-                     next_to: str | None = None) -> int:
+                     next_to: str | None = None, own_results: bool = False) -> int:
         sql = "SELECT COUNT(*) FROM messages WHERE direction='in' AND seen=0 AND state='handled' AND local_agent=?"
         args: list[Any] = [local_agent]
         if since:
             sql += " AND rowid > ?" if str(since).isdigit() else " AND created_at > ?"
             args.append(int(since) if str(since).isdigit() else since)
-        type_sql, type_args = self._type_filter(types, next_to)
+        type_sql, type_args = self._type_filter(types, next_to, own_results)
         return self.db.execute(sql + type_sql, [*args, *type_args]).fetchone()[0]
 
     def last_rowid(self) -> int:
