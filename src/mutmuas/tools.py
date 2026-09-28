@@ -49,6 +49,13 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
     body = request_body(objective, reason, kind=kind, inputs=inputs, expected_outputs=expected_outputs,
                         constraints=constraints, acceptance_criteria=acceptance_criteria,
                         deadline=deadline, timeout_s=timeout_s, reply=reply, observers=observers)
+    sender = str(hub.local_agent(me)[0])
+    for ref in artifacts or []:
+        # Attaching grants the recipient access (visibility.artifact_visible), so only what the sender may see
+        # itself can be attached: no forwarding of guessed or foreign URIs.
+        if not artifact_visible(hub.ledger, sender, ref.get("uri", "")):
+            raise PermissionError(f"{sender} may not attach {ref.get('uri')!r}: attach only artifacts you "
+                                  "published or received")
     target = await hub.card_or_none(to)
     task_id, delivery = await hub.request(
         me, to, body, artifacts=[ArtifactRef.from_dict(a) for a in artifacts or []],
