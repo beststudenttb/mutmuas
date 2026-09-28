@@ -27,7 +27,7 @@ Addresses and ids used in subjects allow `[A-Za-z0-9_-]` only.
 
 | type | direction | required body | optional body | effect on task |
 |---|---|---|---|---|
-| `REQUEST` | requester → owner | `objective`, `reason` | `kind`, `inputs`, `expected_outputs`, `constraints`, `acceptance_criteria`, `deadline`, `timeout_s`, `parent_task` | creates task (PENDING) |
+| `REQUEST` | requester → owner | `objective`, `reason` | `kind`, `inputs`, `expected_outputs`, `constraints`, `acceptance_criteria`, `deadline`, `timeout_s`, `parent_task`, `reply` | creates task (PENDING) |
 | `ACK` | owner → requester | – | `state`, `message` | ACCEPTED (or RUNNING when an interactive agent accepts) |
 | `UPDATE` | owner → requester | `message` | `state` (task state), `progress` | `state` if given |
 | `QUESTION` | either | `question` | – | requester side: WAITING |
@@ -58,6 +58,114 @@ Addresses and ids used in subjects allow `[A-Za-z0-9_-]` only.
 The daemon never upgrades a status. If the agent process exits non-zero while claiming
 `complete`, the result is downgraded to `partial` and a limitation is added. If there is no
 structured result at all, the result is `partial` (exit 0) or `failed` (non-zero).
+
+### Replies, deadlines and the baton (borrowed from email)
+
+- `reply` on a REQUEST: `required` (the default) means the owner owes a RESULT. `none` makes it a notice.
+  The receiving session reading it, with a plain `inbox` and not `--peek`, closes the task with a read receipt
+  (`RESULT complete "read by X (no reply requested)"`).
+- `deadline` (ISO 8601 with a timezone) says when the reply is needed. Use `agentctl ask --due +2h`.
+- `next: <address>` on RESULT, UPDATE, QUESTION or ANSWER names whose move it is. That agent is woken exactly
+  as by a REQUEST, even by an UPDATE. Put it on the last message of every thread whose next step belongs to
+  someone.
+
+### Waking, presence and follow-ups
+
+- **Push.** `agentctl mcp --channel` declares the Claude Code `claude/channel` capability. When a message
+  reaches the ledger that would wake the agent (a wake type, or `next` naming it), the MCP server pushes one
+  line into the running session:
+  `mutmuas: new REQUEST from A:x (task T-…): <first 80 characters>`, with meta
+  `{task_id, msg_type, sender, summary}`.
+  - Start the session with `claude --dangerously-load-development-channels server:mutmuas` until the
+    channel is approved.
+  - The push never marks anything read. Mail that arrived before the session started is not pushed, so
+    handle the backlog with `inbox`.
+  - Codex keeps `agentctl watch` → `codex queue`.
+- **Presence.** The session's own mutmuas MCP process writes a heartbeat to the node ledger every 15 s. The
+  registry card of an interactive agent then shows one of:
+  - `session: online`, or `offline` (no heartbeat for 50 s, or the process has gone);
+  - `unknown` (no mutmuas MCP server has ever run for it);
+  - `session_warning` when the session was started outside the agent's workdir. Claude Code keeps memory
+    per start directory, so a wrong start directory means an empty memory.
+- **One agent, one session.** The first session's MCP process holds the agent (a lease in the node
+  ledger). The check and the write are one transaction, so two sessions starting together cannot both win.
+  - A second session acting as the same agent is told at once and receives no mail pushes and no
+    reminders.
+  - Its MCP tools (all but `whoami`) refuse to act.
+  - `agentctl` commands for that agent are refused too, unless they run inside the holding session: a
+    descendant of the session process, such as its shell. The ancestry comes from `/proc` or `ps` by absolute
+    path, and no environment variable exempts a process.
+  - Exceptions, because they show no mail content: `status`, `agents`, `find`, and `watch --headers-only`
+    (a notifier service outside the session: count, type and sender only). `whoami` is exempt only as an MCP
+    tool; `agentctl whoami` needs the session.
+  - Only a foreground `inbox` listing counts as having shown a message; `clear_inbox` marks read only messages
+    shown that way. Notifier reads (`watch`, pushes) do not count.
+  - The holder is told about the contender. When the holder closes, the other session takes over at its
+    next heartbeat. Two projects on one machine are two agents (e.g. `C:paper` and
+  `C:course`), not two sessions of one agent.
+- **Follow-ups.** Every 30 s the requester's daemon checks the tasks it is owed. Each follow-up is sent
+  once: an UPDATE to the requester with `next` set to the requester (so it wakes), copied as an FYI to
+  `escalate_to` in node.yaml (e.g. the secretary). There are two:
+  - `overdue`: a reply is required, the deadline has passed, and there is no RESULT yet;
+  - `session_offline`: the owner is interactive, its node is up, its session is offline, and the request
+    is still PENDING.
+
+  Nothing is chased while the owner's node is offline (a closed laptop).
+- **Reading.** Only the session marks mail read. Pushes, watchers and scripts use `--peek`.
+  - The MCP `inbox` tool lists only what needs the agent by default (`only="wake"`).
+  - A backlog the session has already dealt with elsewhere is cleared explicitly, after looking at it:
+    `clear_inbox(before_seq)` in MCP, or `agentctl inbox --clear-before SEQ`.
+- **Refused but seen.** A REQUEST that an interactive agent may not take, because of a wrong `kind` or a
+  missing permission, is still refused: the requester gets REJECT and the task is FAILED. But if the sender
+  is in the agent's `accept_from`, the request also shows in the agent's inbox with
+  `note: "rejected: …"`, and it wakes the agent. Requests from senders outside `accept_from` stay invisible.
+- **Later.** `remind_me(at, text)` in MCP stores a reminder in the node ledger. The session's MCP process
+  pushes it into the session when it is due, or at the next session start if no session was running. Use
+  it instead of promising to come back.
+
+### Visibility (step 1: minimal exposure by default)
+
+The leader's rule: everyone may know what state a task is in; nobody may look into someone else's work.
+There are four layers (`src/mutmuas/visibility.py`):
+
+| layer | who | what |
+|---|---|---|
+| public | everyone | address, role, capabilities, provider, mode, `accepts_kinds`, online/offline, `session` on duty, `availability` available/busy |
+| task status | coordinators + participants | task id, first 80 characters of the objective, status, requester → owner, last update |
+| task content | participants only: requester, owner, `observers` | reason, inputs, the thread, the RESULT, artifacts |
+| private | nobody | session reasoning, memory, work logs, transcripts, raw run logs. Never sent over mutmuas; ask the person, who answers with a condensed summary |
+
+- Shared stores carry only the public and status layers. The registry card has no current task, queue,
+  inbox counts or session directory; the agent reads those itself with `whoami`. The task KV has no reason,
+  inputs, thread, result or artifact references.
+- Every tool filters by viewer:
+  - `task`, `result` and MCP `check_task` return nothing to non-participants, and the status layer to
+    coordinators;
+  - `tasks --all` lists the viewer's own tasks, or every status record for a coordinator;
+  - `history` lists only messages the viewer sent or received;
+  - `artifact list` and `fetch` cover only artifacts the viewer published or was sent.
+- `coordinators` is set in the HR-issued node.yaml, e.g. `[B:claude-secretary]`; an agent cannot make
+  itself one.
+- **Participants** come from what the node persisted for the task: its requester, its owner, the `observers`
+  listed on its request, and agents holding an observer row. Sending mail on a task makes nobody a
+  participant. Only the requester or owner may send on a task: `reply`, `question`, `answer`, and `send`
+  with `--task`.
+- `observers` go on a REQUEST (`agentctl ask --observer`), or any participant adds them later with
+  `add_observer` / `agentctl observe`.
+  - Observers receive FYI copies of the REQUEST and RESULT. The copies never wake them.
+  - Each copy lists the task's participants. The observer's node keeps a copy only if both the sender and
+    the recipient are on that list.
+  - Every other participant is told `observers_add`, so the requester's side also forwards a later RESULT.
+- A worker's `notify` lead gets the status layer only: task id, a short objective, status.
+- Artifacts: the object store keeps no description (it travels in the participants' ArtifactRef).
+- A session started outside its workdir is reported to the agent and to the coordinators, not on the card.
+- **Not a security boundary.** Every process holding the node credential can still read:
+  - the message stream;
+  - the object-store bytes;
+  - its node's whole ledger (the SQLite file).
+
+  It can also pass `--as` for another agent of its node, because there is no process identity in step 1.
+  Enforcement (the daemon as the only NATS principal, per-agent identity, or NATS accounts) is step 2.
 
 ### Example REQUEST
 

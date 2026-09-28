@@ -66,6 +66,53 @@ CREATE TABLE IF NOT EXISTS tasks (
     PRIMARY KEY (task_id, role)
 );
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(role, status);
+
+-- Is the interactive agent's session there? Written by the session's own mutmuas MCP process, which lives
+-- exactly as long as the session; read by the daemon for the registry card (session: online|offline).
+CREATE TABLE IF NOT EXISTS sessions (
+    local_agent     TEXT PRIMARY KEY,
+    pid             INTEGER NOT NULL,           -- the session's mutmuas MCP process
+    session_pid     INTEGER,                    -- its parent: the session itself (Claude Code, Codex, ...)
+    cwd             TEXT,
+    started_at      TEXT NOT NULL,
+    last_seen       TEXT NOT NULL
+);
+
+-- Other sessions that tried to act as an agent whose session lease is held (one agent, one session).
+CREATE TABLE IF NOT EXISTS session_contenders (
+    local_agent     TEXT NOT NULL,
+    pid             INTEGER NOT NULL,
+    cwd             TEXT,
+    last_seen       TEXT NOT NULL,
+    PRIMARY KEY (local_agent, pid)
+);
+
+-- "Remind me at …": the session's MCP process pushes the text into the session when it is due.
+-- Artifacts an agent of this node published itself: with inbound mail, the only source of artifact access
+-- (not the URI's path, which the publisher chooses; not outgoing mail, which anyone can fill with any URI).
+CREATE TABLE IF NOT EXISTS artifact_publishers (
+    uri             TEXT NOT NULL,
+    local_agent     TEXT NOT NULL,
+    published_at    TEXT NOT NULL,
+    PRIMARY KEY (uri, local_agent)
+);
+
+CREATE TABLE IF NOT EXISTS reminders (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    local_agent     TEXT NOT NULL,
+    due             TEXT NOT NULL,
+    text            TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    fired_at        TEXT
+);
+
+-- Follow-ups already sent (overdue reply, session gone), so each is sent once.
+CREATE TABLE IF NOT EXISTS notices (
+    task_id         TEXT NOT NULL,
+    reason          TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    PRIMARY KEY (task_id, reason)
+);
 """
 
 TASK_JSON_FIELDS = ("request", "result", "result_draft", "input_refs", "output_refs")
@@ -82,6 +129,13 @@ class Ledger:
         self.db.execute("PRAGMA busy_timeout=30000")
         self._migrate_v1()
         self.db.executescript(SCHEMA)
+        self._add_column("sessions", "session_pid", "INTEGER")    # ledgers created by exp/wake e2fb5d1
+        # 1 once an inbox listing has shown the message to the session: clear_inbox may only mark those read
+        self._add_column("messages", "shown", "INTEGER NOT NULL DEFAULT 0")
+
+    def _add_column(self, table: str, column: str, decl: str) -> None:
+        if column not in [r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")]:
+            self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def _migrate_v1(self) -> None:
         """v1 keyed messages on message_id alone, which dropped same-node deliveries. Re-key in place."""
@@ -171,40 +225,196 @@ class Ledger:
         self.db.execute("UPDATE messages SET state=?, last_error=?, updated_at=? WHERE message_id=? AND direction='in'",
                         (state, error, now_iso(), message_id))
 
+    @staticmethod
+    def _type_filter(types: tuple[str, ...] | None, next_to: str | None) -> tuple[str, tuple]:
+        """types, plus (with next_to) any message that hands the baton to that agent (body.next)."""
+        if not types:
+            return "", ()
+        in_types = f"type IN ({','.join('?' * len(types))})"
+        if next_to:
+            return f" AND ({in_types} OR json_extract(envelope, '$.body.next') = ?)", (*types, next_to)
+        return f" AND {in_types}", tuple(types)
+
     def unseen(self, local_agent: str, limit: int = 50, mark: bool = True,
-               types: tuple[str, ...] | None = None, since: str | None = None) -> list[Envelope]:
+               types: tuple[str, ...] | None = None, since: str | None = None,
+               next_to: str | None = None, show: bool = True) -> list[Envelope]:
         """Inbound messages an interactive agent has not looked at yet.
 
         Only messages the dispatcher has fully handled: a REQUEST shows up once its task exists
         (so accept_task always works), and requests rejected by policy never show up.
         """
         with self.tx() as db:
-            type_sql = f" AND type IN ({','.join('?' * len(types))})" if types else ""
+            type_sql, type_args = self._type_filter(types, next_to)
             # a digit-only `since` is a rowid cursor (monotonic; timestamps collide within a millisecond)
             by_row = since is not None and str(since).isdigit()
             since_sql = (" AND rowid > ?" if by_row else " AND created_at > ?") if since else ""
             since_arg = ((int(since) if by_row else since),) if since else ()
             rows = db.execute("SELECT message_id, envelope FROM messages WHERE direction='in' AND seen=0"
                               f" AND state='handled' AND local_agent=?{type_sql}{since_sql} ORDER BY rowid LIMIT ?",
-                              (local_agent, *(types or ()), *since_arg, limit)).fetchall()
-            if mark and rows:
-                db.executemany("UPDATE messages SET seen=1 WHERE message_id=? AND direction='in'",
+                              (local_agent, *type_args, *since_arg, limit)).fetchall()
+            # show: a foreground listing for the session (peek too) = shown, so clear_inbox may clear it later;
+            # a notifier's read (watch, push) is not (Codex review of 8c018ee). mark: read.
+            sets = [x for x, on in (("shown=1", show), ("seen=1", mark)) if on]
+            if rows and sets:
+                db.executemany(f"UPDATE messages SET {', '.join(sets)} WHERE message_id=? AND direction='in'",
                                [(r["message_id"],) for r in rows])
         return [Envelope.from_json(r["envelope"]) for r in rows]
 
     def mark_seen(self, task_id: str) -> None:
         self.db.execute("UPDATE messages SET seen=1 WHERE direction='in' AND task_id=?", (task_id,))
 
-    def unseen_count(self, local_agent: str, types: tuple[str, ...] | None = None, since: str | None = None) -> int:
+    def unseen_count(self, local_agent: str, types: tuple[str, ...] | None = None, since: str | None = None,
+                     next_to: str | None = None) -> int:
         sql = "SELECT COUNT(*) FROM messages WHERE direction='in' AND seen=0 AND state='handled' AND local_agent=?"
         args: list[Any] = [local_agent]
         if since:
             sql += " AND rowid > ?" if str(since).isdigit() else " AND created_at > ?"
             args.append(int(since) if str(since).isdigit() else since)
-        if types:
-            sql += f" AND type IN ({','.join('?' * len(types))})"
-            args.extend(types)
-        return self.db.execute(sql, args).fetchone()[0]
+        type_sql, type_args = self._type_filter(types, next_to)
+        return self.db.execute(sql + type_sql, [*args, *type_args]).fetchone()[0]
+
+    def last_rowid(self) -> int:
+        """The newest message's rowid: a cursor meaning "from now on"."""
+        return self.db.execute("SELECT COALESCE(MAX(rowid), 0) FROM messages").fetchone()[0]
+
+    # ---- sessions and follow-ups ------------------------------------------
+
+    _BEAT_SQL = ("INSERT INTO sessions (local_agent, pid, session_pid, cwd, started_at, last_seen)"
+                 " VALUES (?,?,?,?,?,?) ON CONFLICT(local_agent) DO UPDATE SET pid=excluded.pid,"
+                 " session_pid=excluded.session_pid, cwd=excluded.cwd, last_seen=excluded.last_seen,"
+                 " started_at=CASE WHEN sessions.pid=excluded.pid THEN sessions.started_at"
+                 " ELSE excluded.started_at END")
+
+    def session_beat(self, local_agent: str, pid: int, cwd: str | None, session_pid: int | None = None) -> None:
+        now = now_iso()
+        self.db.execute(self._BEAT_SQL, (local_agent, pid, session_pid, cwd, now, now))
+
+    def session_claim(self, local_agent: str, pid: int, cwd: str | None, holder_alive,
+                      session_pid: int | None = None) -> int:
+        """One agent, one session: beat as the holder if the lease is free, stale or already ours. Otherwise
+        record us as a contender and return the holder's pid. The check and the write are one transaction
+        (BEGIN IMMEDIATE), so two sessions starting together cannot both win."""
+        now = now_iso()
+        with self.tx() as db:
+            row = db.execute("SELECT * FROM sessions WHERE local_agent=?", (local_agent,)).fetchone()
+            if row is not None and row["pid"] not in (0, pid) and holder_alive(dict(row)):
+                db.execute("INSERT INTO session_contenders (local_agent, pid, cwd, last_seen) VALUES (?,?,?,?)"
+                           " ON CONFLICT(local_agent, pid) DO UPDATE SET last_seen=excluded.last_seen, cwd=excluded.cwd",
+                           (local_agent, pid, cwd, now))
+                return row["pid"]
+            db.execute("DELETE FROM session_contenders WHERE local_agent=? AND pid=?", (local_agent, pid))
+            db.execute(self._BEAT_SQL, (local_agent, pid, session_pid, cwd, now, now))
+        return pid
+
+    def session_contenders(self, local_agent: str) -> list[dict[str, Any]]:
+        return [dict(r) for r in self.db.execute("SELECT * FROM session_contenders WHERE local_agent=?",
+                                                 (local_agent,))]
+
+    def session_end(self, local_agent: str, pid: int) -> None:
+        """The session closed cleanly. The row stays (pid 0) so the card can say offline, not unknown."""
+        self.db.execute("UPDATE sessions SET pid=0, last_seen=? WHERE local_agent=? AND pid=?",
+                        (now_iso(), local_agent, pid))
+        self.db.execute("DELETE FROM session_contenders WHERE local_agent=? AND pid=?", (local_agent, pid))
+
+    def session_of(self, local_agent: str) -> dict[str, Any] | None:
+        row = self.db.execute("SELECT * FROM sessions WHERE local_agent=?", (local_agent,)).fetchone()
+        return dict(row) if row else None
+
+    def mark_seen_before(self, local_agent: str, before_seq: int) -> list[Envelope]:
+        """Mark everything up to a rowid as read (the session's explicit 'clear the backlog') that an inbox
+        listing has shown: never mail the session has not seen (STANDARD item 8; Codex review of dfdd719).
+        Returns what was marked, so receipts can follow."""
+        with self.tx() as db:
+            rows = db.execute("SELECT message_id, envelope FROM messages WHERE direction='in' AND local_agent=?"
+                              " AND seen=0 AND shown=1 AND state='handled' AND rowid <= ?",
+                              (local_agent, before_seq)).fetchall()
+            db.executemany("UPDATE messages SET seen=1 WHERE message_id=? AND direction='in'",
+                           [(r["message_id"],) for r in rows])
+        return [Envelope.from_json(r["envelope"]) for r in rows]
+
+    def list_recent_inbound(self, local_agent: str, limit: int = 50, show: bool = True) -> list[Envelope]:
+        """The newest handled inbound messages, read or not (inbox --all): not ones still new, unverified or
+        rejected (Codex review of d98413f). With show (a foreground listing) the unread ones count as shown, so
+        clear_inbox may clear them later; they are not marked read (Codex review of d13ffc8)."""
+        with self.tx() as db:
+            rows = db.execute("SELECT message_id, envelope FROM messages WHERE direction='in' AND local_agent=?"
+                              " AND state='handled' ORDER BY rowid DESC LIMIT ?", (local_agent, limit)).fetchall()
+            if show and rows:
+                db.executemany("UPDATE messages SET shown=1 WHERE message_id=? AND direction='in' AND seen=0",
+                               [(r["message_id"],) for r in rows])
+        return [Envelope.from_json(r["envelope"]) for r in rows]
+
+    def inbound_state(self, message_id: str) -> str | None:
+        row = self.db.execute("SELECT state FROM messages WHERE message_id=? AND direction='in'",
+                              (message_id,)).fetchone()
+        return row["state"] if row else None
+
+    def inbound_in_state(self, state: str) -> list[Envelope]:
+        return [Envelope.from_json(r["envelope"]) for r in
+                self.db.execute("SELECT envelope FROM messages WHERE direction='in' AND state=?", (state,))]
+
+    def unshown_count(self, local_agent: str, before_seq: int) -> int:
+        """Unread mail up to a rowid that no foreground inbox listing has shown (clear_inbox leaves it)."""
+        return self.db.execute("SELECT COUNT(*) FROM messages WHERE direction='in' AND local_agent=? AND seen=0"
+                               " AND shown=0 AND state='handled' AND rowid <= ?",
+                               (local_agent, before_seq)).fetchone()[0]
+
+    def record_published(self, uri: str, local_agent: str) -> None:
+        self.db.execute("INSERT OR IGNORE INTO artifact_publishers (uri, local_agent, published_at) VALUES (?,?,?)",
+                        (uri, local_agent, now_iso()))
+
+    def add_reminder(self, local_agent: str, due: str, text: str) -> int:
+        cur = self.db.execute("INSERT INTO reminders (local_agent, due, text, created_at) VALUES (?,?,?,?)",
+                              (local_agent, due, text, now_iso()))
+        return cur.lastrowid
+
+    def due_reminders(self, local_agent: str, now: str) -> list[dict[str, Any]]:
+        return [dict(r) for r in self.db.execute(
+            "SELECT * FROM reminders WHERE local_agent=? AND fired_at IS NULL AND due <= ? ORDER BY due",
+            (local_agent, now))]
+
+    def fire_reminder(self, reminder_id: int) -> bool:
+        """Take a due reminder: True for exactly one caller, so it is pushed once."""
+        cur = self.db.execute("UPDATE reminders SET fired_at=? WHERE id=? AND fired_at IS NULL",
+                              (now_iso(), reminder_id))
+        return cur.rowcount == 1
+
+    def record_observed(self, task_id: str, observer: str, requester: str, owner: str,
+                        request: dict[str, Any] | None = None, result: dict[str, Any] | None = None,
+                        observers: list[str] | None = None) -> None:
+        """An observer's own row for a task it was given copies of (role observer:<agent>)."""
+        role, now = f"observer:{observer}", now_iso()
+        with self.tx() as db:
+            row = db.execute("SELECT request, result FROM tasks WHERE task_id=? AND role=?", (task_id, role)).fetchone()
+            old_request = json.loads(row["request"]) if row and row["request"] else {}
+            new_request = {**old_request, **(request or {})}
+            if observers:
+                new_request["observers"] = sorted(set(new_request.get("observers") or []) | set(observers))
+            new_result = result if result is not None else (json.loads(row["result"]) if row and row["result"] else None)
+            status = "COMPLETED" if new_result and new_result.get("status") != "failed" else (
+                "FAILED" if new_result else "PENDING")
+            db.execute("INSERT INTO tasks (task_id, role, local_agent, requester, owner, status, result_status, request,"
+                       " result, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+                       " ON CONFLICT(task_id, role) DO UPDATE SET request=excluded.request, result=excluded.result,"
+                       " status=excluded.status, result_status=excluded.result_status, updated_at=excluded.updated_at",
+                       (task_id, role, observer, requester, owner, status,
+                        (new_result or {}).get("status"), json.dumps(new_request, ensure_ascii=False),
+                        json.dumps(new_result, ensure_ascii=False) if new_result is not None else None, now, now))
+
+    def add_observers(self, task_id: str, observers: list[str]) -> None:
+        """Extend the observer list on every row this node keeps for the task."""
+        with self.tx() as db:
+            for row in db.execute("SELECT role, request FROM tasks WHERE task_id=?", (task_id,)).fetchall():
+                request = json.loads(row["request"]) if row["request"] else {}
+                request["observers"] = sorted(set(request.get("observers") or []) | set(observers))
+                db.execute("UPDATE tasks SET request=?, updated_at=? WHERE task_id=? AND role=?",
+                           (json.dumps(request, ensure_ascii=False), now_iso(), task_id, row["role"]))
+
+    def notice_once(self, task_id: str, reason: str) -> bool:
+        """True the first time (task_id, reason) is recorded: send that follow-up now, and never again."""
+        cur = self.db.execute("INSERT OR IGNORE INTO notices (task_id, reason, created_at) VALUES (?,?,?)",
+                              (task_id, reason, now_iso()))
+        return cur.rowcount == 1
 
     def count(self, direction: str, state: str, local_agent: str | None = None) -> int:
         sql = "SELECT COUNT(*) FROM messages WHERE direction=? AND state=?"
