@@ -219,9 +219,9 @@ async def test_session_cannot_report_progress_on_a_worker_task(tmp_path):
         ledger.close()
 
 
-async def test_an_adopted_worker_delivers_its_result_after_it_ends(tmp_path):
-    """Codex review of ba28e70: after an unclean restart the old worker is watched, not run again nor handed
-    to the session; when it ends, the result it submitted (the draft) is delivered."""
+async def test_restart_stops_a_surviving_worker_and_delivers_its_draft(tmp_path):
+    """Option B (Codex review of f8c105e): no adoption. A worker that submitted its result and still runs at the
+    restart is stopped, and the result it submitted is delivered rather than run again."""
     import asyncio
     import subprocess
     import sys
@@ -240,7 +240,7 @@ async def test_an_adopted_worker_delivers_its_result_after_it_ends(tmp_path):
                                       body=request_body("t", "t")))
     ledger.update_task("T-orphan", "owner", status="RUNNING")
     assert ledger.claim_task("T-orphan", "worker", ("RUNNING",)) is None
-    orphan = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    orphan = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
     ledger.set_runner_pid("T-orphan", orphan.pid, proc_start(orphan.pid))
     ledger.update_task("T-orphan", "owner", result_draft={"status": "complete", "summary": "done by the orphan"})
     daemon = NodeDaemon(cfg)
@@ -249,12 +249,10 @@ async def test_an_adopted_worker_delivers_its_result_after_it_ends(tmp_path):
     daemon._queued["B:desk"] = set()
     try:
         await daemon.recover()
-        assert daemon._background and not daemon._queued["B:desk"]        # watched, not queued again
-        orphan.terminate()
-        orphan.wait(5)
-        await asyncio.wait_for(asyncio.gather(*daemon._background), 10)
+        orphan.wait(5)                                                   # stopped at the restart
         task = ledger.task("T-orphan", "owner")
         assert task["status"] == "COMPLETED" and task["result"]["summary"] == "done by the orphan"
+        assert not daemon._queued["B:desk"] and not daemon._background
     finally:
         if orphan.poll() is None:
             orphan.kill()

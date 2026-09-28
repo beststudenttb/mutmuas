@@ -1,10 +1,4 @@
-"""Regression checks for auto-worker actor identity after ba28e70.
-
-Option B (exp/staff-v4-b) changes two things here; the original file is kept in tests/reviews/:
-- the worker is recorded with its start time: Codex's round 4 (f8c105e) requires pid and start time (a record
-  without a start time proves nothing);
-- recovery stops a surviving worker instead of adopting it, so the task may go to the session, but only after
-  the old worker is gone: never two actors."""
+"""Regression checks for auto-worker actor identity after ba28e70."""
 
 import asyncio
 import os
@@ -47,8 +41,7 @@ async def test_worker_without_task_env_still_cannot_finish_session_task(tmp_path
     _request(ledger, session_task)
     ledger.update_task(worker_task, "owner", status="RUNNING")
     assert ledger.claim_task(worker_task, "worker", ("RUNNING",)) is None
-    from mutmuas.node import proc_start
-    ledger.set_runner_pid(worker_task, os.getpid(), proc_start(os.getpid()))  # models the daemon-started worker
+    ledger.set_runner_pid(worker_task, os.getpid())  # this process models the daemon-started worker
     assert ledger.claim_task(session_task, "session", ("PENDING",)) is None
     ledger.update_task(session_task, "owner", status="RUNNING")
     session = _holder()
@@ -67,16 +60,14 @@ async def test_worker_without_task_env_still_cannot_finish_session_task(tmp_path
 
 @pytest.mark.asyncio
 async def test_recovery_does_not_release_a_still_running_worker_to_the_session(tmp_path):
-    """An unclean daemon restart must not hand off a task while its detached worker process is alive.
-    Option B: the restart stops it first; only then may the session get the task (no two actors)."""
+    """An unclean daemon restart must not hand off a task while its detached worker process is alive."""
     agent, cfg, ledger, hub = _setup(tmp_path)
     task_id = "T-worker-survives"
     _request(ledger, task_id)
     ledger.update_task(task_id, "owner", status="RUNNING")
     assert ledger.claim_task(task_id, "worker", ("RUNNING",)) is None
     worker, session = _holder(), _holder()
-    from mutmuas.node import proc_start
-    ledger.set_runner_pid(task_id, worker.pid, proc_start(worker.pid))
+    ledger.set_runner_pid(task_id, worker.pid)
     ledger.session_beat("B:desk", session.pid, str(agent.workdir_path), session_pid=session.pid)
     daemon = NodeDaemon(cfg)
     daemon.hub = hub
@@ -84,10 +75,10 @@ async def test_recovery_does_not_release_a_still_running_worker_to_the_session(t
     daemon._queued["B:desk"] = set()
     try:
         await daemon.recover()
-        worker.wait(5)                              # option B: the surviving worker is stopped at the restart
+        assert worker.poll() is None
         await daemon._execute(agent, task_id)  # dequeued after restart while the session is present
         task = ledger.task(task_id, "owner")
-        assert task["status"] == "PENDING" and task["runner"] is None     # the session's to decide, worker gone
+        assert task["runner"] == "worker" and task["status"] != "PENDING"
     finally:
         for proc in (worker, session):
             proc.terminate()
