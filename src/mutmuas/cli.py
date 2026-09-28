@@ -700,10 +700,8 @@ def node_retire_agent(args):
                 print(f"error: no card and no mailbox for {addr}: nothing to retire (wrong id?)", file=sys.stderr)
                 return 1
             if pending and args.drop_mail:
-                # Every message that is dropped must have been listed: list them all, then check right before the
-                # deletion that nothing new arrived meanwhile; if mail keeps arriving, do not delete (Codex review
-                # of retire-agent-v4). A message landing in the milliseconds between the last check and the
-                # deletion is the remaining window.
+                # Every message that is dropped must have been listed: list them all (and re-list while the count
+                # moves); the count is checked again after the output, right at the deletion (below).
                 for _ in range(3):
                     waiting = await bus.pending_messages(addr, limit=pending)
                     now = await bus.inbox_pending(addr) or 0
@@ -717,9 +715,18 @@ def node_retire_agent(args):
             else:
                 waiting = await bus.pending_messages(addr, limit=PENDING_LIST_LIMIT) if pending else []
             for env in waiting:
-                print(f"{addr}: waiting mail {env.type} from {env.sender} task {env.task_id}")
+                print(f"{addr}: waiting mail {env.type} from {env.sender} task {env.task_id}", flush=True)
             if pending and len(waiting) < pending:
-                print(f"{addr}: listed {len(waiting)} of {pending} waiting message(s)")
+                print(f"{addr}: listed {len(waiting)} of {pending} waiting message(s)", flush=True)
+            if pending and args.drop_mail:
+                # The listing above may take long (a big mailbox, a slow terminal): check once more right at
+                # the deletion, after all output, and delete nothing if mail came in meanwhile (Codex review
+                # of 18509e2). Nothing else happens between this check and the deletion.
+                now = await bus.inbox_pending(addr) or 0
+                if now != len(waiting):
+                    print(f"error: {now - len(waiting)} message(s) for {addr} arrived while listing; nothing was "
+                          "deleted: run retire-agent again", file=sys.stderr)
+                    return 1
             print(f"{addr}: {await bus.remove_agent(addr, force=args.drop_mail)}")
             if pending and args.drop_mail:
                 print(f"{addr}: dropped {pending} waiting message(s), all listed above: tell their senders (R11.4)")

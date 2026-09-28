@@ -21,7 +21,7 @@ artifacts: [ ArtifactRef, … ]    # references only, never payloads
 reply_to: msg-…                  # message this one answers (optional)
 ```
 
-Addresses and ids used in subjects allow `[A-Za-z0-9_-]` only.
+Addresses and ids used in subjects allow `[A-Za-z0-9_-]` only, and node ids no `_` (only `[A-Za-z0-9-]`): mailbox consumers are named `inbox_<node>_<agent>`, so node `C_a` with agent `b` would collide with node `C` and agent `a_b`. Agent ids may contain `_`.
 
 ## Types and bodies
 
