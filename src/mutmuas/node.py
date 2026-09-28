@@ -133,8 +133,9 @@ def session_fields(session: dict[str, Any] | None, workdir: Path) -> dict[str, A
     out: dict[str, Any] = {"session": "online" if online else "offline", "session_seen": session["last_seen"]}
     if online and session.get("cwd"):
         out["session_cwd"] = session["cwd"]
-        if os.path.realpath(session["cwd"]) != os.path.realpath(workdir):
-            # Claude Code keeps memory per start directory: the wrong one means an empty memory.
+        if not Path(os.path.realpath(session["cwd"])).is_relative_to(os.path.realpath(workdir)):
+            # Claude Code keeps memory per start directory: the wrong one means an empty memory. A project
+            # directory below the workdir is the right one (staff system v4, D-029).
             out["session_warning"] = f"session started in {session['cwd']}, not in its workdir {workdir}"
     return out
 
