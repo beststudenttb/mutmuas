@@ -51,13 +51,38 @@ def _claude_ctx(tmp_path, kind="query", permissions=("READ",)):
     return ClaudeCodeRuntime(agent, node), TaskContext("T-1", req, agent, node), workdir
 
 
-def test_worker_does_not_load_local_settings(tmp_path):
-    """Approvals given in a session ("don't ask again") land in .claude/settings.local.json of the directory; a
-    worker started there must not inherit them (C2 experiment 2026-09-28: with local loaded, a rule there let a
-    worker run a Bash command node.yaml never granted). user,project keeps the function CLAUDE.md and memory."""
+def test_worker_loads_only_project_settings(tmp_path):
+    """Approvals given in a session ("don't ask again") land in .claude/settings.local.json of the directory, and
+    user settings may allow tools too (Codex review of 6c2a60a); a worker must inherit neither (C2 experiment
+    2026-09-28: with local loaded, a rule there let a worker run a Bash command node.yaml never granted).
+    "project" alone still loads the function CLAUDE.md above and the project's memory (experiment E6)."""
     runtime, ctx, _ = _claude_ctx(tmp_path)
     argv, _ = runtime.command(ctx)
-    assert argv[argv.index("--setting-sources") + 1] == "user,project"
+    assert argv[argv.index("--setting-sources") + 1] == "project"
+
+
+def test_available_tools_are_exactly_what_node_yaml_grants(tmp_path):
+    """--allowedTools only pre-approves; --tools limits what exists (experiment E7: with --tools, a local allow
+    rule could not run Bash; E9: MCP tools stay available)."""
+    runtime, ctx, _ = _claude_ctx(tmp_path)
+    argv, _ = runtime.command(ctx)
+    assert argv[argv.index("--tools") + 1] == "Read,Glob,Grep"
+    runtime, ctx, _ = _claude_ctx(tmp_path, kind="code", permissions=("READ", "WRITE_WORKTREE"))
+    argv, _ = runtime.command(ctx)
+    assert argv[argv.index("--tools") + 1] == "Read,Glob,Grep,Edit,Write,Bash"
+    assert "Bash(git:*)" in argv[argv.index("--allowedTools") + 1].split(",")
+
+
+def test_worker_refuses_grants_in_an_ancestor_settings_file(tmp_path):
+    """Any .claude/settings.json from the project directory up could widen Bash(git:*) to all of Bash."""
+    import json
+
+    import pytest
+    runtime, ctx, workdir = _claude_ctx(tmp_path, kind="code", permissions=("READ", "WRITE_WORKTREE"))
+    (workdir.parent / ".claude").mkdir()
+    (workdir.parent / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": ["Bash"]}}))
+    with pytest.raises(PermissionError, match="settings.json"):
+        runtime.command(ctx)
 
 
 def test_worker_may_not_edit_the_handoff(tmp_path):

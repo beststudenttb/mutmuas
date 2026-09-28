@@ -212,6 +212,8 @@ def load_config(path: str | Path) -> NodeConfig:
             a["workdir"] = rel(a.get("workdir", "."))
             if a.get("repo"):
                 a["repo"] = rel(a["repo"])
+            if isinstance(a.get("code_dirs"), list):          # Codex review of 6c2a60a
+                a["code_dirs"] = [rel(d) for d in a["code_dirs"]]
     raw_nats = raw.pop("nats", {}) or {}
     for key in ("credentials_file", "tls_ca", "tls_cert", "tls_key"):
         if isinstance(raw_nats, dict) and raw_nats.get(key):

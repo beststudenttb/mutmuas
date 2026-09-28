@@ -190,9 +190,13 @@ daemon (`launchctl kickstart -k …` / `systemctl --user restart mutmuas-agent-n
 Runtime notes:
 - `claude-code` runs `claude -p` with only the mutmuas MCP server (`--strict-mcp-config`) and the tools
   allowed by the agent's permissions (ARCHITECTURE_V1 §5). `extra_args` are appended to the command line.
-  Tools come from node.yaml only (D-032): it loads setting sources `user,project` (not `local`, where a
-  session's "don't ask again" approvals are saved), may not edit `<workdir>/HANDOFF.md`, and refuses to run
-  if the project's `.claude/settings.json` grants tools.
+  Tools come from node.yaml only (D-032): `--tools` limits the built-in tools that exist (`--allowedTools` only
+  pre-approves); setting source `project` only, not `user` (its allow rules, plugin hooks) nor `local` (a
+  session's "don't ask again" approvals); a `.claude/settings.json` from the project directory up (including
+  `~/.claude/settings.json`) that grants tools stops the run.
+  HANDOFF.md: the worker's file tools (Edit/Write) may not touch `<workdir>/HANDOFF.md`, and its prompt says
+  so. That is a **convention, not a boundary**, for a worker with Bash (RUN_EXPERIMENT, or git via
+  WRITE_WORKTREE): any program it runs can still write the file (Codex review of 6c2a60a).
 - Staff system v4 (D-029..D-031): workdir is the function x project directory, e.g.
   `~/mutmuas/work/paper/visualrl/` (not inside any git repo). LLM workers start there, so the function's
   `CLAUDE.md` one level up and the project's auto memory load; a code task's worktree (copy) or `code_dirs`
