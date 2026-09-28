@@ -155,3 +155,65 @@ async def test_spawn_without_a_start_time_stops_the_worker(tmp_path, monkeypatch
         assert task["status"] == "FAILED" and "start time" in task["result"]["summary"]
     finally:
         ledger.close()
+
+
+# ours (Codex review of e6a9df9): the whole process group is stopped, children included, before a retry
+async def test_restart_stops_the_whole_process_group_before_the_retry(tmp_path, monkeypatch):
+    """The child ignores TERM and outlives its leader: only KILL for the whole group stops it."""
+    monkeypatch.setattr(node_mod, "STOP_GRACE_S", 0.3)
+    _, ledger, daemon = _setup(tmp_path, "RUNNING")
+    child_pid = tmp_path / "child.pid"
+    leader = _worker("import pathlib, subprocess, sys, time; "
+                     "c = subprocess.Popen([sys.executable, '-c', 'import signal, time; "
+                     "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)']); "
+                     f"pathlib.Path({str(child_pid)!r}).write_text(str(c.pid)); time.sleep(30)")
+    try:
+        for _ in range(200):
+            if child_pid.exists() and child_pid.read_text():
+                break
+            await asyncio.sleep(0.02)
+        child = int(child_pid.read_text())
+        ledger.set_runner_pid("T-b", leader.pid, proc_start(leader.pid))
+        await daemon.recover()
+        leader.wait(5)
+        assert not node_mod.group_members(leader.pid), "a process of the old worker's group still runs"
+        assert not same_process(child, proc_start(child) or "gone")
+        assert "T-b" in daemon._queued["B:desk"]
+    finally:
+        with __import__("contextlib").suppress(ProcessLookupError):
+            os.killpg(leader.pid, 9)
+        if leader.poll() is None:
+            leader.kill()
+        leader.wait(5)
+        ledger.close()
+
+
+# ours (restores the ba28e70 migration edge): a record without a start time never proves a worker
+async def test_a_record_without_start_time_does_not_admit_a_worker(tmp_path):
+    from mutmuas.node import lease_refusal
+    agent, ledger, _ = _setup(tmp_path, "RUNNING")
+    ledger.set_runner_pid("T-b", os.getpid(), None)           # a record from before start times were kept
+    session = _worker()
+    try:
+        ledger.session_beat("B:desk", session.pid, str(agent.workdir_path), session_pid=session.pid)
+        assert lease_refusal(ledger, "B:desk") is not None       # this process is not proven to be the worker
+    finally:
+        session.kill()
+        session.wait(5)
+        ledger.close()
+
+
+# ours: an old worker pid without a start time that is not a group leader is quarantined too
+async def test_unknown_start_time_quarantines_a_live_process_that_leads_no_group(tmp_path):
+    _, ledger, daemon = _setup(tmp_path, "RUNNING")
+    worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])   # not a group leader
+    ledger.set_runner_pid("T-b", worker.pid, None)
+    try:
+        await daemon.recover()
+        assert worker.poll() is None                                       # not signalled
+        assert "T-b" not in daemon._queued["B:desk"]
+        assert ledger.task("T-b", "owner")["status"] == "FAILED"
+    finally:
+        worker.kill()
+        worker.wait(5)
+        ledger.close()
