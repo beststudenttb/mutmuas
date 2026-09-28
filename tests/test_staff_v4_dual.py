@@ -90,8 +90,23 @@ async def test_after_the_session_ends_the_worker_takes_over_after_a_grace_period
     assert await _status(hub_b, sent["task_id"]) == "PENDING" and not marker.exists()
     monkeypatch.setattr(node_mod, "AUTO_WORKER_GRACE_S", 0.0)         # the grace period is over
     result = await tools.wait_for_result(hub_a, sent["task_id"], 30)
-    assert result["result_status"] == "complete" and marker.read_text().count("\n") == 1
-    assert [m["type"] for m in hub_a.ledger.thread(sent["task_id"])].count("ACK") == 1
+    daemon = cluster.daemons["B"]
+    state = {"owner_task": {k: v for k, v in (hub_b.ledger.task(sent["task_id"], "owner") or {}).items()
+                            if k in ("status", "runner", "runner_pid", "attempts", "updated_at")},
+             "session": hub_b.ledger.session_of("B:desk"), "queued": daemon._queued.get("B:desk"),
+             "arriving": daemon._arriving, "present": node_mod.session_present(hub_b.ledger, "B:desk"),
+             "thread": [m["type"] for m in hub_a.ledger.thread(sent["task_id"])],
+             "b_rows": [tuple(r) for r in hub_b.ledger.db.execute(
+                 "SELECT direction, json_extract(envelope, '$.type'), state, last_error, created_at FROM messages"
+                 " WHERE task_id=? ORDER BY rowid", (sent["task_id"],))],
+             "a_rows": [tuple(r) for r in hub_a.ledger.db.execute(
+                 "SELECT direction, json_extract(envelope, '$.type'), state, last_error, created_at FROM messages"
+                 " WHERE task_id=? ORDER BY rowid", (sent["task_id"],))],
+             "a_task": {k: v for k, v in (hub_a.ledger.task(sent["task_id"], "requester") or {}).items()
+                        if k in ("status", "result_status", "updated_at")}}
+    assert result.get("result_status") == "complete", f"not taken over after the grace period: {state}"
+    assert marker.read_text().count("\n") == 1
+    assert state["thread"].count("ACK") == 1
 
 
 async def test_a_request_being_handled_is_not_also_taken_by_the_heartbeat(make_config, cluster, monkeypatch,

@@ -286,12 +286,21 @@ class Hub:
             view = await self.task_view(task_id, viewer)
             if view is None:
                 raise KeyError(f"unknown task {task_id}")
-            if view.get("status") in TERMINAL_STATES:
+            if view.get("status") in TERMINAL_STATES and self._closed_here(task_id, view):
                 return view
             if asyncio.get_running_loop().time() >= deadline:
                 view["timed_out_waiting"] = True
                 return view
             await asyncio.sleep(poll)
+
+    def _closed_here(self, task_id: str, view: dict[str, Any]) -> bool:
+        """The requester's own ledger has handled the message that closed the task (RESULT, REJECT, CANCEL).
+        The owner's KV record can arrive first, and returning then gives a finished task without its result
+        (found through the v4 grace test on B, 8de9448). Others (observers, coordinators) only get the record."""
+        if view.get("local_role") != "requester":
+            return True
+        local = self.ledger.task(task_id, "requester")
+        return local is None or local["status"] in TERMINAL_STATES
 
     # ---- owner side ---------------------------------------------------
 
