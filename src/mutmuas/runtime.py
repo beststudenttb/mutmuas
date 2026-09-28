@@ -173,6 +173,20 @@ Rules:
 """
 
 
+def _refuse_granting_project_settings(workdir: Path) -> None:
+    """A worker loads the project directory's .claude/settings.json; it may restrict tools, never grant them."""
+    path = workdir / ".claude" / "settings.json"
+    try:
+        allow = (json.loads(path.read_text()).get("permissions") or {}).get("allow")
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError, AttributeError) as e:
+        raise PermissionError(f"cannot check {path} for tool grants: {e!r}") from e
+    if allow:
+        raise PermissionError(f"{path} grants tools ({', '.join(map(str, allow))}); a worker's tools come from "
+                              "node.yaml only (D-032): move these rules out of the project directory")
+
+
 class ClaudeCodeRuntime(SubprocessRuntime):
     name = "claude-code"
 
@@ -185,7 +199,14 @@ class ClaudeCodeRuntime(SubprocessRuntime):
             tools += ["Edit", "Write", "Bash(git:*)"]
         if ctx.allows("RUN_EXPERIMENT"):
             tools += ["Bash"]
+        # Tools come from node.yaml alone (D-032): no approvals saved by a session in this directory (source
+        # "local"), no grants in the project's own settings; "project" stays for the function CLAUDE.md above.
+        _refuse_granting_project_settings(self.agent.workdir_path)
+        handoff = "/" + os.path.realpath(self.agent.workdir_path / "HANDOFF.md")   # //abs: an absolute rule path
+        settings_path = self.node.data_path / "runs" / f"{ctx.task_id}.settings.json"
+        settings_path.write_text(json.dumps({"permissions": {"deny": [f"Edit({handoff})", f"Write({handoff})"]}}))
         argv = ["claude", "-p", "--output-format", "json", "--mcp-config", str(cfg_path), "--strict-mcp-config",
+                "--setting-sources", "user,project", "--settings", str(settings_path),
                 "--allowedTools", ",".join(tools)]
         if self.agent.model:
             argv += ["--model", self.agent.model]
