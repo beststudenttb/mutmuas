@@ -34,3 +34,34 @@ def test_agentctl_failures_lists_them(tmp_path, capsys, monkeypatch):
     ledger.close()
     args = cli.agentctl_parser().parse_args(["failures", "--config", str(tmp_path / "node.yaml")])
     assert args.fn.__name__ == "cmd_failures" and args.bus is False
+
+
+async def test_a_background_loop_error_is_recorded_and_the_loop_goes_on(tmp_path):
+    """Heartbeat errors were only log.debug'ed; now they are recorded and the loop keeps running."""
+    import asyncio
+
+    from mutmuas.hub import Hub
+    from mutmuas.node import NodeDaemon
+    cfg = NodeConfig(project="p", node="B", data_dir=str(tmp_path / "data"), heartbeat_s=0.02,
+                     agents=[AgentConfig(id="desk", mode="interactive")])
+    ledger = Ledger(cfg.db_path)
+    daemon = NodeDaemon(cfg)
+    daemon.hub = Hub(cfg, None, ledger)
+    calls = 0
+
+    async def broken():
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("registry unavailable")
+
+    daemon._publish_cards = broken
+    loop = asyncio.create_task(daemon._heartbeat())
+    try:
+        await asyncio.sleep(0.2)
+        assert calls >= 2                                          # it went on after the first error
+        stages = {r["stage"] for r in ledger.failures()}
+        assert "heartbeat" in stages
+    finally:
+        loop.cancel()
+        await asyncio.gather(loop, return_exceptions=True)
+        ledger.close()

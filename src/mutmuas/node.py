@@ -370,7 +370,7 @@ class NodeDaemon:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                log.debug("fetch on %s failed: %r", addr, e)
+                self._failed("receive", e, address=addr)
                 await asyncio.sleep(1)
                 continue
             for msg in msgs:
@@ -426,7 +426,7 @@ class NodeDaemon:
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    log.exception("handling %s failed", env.short())
+                    self._failed("handle", e, address=addr, task_id=env.task_id)
                     self.hub.ledger.mark_handled(env.message_id, "dropped", repr(e))
 
     async def _handle(self, agent: AgentConfig, env: Envelope) -> str | None:
@@ -538,6 +538,13 @@ class NodeDaemon:
             from .tools import send_observer_copies
             self._background_job(send_observer_copies(self.hub, env.to, env.task_id, new))
         return None
+
+    def _failed(self, stage: str, error: BaseException, address: str | None = None, task_id: str | None = None,
+                attempt: int | None = None) -> None:
+        """Supervision (D-040): skip, record, carry on; the next round tries again."""
+        log.warning("%s failed (%s %s): %r", stage, address or "-", task_id or "-", error)
+        with contextlib.suppress(Exception):
+            self.hub.ledger.record_failure(stage, error, address, task_id, attempt)
 
     def _background_job(self, coro) -> None:
         """A job outside the daemon's fixed loops (see _spawn), e.g. an observer-copy verifier that may run as long
@@ -770,7 +777,7 @@ class NodeDaemon:
                 await self.hub.send(Envelope(type="UPDATE", sender=sender, to=target, task_id=task_id,
                                              body={"message": text, "fyi": True}))
             except Exception as e:
-                log.warning("notify %s failed: %r", target, e)
+                self._failed("notify", e, address=target, task_id=task_id)
 
     async def _attach_git(self, wt: Worktree, agent: AgentConfig, task_id: str, body: dict[str, Any],
                           refs: list[ArtifactRef]) -> None:
@@ -815,7 +822,7 @@ class NodeDaemon:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                log.debug("heartbeat failed: %r", e)
+                self._failed("heartbeat", e)
 
     async def _warn_session_dir(self, addr: str, session: dict[str, Any] | None, workdir: Path) -> None:
         """A session started outside its workdir gets an empty memory: tell the agent and the coordinators,
@@ -867,7 +874,7 @@ class NodeDaemon:
                                              body={"message": f"follow-up ({reason}): {text}", "fyi": True,
                                                    "follow_up": reason, **extra}))
             except Exception as e:
-                log.warning("follow-up to %s failed: %r", target, e)
+                self._failed("follow-up", e, address=target, task_id=task["task_id"])
 
     def _record_worker(self, task_id: str, pid: int) -> None:
         """Record the worker process with its start time; without one its identity cannot be proven later, so it
@@ -1031,7 +1038,7 @@ class NodeDaemon:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                log.debug("outbox flush failed: %r", e)
+                self._failed("outbox", e)
 
     def _agent_cfg(self, address: str) -> AgentConfig | None:
         addr = Address.parse(address)
