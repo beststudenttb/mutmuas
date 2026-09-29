@@ -86,36 +86,40 @@ def session_present(ledger, agent: str) -> str | None:
 _PS = next((p for p in ("/bin/ps", "/usr/bin/ps") if os.path.exists(p)), None)
 
 
-def _proc_field(pid: int, index: int, ps_column: str) -> str | None:
-    """One field of a process: /proc/<pid>/stat (index counted after the command name, which may contain ")") or
-    an absolute-path ps; None when it cannot be read (never a guess)."""
+def _proc_field(pid: int, index: int, ps_column: str) -> tuple[str | None, bool]:
+    """One field of a process and whether it came from /proc/<pid>/stat (index counted after the command name,
+    which may contain ")") rather than an absolute-path ps; None when it cannot be read (never a guess)."""
     stat = Path(f"/proc/{pid}/stat")
     if stat.exists():
         try:
-            return stat.read_text().rsplit(")", 1)[1].split()[index]
+            return stat.read_text().rsplit(")", 1)[1].split()[index], True
         except (OSError, IndexError):
-            return None
+            return None, True
     if _PS is None:
-        return None
+        return None, False
     import subprocess
     out = subprocess.run([_PS, "-o", f"{ps_column}=", "-p", str(pid)], capture_output=True, text=True,
                          env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
-    return out.stdout.strip() or None
+    return out.stdout.strip() or None, False
 
 
 def _ppid(pid: int) -> int | None:
-    value = _proc_field(pid, 1, "ppid")                                # stat field 4
-    return int(value) if value and value.isdigit() else None
+    try:
+        return int(_proc_field(pid, 1, "ppid")[0])                     # stat field 4
+    except (TypeError, ValueError):
+        return None
 
 
 def proc_start(pid: int) -> str | None:
     """When a process started (identifies it across pid reuse)."""
-    return _proc_field(pid, 19, "lstart")                              # stat field 22: starttime
+    return _proc_field(pid, 19, "lstart")[0]                           # stat field 22: starttime
 
 
 def _zombie(pid: int) -> bool:
     """An exited process not yet reaped by its parent: it runs nothing any more."""
-    return (_proc_field(pid, 0, "stat") or "").startswith("Z")         # stat field 3: state
+    value, from_proc = _proc_field(pid, 0, "stat")                     # stat field 3: state
+    # /proc holds exactly one state letter; ps may add flags after it (Codex review of cleanup #1)
+    return value == "Z" if from_proc else (value or "").startswith("Z")
 
 
 def same_process(pid: int | None, start: str | None) -> bool:
