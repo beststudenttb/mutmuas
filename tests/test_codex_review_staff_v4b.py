@@ -7,30 +7,15 @@ import subprocess
 import sys
 
 import pytest
+from conftest import auto_worker_node, owned_task
 
-from mutmuas.config import AgentConfig, NodeConfig
-from mutmuas.hub import Hub
-from mutmuas.ledger import Ledger
-from mutmuas.node import NodeDaemon, proc_start
-from mutmuas.protocol import Envelope, request_body
+from mutmuas.node import proc_start
 
 
 def _daemon(tmp_path, status="RUNNING"):
-    agent = AgentConfig(id="desk", mode="interactive", auto_worker=True, runtime="script",
-                        command=["true"], workdir=str(tmp_path / "work"))
-    cfg = NodeConfig(project="p", node="B", data_dir=str(tmp_path / "data"), agents=[agent])
-    ledger = Ledger(cfg.db_path)
-    hub = Hub(cfg, None, ledger)
-    task_id = "T-review-b"
-    ledger.create_owned_task(Envelope(type="REQUEST", sender="A:sender", to="B:desk", task_id=task_id,
-                                      body=request_body("test task", "test", kind="query")))
-    ledger.update_task(task_id, "owner", status=status)
-    assert ledger.claim_task(task_id, "worker", (status,)) is None
-    daemon = NodeDaemon(cfg)
-    daemon.hub = hub
-    daemon._queues["B:desk"] = asyncio.Queue()
-    daemon._queued["B:desk"] = set()
-    return ledger, daemon, task_id
+    _, _, ledger, _, daemon = auto_worker_node(tmp_path)
+    owned_task(ledger, "T-review-b", status, claim="worker")
+    return ledger, daemon, "T-review-b"
 
 
 @pytest.mark.asyncio

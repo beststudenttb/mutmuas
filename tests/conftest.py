@@ -161,6 +161,38 @@ async def eventually(predicate, timeout: float = 20, interval: float = 0.1, what
         await asyncio.sleep(interval)
 
 
+def auto_worker_node(tmp_path, **agent_extra):
+    """An auto_worker agent B:desk on a Hub without a bus, and its daemon (not started; queue ready), for the v4
+    recovery and actor tests. Returns (agent, cfg, ledger, hub, daemon)."""
+    from mutmuas.config import AgentConfig, NodeConfig
+    from mutmuas.ledger import Ledger
+    agent = AgentConfig(id="desk", mode="interactive", auto_worker=True, runtime="script", command=["true"],
+                        workdir=str(tmp_path / "work"), **agent_extra)
+    cfg = NodeConfig(project="p", node="B", data_dir=str(tmp_path / "data"), agents=[agent])
+    ledger = Ledger(cfg.db_path)
+    hub = Hub(cfg, None, ledger)
+    daemon = NodeDaemon(cfg)
+    daemon.hub = hub
+    daemon._queues["B:desk"] = asyncio.Queue()
+    daemon._queued["B:desk"] = set()
+    return agent, cfg, ledger, hub, daemon
+
+
+def owned_task(ledger, task_id: str, status: str | None = None, claim: str | None = None, ingest: bool = False):
+    """A REQUEST from A:sender that B:desk owns; optionally in `status` and claimed by `claim` (worker|session)."""
+    from mutmuas.protocol import Envelope, request_body
+    request = Envelope(type="REQUEST", sender="A:sender", to="B:desk", task_id=task_id,
+                       body=request_body("test task", "test", kind="query"))
+    if ingest:
+        ledger.ingest(request)
+    ledger.create_owned_task(request)
+    if status:
+        ledger.update_task(task_id, "owner", status=status)
+    if claim:
+        assert ledger.claim_task(task_id, claim, (status or "PENDING",)) is None
+    return request
+
+
 def thread_types(hub: Hub, task_id: str) -> list[str]:
     return [m["type"] for m in hub.ledger.thread(task_id)]
 

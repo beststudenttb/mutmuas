@@ -3,28 +3,19 @@
 import asyncio
 
 import pytest
+from conftest import auto_worker_node, owned_task
 
 from mutmuas import tools
-from mutmuas.config import AgentConfig, NodeConfig
-from mutmuas.hub import Hub
-from mutmuas.ledger import Ledger
 from mutmuas.node import NodeDaemon
-from mutmuas.protocol import Envelope, request_body
 
 
 def _auto_worker(tmp_path):
-    agent = AgentConfig(id="desk", mode="interactive", auto_worker=True,
-                        runtime="script", command=["true"], workdir=str(tmp_path / "work"))
-    cfg = NodeConfig(project="p", node="B", data_dir=str(tmp_path / "data"), agents=[agent])
-    ledger = Ledger(cfg.db_path)
-    hub = Hub(cfg, None, ledger)
+    _, cfg, ledger, hub, _ = auto_worker_node(tmp_path)
     return cfg, ledger, hub
 
 
 def _owned(ledger, task_id):
-    request = Envelope(type="REQUEST", sender="A:sender", to="B:desk", task_id=task_id,
-                       body=request_body("test task", "test", kind="query"))
-    ledger.create_owned_task(request)
+    owned_task(ledger, task_id)
 
 
 @pytest.mark.asyncio

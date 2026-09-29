@@ -9,32 +9,15 @@ import os
 import subprocess
 import sys
 
-import pytest
+from conftest import auto_worker_node, owned_task
 
 from mutmuas import node as node_mod
-from mutmuas.config import AgentConfig, NodeConfig
-from mutmuas.hub import Hub
-from mutmuas.ledger import Ledger
-from mutmuas.node import NodeDaemon, proc_start, same_process
-from mutmuas.protocol import Envelope, request_body
+from mutmuas.node import proc_start, same_process
 
 
 def _setup(tmp_path, status, **agent_extra):
-    agent = AgentConfig(id="desk", mode="interactive", auto_worker=True, runtime="script",
-                        command=["true"], workdir=str(tmp_path / "work"), **agent_extra)
-    cfg = NodeConfig(project="p", node="B", data_dir=str(tmp_path / "data"), agents=[agent])
-    ledger = Ledger(cfg.db_path)
-    hub = Hub(cfg, None, ledger)
-    request = Envelope(type="REQUEST", sender="A:sender", to="B:desk", task_id="T-b",
-                       body=request_body("test task", "test", kind="query"))
-    ledger.ingest(request)
-    ledger.create_owned_task(request)
-    ledger.update_task("T-b", "owner", status=status)
-    assert ledger.claim_task("T-b", "worker", (status,)) is None
-    daemon = NodeDaemon(cfg)
-    daemon.hub = hub
-    daemon._queues["B:desk"] = asyncio.Queue()
-    daemon._queued["B:desk"] = set()
+    agent, _, ledger, _, daemon = auto_worker_node(tmp_path, **agent_extra)
+    owned_task(ledger, "T-b", status, claim="worker", ingest=True)
     return agent, ledger, daemon
 
 
