@@ -221,7 +221,9 @@ async def _read_receipts(hub: Hub, me: str, envs: list[Envelope], read: bool = T
 
 
 async def accept_task(hub: Hub, me: str, task_id: str) -> dict[str, Any]:
-    _check_actor(hub, _owned(hub, me, task_id))
+    if _check_actor(hub, _owned(hub, me, task_id)) == task_id:
+        # A worker's task was accepted for it when the daemon started it: nothing to do, and no session claim
+        return {"task_id": task_id, "accepted": True, "note": "already accepted for you when the worker started"}
     refused = hub.ledger.claim_task(task_id, "session", OPEN_STATES)
     if refused and "worker" in refused:
         raise PermissionError(f"{task_id} is being done by the worker the daemon started before this session; "
@@ -436,7 +438,7 @@ async def fetch_artifact(hub: Hub, uri: str, dest_dir: str | None = None, sha256
     return {"uri": uri, "path": str(path), "size": path.stat().st_size if path.is_file() else None}
 
 
-def _check_actor(hub: Hub, task: dict[str, Any]) -> None:
+def _check_actor(hub: Hub, task: dict[str, Any]) -> str | None:
     """Every owner-side change (accept, reject, progress, result) is made by whoever holds the task, so a task is
     never done twice and a running worker is not interrupted (D-032, D-032a; Codex reviews of 6116466, ba28e70).
     Who the caller is comes from the process tree: a process descending from a worker the daemon started (pid
@@ -444,7 +446,8 @@ def _check_actor(hub: Hub, task: dict[str, Any]) -> None:
     restriction (a process that claims to be a worker is treated as one), never prove anything.
     - A worker acts on its own task only.
     - A task held by the worker is changed only by that worker's processes.
-    - A task held by the session is not changed by a worker."""
+    - A task held by the session is not changed by a worker.
+    Returns the task the caller is the worker of (None: not a worker)."""
     from .node import _ancestors, worker_tasks_of
     proven = worker_tasks_of(hub.ledger, task["owner"], {os.getpid(), *_ancestors(os.getpid())})
     worker_of = next(iter(proven), None) or _current_task()
@@ -456,6 +459,7 @@ def _check_actor(hub: Hub, task: dict[str, Any]) -> None:
                               "interrupted (D-032a): wait for its result (whoami: worker_running)")
     if task.get("runner") == "session" and worker_of == task["task_id"]:
         raise PermissionError(f"{task['task_id']} was taken by the session; a worker may not act on it")
+    return worker_of
 
 
 def _owned(hub: Hub, me: str, task_id: str) -> dict[str, Any]:

@@ -205,6 +205,7 @@ Rules:
    complete = every acceptance criterion met; partial = some output but not all criteria;
    failed = nothing usable. Never report partial work as complete. List limitations.
 5. If you need something only the requester can provide, say so in follow_up and use status partial or failed.
+6. This task was accepted for you when this run started: do not call accept_task.
 """
 
 
