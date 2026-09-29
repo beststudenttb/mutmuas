@@ -78,15 +78,6 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_seen       TEXT NOT NULL
 );
 
--- Other sessions that tried to act as an agent whose session lease is held (one agent, one session).
-CREATE TABLE IF NOT EXISTS session_contenders (
-    local_agent     TEXT NOT NULL,
-    pid             INTEGER NOT NULL,
-    cwd             TEXT,
-    last_seen       TEXT NOT NULL,
-    PRIMARY KEY (local_agent, pid)
-);
-
 -- "Remind me at …": the session's MCP process pushes the text into the session when it is due.
 -- Artifacts an agent of this node published itself: with inbound mail, the only source of artifact access
 -- (not the URI's path, which the publisher chooses; not outgoing mail, which anyone can fill with any URI).
@@ -315,18 +306,14 @@ class Ledger:
 
     def session_claim(self, local_agent: str, pid: int, cwd: str | None, holder_alive,
                       session_pid: int | None = None) -> int:
-        """One agent, one session: beat as the holder if the lease is free, stale or already ours. Otherwise
-        record us as a contender and return the holder's pid. The check and the write are one transaction
-        (BEGIN IMMEDIATE), so two sessions starting together cannot both win."""
+        """One agent, one session: beat as the holder if the lease is free, stale or already ours; otherwise return
+        the holder's pid. The check and the write are one transaction (BEGIN IMMEDIATE), so two sessions starting
+        together cannot both win."""
         now = now_iso()
         with self.tx() as db:
             row = db.execute("SELECT * FROM sessions WHERE local_agent=?", (local_agent,)).fetchone()
             if row is not None and row["pid"] not in (0, pid) and holder_alive(dict(row)):
-                db.execute("INSERT INTO session_contenders (local_agent, pid, cwd, last_seen) VALUES (?,?,?,?)"
-                           " ON CONFLICT(local_agent, pid) DO UPDATE SET last_seen=excluded.last_seen, cwd=excluded.cwd",
-                           (local_agent, pid, cwd, now))
                 return row["pid"]
-            db.execute("DELETE FROM session_contenders WHERE local_agent=? AND pid=?", (local_agent, pid))
             db.execute(self._BEAT_SQL, (local_agent, pid, session_pid, cwd, now, now))
         return pid
 
@@ -367,15 +354,10 @@ class Ledger:
             (local_agent, *TERMINAL_STATES)).fetchall()
         return [(r[0], r[1], r[2]) for r in rows]
 
-    def session_contenders(self, local_agent: str) -> list[dict[str, Any]]:
-        return [dict(r) for r in self.db.execute("SELECT * FROM session_contenders WHERE local_agent=?",
-                                                 (local_agent,))]
-
     def session_end(self, local_agent: str, pid: int) -> None:
         """The session closed cleanly. The row stays (pid 0) so the card can say offline, not unknown."""
         self.db.execute("UPDATE sessions SET pid=0, last_seen=? WHERE local_agent=? AND pid=?",
                         (now_iso(), local_agent, pid))
-        self.db.execute("DELETE FROM session_contenders WHERE local_agent=? AND pid=?", (local_agent, pid))
 
     def session_of(self, local_agent: str) -> dict[str, Any] | None:
         row = self.db.execute("SELECT * FROM sessions WHERE local_agent=?", (local_agent,)).fetchone()

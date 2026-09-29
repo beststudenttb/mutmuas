@@ -215,7 +215,6 @@ async def test_one_agent_one_session(make_config, cluster):
         return next((n for n in notes if n["meta"].get("session") == kind), None)
     dup = await eventually(lambda: note(second_notes, "duplicate"), what="second session told it is a duplicate")
     assert str(first.pid) in dup["content"]
-    await eventually(lambda: note(first_notes, "contender"), what="first session told about the second")
 
     sent = await tools.send_request(hub_a, "A:main", "B:desk", "who gets woken", "lease test")
     await eventually(lambda: _pushed(first_notes, sent["task_id"]), what="holder woken")

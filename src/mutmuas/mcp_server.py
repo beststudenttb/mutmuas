@@ -92,12 +92,6 @@ def duplicate_notice(addr: str, holder: int) -> dict[str, Any]:
             "meta": {"session": "duplicate", "holder_pid": str(holder)}}
 
 
-def contender_notice(addr: str, contender: dict[str, Any]) -> dict[str, Any]:
-    return {"content": f"mutmuas: a second session tried to act as {addr} (process {contender['pid']}, "
-                       f"directory {contender.get('cwd')}). This session keeps the mail; tell the leader.",
-            "meta": {"session": "contender", "contender_pid": str(contender["pid"])}}
-
-
 def reminder_notice(r: dict[str, Any]) -> dict[str, Any]:
     return {"content": f"mutmuas reminder (set {r['created_at']}): {r['text']}",
             "meta": {"reminder": str(r["id"]), "due": r["due"]}}
@@ -118,7 +112,7 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
     async def heartbeat(hub: Hub, addr: str) -> None:
         """This process lives exactly as long as the session that started it: its beat is the session's.
         One agent, one session: a second session gets told and receives no pushes until the first is gone."""
-        me, told = os.getpid(), set()
+        me = os.getpid()
         while True:
             holder = hub.ledger.session_claim(addr, me, os.getcwd(), session_alive, session_pid=os.getppid())
             if holder != me and state.get("duplicate_of") != holder:
@@ -128,10 +122,6 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
                 if state.pop("duplicate_of", None):
                     await push_now({"content": f"mutmuas: the other session has gone; this session now holds "
                                                f"{addr} and receives its mail.", "meta": {"session": "holder"}})
-                for c in hub.ledger.session_contenders(addr):
-                    if c["pid"] not in told and session_alive({**c, "pid": c["pid"]}):
-                        told.add(c["pid"])
-                        await push_now(contender_notice(addr, c))
             await asyncio.sleep(HEARTBEAT_S)
 
     async def push_now(params: dict[str, Any]) -> None:
