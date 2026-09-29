@@ -9,7 +9,7 @@ import os
 import subprocess
 import sys
 
-from conftest import auto_worker_node, owned_task
+from conftest import auto_worker_node, group_child_survives, owned_task
 
 from mutmuas import node as node_mod
 from mutmuas.node import proc_start, same_process
@@ -203,36 +203,17 @@ async def test_unknown_start_time_quarantines_a_live_process_that_leads_no_group
 
 
 # ours (Codex review of 0a9f031, D-034): the group query has three answers; "unknown" never allows a retry
-def _leader_gone_child_running(tmp_path):
-    ready, release = tmp_path / "child-ready", tmp_path / "release-parent"
-    leader = _worker("import pathlib, subprocess, sys, time; "
-                     "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
-                     f"pathlib.Path({str(ready)!r}).write_text('ready'); "
-                     f"p = pathlib.Path({str(release)!r})\nwhile not p.exists(): time.sleep(0.01)")
-    return leader, ready, release
-
-
 async def _run_with_group_child(tmp_path, monkeypatch, ps):
     _, ledger, daemon = _setup(tmp_path, "RUNNING")
-    leader, ready, release = _leader_gone_child_running(tmp_path)
     try:
-        for _ in range(200):
-            if ready.exists():
-                break
-            await asyncio.sleep(0.02)
-        ledger.set_runner_pid("T-b", leader.pid, proc_start(leader.pid))
-        release.write_text("go")
-        leader.wait(5)
-        os.killpg(leader.pid, 0)                                         # the child still runs in the group
-        monkeypatch.setattr(node_mod, "_PS", ps)
-        await daemon.recover()
-        task = ledger.task("T-b", "owner")
-        assert "T-b" not in daemon._queued["B:desk"], "retried although the group could not be checked"
-        assert task["status"] == "FAILED" and "could not be checked" in task["result"]["summary"]
-        os.killpg(leader.pid, 0)                                         # quarantined, not signalled
+        async with group_child_survives(ledger, "T-b", tmp_path) as leader:
+            monkeypatch.setattr(node_mod, "_PS", ps)
+            await daemon.recover()
+            task = ledger.task("T-b", "owner")
+            assert "T-b" not in daemon._queued["B:desk"], "retried although the group could not be checked"
+            assert task["status"] == "FAILED" and "could not be checked" in task["result"]["summary"]
+            os.killpg(leader.pid, 0)                                     # quarantined, not signalled
     finally:
-        with __import__("contextlib").suppress(ProcessLookupError):
-            os.killpg(leader.pid, 9)
         ledger.close()
 
 

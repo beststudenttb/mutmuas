@@ -7,7 +7,9 @@ machines; they only share the NATS server.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
+import signal
 import shutil
 import socket
 import subprocess
@@ -191,6 +193,36 @@ def owned_task(ledger, task_id: str, status: str | None = None, claim: str | Non
     if claim:
         assert ledger.claim_task(task_id, claim, (status or "PENDING",)) is None
     return request
+
+
+@contextlib.asynccontextmanager
+async def group_child_survives(ledger, task_id: str, tmp_path):
+    """A worker process group whose leader has exited while a child keeps running in the group, recorded as
+    task_id's worker (pid and start time). Kills the whole group afterwards."""
+    from mutmuas.node import proc_start
+    ready, release = tmp_path / "child-ready", tmp_path / "release-parent"
+    code = ("import pathlib, subprocess, sys, time; "
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+            f"pathlib.Path({str(ready)!r}).write_text('ready'); "
+            f"p = pathlib.Path({str(release)!r})\nwhile not p.exists(): time.sleep(0.01)")
+    leader = subprocess.Popen([sys.executable, "-c", code], start_new_session=True)
+    try:
+        for _ in range(200):
+            if ready.exists():
+                break
+            await asyncio.sleep(0.02)
+        assert ready.exists()
+        ledger.set_runner_pid(task_id, leader.pid, proc_start(leader.pid))
+        release.write_text("go")
+        leader.wait(5)
+        os.killpg(leader.pid, 0)                                         # the child still runs in the group
+        yield leader
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(leader.pid, signal.SIGKILL)
+        if leader.poll() is None:
+            leader.kill()
+        leader.wait(5)
 
 
 def thread_types(hub: Hub, task_id: str) -> list[str]:
