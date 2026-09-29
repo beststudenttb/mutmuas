@@ -142,22 +142,39 @@ def same_process(pid: int | None, start: str | None) -> bool:
             and not _zombie(pid))
 
 
-def group_members(pgid: int) -> list[int]:
-    """The processes of a process group that still run (zombies excluded), from an absolute-path ps. A worker
-    leads its own group (start_new_session), so its children are here too."""
+def group_state(pgid: int) -> tuple[str, list[int]]:
+    """Which processes of a process group still run (zombies excluded): ("members", pids), ("empty", []), or
+    ("unknown", []) when the process list cannot be trusted: no ps, ps failed, empty or malformed output, or a
+    list that does not even contain this process. A worker leads its own group (start_new_session), so its
+    children are listed too. "unknown" never counts as empty (Codex review of 0a9f031)."""
     if not pgid:
-        return []
+        return "empty", []
     if _PS is None:
-        return [pgid] if _pid_alive(pgid) and not _zombie(pgid) else []
+        return "unknown", []
     import subprocess
-    out = subprocess.run([_PS, "-A", "-o", "pid=,pgid=,stat="], capture_output=True, text=True,
-                         env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
-    members = []
+    try:
+        out = subprocess.run([_PS, "-A", "-o", "pid=,pgid=,stat="], capture_output=True, text=True, timeout=10,
+                             env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError):
+        return "unknown", []
+    if out.returncode != 0:
+        return "unknown", []
+    rows = []
     for line in out.stdout.splitlines():
+        if not line.strip():
+            continue
         parts = line.split()
-        if len(parts) >= 3 and parts[1] == str(pgid) and not parts[2].startswith("Z"):
-            members.append(int(parts[0]))
-    return members
+        if len(parts) < 3 or not parts[0].isdigit() or not parts[1].isdigit():
+            return "unknown", []
+        rows.append((int(parts[0]), int(parts[1]), parts[2]))
+    if not any(pid == os.getpid() for pid, _, _ in rows):
+        return "unknown", []
+    members = [pid for pid, group, stat in rows if group == pgid and not stat.startswith("Z")]
+    return ("members", members) if members else ("empty", [])
+
+
+def group_members(pgid: int) -> list[int]:
+    return group_state(pgid)[1]
 
 
 def live_worker_runs(ledger, agent: str) -> dict[int, str]:
@@ -902,17 +919,26 @@ class NodeDaemon:
             return
         pid, start = task.get("runner_pid"), task.get("runner_start")
         if pid and same_process(pid, start):
-            if not await self._stop_worker(pid, start):
-                await hub.finish(task_id, result_body(
-                    "failed", f"could not stop the worker from before the restart (process group {pid}); "
-                              "not run again", limitations=["stop the processes by hand, then send the request again"]))
+            stopped = await self._stop_worker(pid, start)
+            if stopped != "stopped":
+                await self._quarantine(task_id, pid, "could not stop the worker from before the restart"
+                                       if stopped == "running" else
+                                       "stopped the worker from before the restart, but its process group could "
+                                       "not be checked afterwards")
                 return
-        elif pid and (group_members(pid) or (start is None and _pid_alive(pid) and not _zombie(pid))):
-            await hub.finish(task_id, result_body(
-                "failed", f"processes of the worker from before the restart may still run (process group {pid}) "
-                          "and cannot be proven to be it; not run again and not signalled",
-                limitations=["check and stop process group " + str(pid) + " by hand, then send the request again"]))
-            return
+        elif pid:
+            state, _ = group_state(pid)
+            alive = _pid_alive(pid) and not _zombie(pid)
+            if state == "unknown":
+                await self._quarantine(task_id, pid, "the process group of the worker from before the restart "
+                                                     "could not be checked (process list unavailable)")
+                return
+            if state == "members" or (alive and (start is None or proc_start(pid) is None)):
+                # Its leader is gone or cannot be identified, but something still runs there. A start time that
+                # was recorded and differs proves the pid now belongs to another process: that one is ignored.
+                await self._quarantine(task_id, pid, "processes of the worker from before the restart may still "
+                                                     "run and cannot be proven to be it")
+                return
         if task["status"] == "PENDING":
             if task.get("runner") == "worker":
                 hub.ledger.release_task(task_id, "worker")
@@ -924,11 +950,21 @@ class NodeDaemon:
             await hub.owner_transition(task_id, "ACCEPTED", f"node {self.cfg.node} restarted; task will be run again")
         self._enqueue(task["owner"], task_id)
 
-    async def _stop_worker(self, pid: int, start: str | None) -> bool:
-        """Stop a worker's whole process group: TERM, then KILL after STOP_GRACE_S. True once no process of the
-        group runs any more (not merely its leader: Codex review of e6a9df9)."""
-        def gone() -> bool:
-            return not same_process(pid, start) and not group_members(pid)
+    async def _quarantine(self, task_id: str, pid: int, why: str) -> None:
+        """Neither run the task again nor signal anything whose identity is not proven: fail it with the reason."""
+        await self.hub.finish(task_id, result_body(
+            "failed", f"{why} (process group {pid}); not run again and not signalled further",
+            limitations=[f"check and stop process group {pid} by hand, then send the request again"]))
+
+    async def _stop_worker(self, pid: int, start: str | None) -> str:
+        """Stop a worker's whole process group: TERM, then KILL after STOP_GRACE_S. "stopped" once no process of
+        the group runs any more (not merely its leader: Codex review of e6a9df9); "running" if something still
+        runs; "unknown" if the group could not be checked (Codex review of 0a9f031)."""
+        def gone() -> str:
+            if same_process(pid, start):
+                return "running"
+            state, _ = group_state(pid)
+            return {"empty": "stopped", "members": "running"}.get(state, "unknown")
 
         for sig, wait_s in ((signal.SIGTERM, STOP_GRACE_S), (signal.SIGKILL, 2.0)):
             try:
@@ -937,11 +973,12 @@ class NodeDaemon:
                 with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.kill(pid, sig)               # not a group leader: the process itself
             deadline = asyncio.get_running_loop().time() + wait_s
-            while not gone() and asyncio.get_running_loop().time() < deadline:
+            while gone() == "running" and asyncio.get_running_loop().time() < deadline:
                 await asyncio.sleep(0.05)
-            if gone():
-                return True
-        return False
+            result = gone()
+            if result != "running":
+                return result
+        return "running"
 
     async def _deliver_draft(self, task_id: str) -> bool:
         """A worker that submitted its result and ended while the daemon was down: deliver that result rather

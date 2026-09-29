@@ -217,3 +217,90 @@ async def test_unknown_start_time_quarantines_a_live_process_that_leads_no_group
         worker.kill()
         worker.wait(5)
         ledger.close()
+
+
+# ours (Codex review of 0a9f031, D-034): the group query has three answers; "unknown" never allows a retry
+def _leader_gone_child_running(tmp_path):
+    ready, release = tmp_path / "child-ready", tmp_path / "release-parent"
+    leader = _worker("import pathlib, subprocess, sys, time; "
+                     "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+                     f"pathlib.Path({str(ready)!r}).write_text('ready'); "
+                     f"p = pathlib.Path({str(release)!r})\nwhile not p.exists(): time.sleep(0.01)")
+    return leader, ready, release
+
+
+async def _run_with_group_child(tmp_path, monkeypatch, ps):
+    _, ledger, daemon = _setup(tmp_path, "RUNNING")
+    leader, ready, release = _leader_gone_child_running(tmp_path)
+    try:
+        for _ in range(200):
+            if ready.exists():
+                break
+            await asyncio.sleep(0.02)
+        ledger.set_runner_pid("T-b", leader.pid, proc_start(leader.pid))
+        release.write_text("go")
+        leader.wait(5)
+        os.killpg(leader.pid, 0)                                         # the child still runs in the group
+        monkeypatch.setattr(node_mod, "_PS", ps)
+        await daemon.recover()
+        task = ledger.task("T-b", "owner")
+        assert "T-b" not in daemon._queued["B:desk"], "retried although the group could not be checked"
+        assert task["status"] == "FAILED" and "could not be checked" in task["result"]["summary"]
+        os.killpg(leader.pid, 0)                                         # quarantined, not signalled
+    finally:
+        with __import__("contextlib").suppress(ProcessLookupError):
+            os.killpg(leader.pid, 9)
+        ledger.close()
+
+
+async def test_failing_ps_is_unknown_not_empty(tmp_path, monkeypatch):
+    """A ps that lists processes but exits non-zero: the list may be partial, so it proves nothing."""
+    fake = tmp_path / "ps-fails"
+    fake.write_text(f"#!/bin/sh\n{node_mod._PS} \"$@\"\nexit 1\n")
+    fake.chmod(0o755)
+    await _run_with_group_child(tmp_path, monkeypatch, str(fake))
+
+
+async def test_ps_with_no_output_is_unknown_not_empty(tmp_path, monkeypatch):
+    await _run_with_group_child(tmp_path, monkeypatch, "/usr/bin/true")
+
+
+async def test_no_ps_at_all_is_unknown_not_empty(tmp_path, monkeypatch):
+    await _run_with_group_child(tmp_path, monkeypatch, None)
+
+
+def test_group_state_answers_members_empty_or_unknown(monkeypatch):
+    assert node_mod.group_state(os.getpgid(0))[0] == "members"        # this test's own group
+    assert node_mod.group_state(2 ** 22 + 12345) == ("empty", [])     # no such group
+    monkeypatch.setattr(node_mod, "_PS", "/usr/bin/false")
+    assert node_mod.group_state(os.getpgid(0))[0] == "unknown"
+
+
+# ours (non-blocking item, choice written down): a start time that differs proves the pid now belongs to
+# another process, so the task is run again; only an unreadable start time counts as unknown
+async def test_a_reused_pid_with_another_start_time_does_not_block_the_retry(tmp_path):
+    _, ledger, daemon = _setup(tmp_path, "RUNNING")
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])   # not a group leader
+    ledger.set_runner_pid("T-b", other.pid, "a start time of the old worker")
+    try:
+        await daemon.recover()
+        assert other.poll() is None and "T-b" in daemon._queued["B:desk"]
+    finally:
+        other.kill()
+        other.wait(5)
+        ledger.close()
+
+
+async def test_an_unreadable_start_time_of_a_live_pid_quarantines(tmp_path, monkeypatch):
+    _, ledger, daemon = _setup(tmp_path, "RUNNING")
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    ledger.set_runner_pid("T-b", other.pid, "a start time of the old worker")
+    monkeypatch.setattr(node_mod, "proc_start", lambda pid: None)
+    try:
+        await daemon.recover()
+        assert other.poll() is None and "T-b" not in daemon._queued["B:desk"]
+        assert ledger.task("T-b", "owner")["status"] == "FAILED"
+    finally:
+        other.kill()
+        other.wait(5)
+        ledger.close()
