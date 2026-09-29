@@ -244,9 +244,11 @@ def request_body(objective: str, reason: str, *, kind: str = "query", inputs: An
                  expected_outputs: Any = None, constraints: Any = None, acceptance_criteria: Any = None,
                  deadline: str | None = None, timeout_s: float | None = None,
                  reply: str | None = None, observers: list[str] | None = None,
-                 deadline_default: bool = False) -> dict[str, Any]:
+                 deadline_default: bool = False, leader: bool = False) -> dict[str, Any]:
     """deadline_default: the deadline was filled in by the requester's node (default_reply_deadline_s), not
-    chosen by the requester (docs/MESSAGE_PROTOCOL.md, "Replies, deadlines and the baton")."""
+    chosen by the requester (docs/MESSAGE_PROTOCOL.md, "Replies, deadlines and the baton").
+    leader: the leader asked for this task; the session sending it on his behalf marks it (D-049, honestly:
+    D-035), and it goes first in the owner's queue and inbox."""
     body: dict[str, Any] = {"objective": objective, "reason": reason, "kind": kind}
     for key, value in (("inputs", inputs), ("expected_outputs", expected_outputs), ("constraints", constraints),
                        ("acceptance_criteria", acceptance_criteria), ("deadline", deadline), ("timeout_s", timeout_s),
@@ -255,6 +257,8 @@ def request_body(objective: str, reason: str, *, kind: str = "query", inputs: An
             body[key] = value
     if deadline_default and deadline:
         body["deadline_default"] = True
+    if leader:
+        body["leader"] = True
     return body
 
 
