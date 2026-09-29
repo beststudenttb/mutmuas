@@ -21,7 +21,6 @@ import contextlib
 import json
 import logging
 import os
-import signal
 import platform
 import socket
 from datetime import datetime, timezone
@@ -46,8 +45,6 @@ log = logging.getLogger(__name__)
 # auto_worker (D-030): after a session ends, wait this long before running tasks as a worker again (it may only
 # be the leader restarting his terminal).
 AUTO_WORKER_GRACE_S = 120
-# Stopping a worker that outlived the daemon (restart): TERM, then KILL after this many seconds.
-STOP_GRACE_S = 5
 SESSION_STALE_S = 50          # the session's MCP process beats every 15 s (mcp_server.HEARTBEAT_S)
 FOLLOW_UP_EVERY_S = 30
 
@@ -65,7 +62,7 @@ def _pid_alive(pid: int) -> bool:
 
 
 def session_alive(session: dict[str, Any]) -> bool:
-    return session_fields(session, Path("/")).get("session") == "online"
+    return session_fields(session).get("session") == "online"
 
 
 def session_present(ledger, agent: str) -> str | None:
@@ -85,54 +82,40 @@ def session_present(ledger, agent: str) -> str | None:
 _PS = next((p for p in ("/bin/ps", "/usr/bin/ps") if os.path.exists(p)), None)
 
 
-def _ppid(pid: int) -> int | None:
+def _proc_field(pid: int, index: int, ps_column: str) -> tuple[str | None, bool]:
+    """One field of a process and whether it came from /proc/<pid>/stat (index counted after the command name,
+    which may contain ")") rather than an absolute-path ps; None when it cannot be read (never a guess)."""
     stat = Path(f"/proc/{pid}/stat")
     if stat.exists():
         try:
-            return int(stat.read_text().rsplit(")", 1)[1].split()[1])   # field 4; the name may contain ")"
-        except (OSError, IndexError, ValueError):
-            return None
+            return stat.read_text().rsplit(")", 1)[1].split()[index], True
+        except (OSError, IndexError):
+            return None, True
     if _PS is None:
-        return None
+        return None, False
     import subprocess
-    out = subprocess.run([_PS, "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True,
+    out = subprocess.run([_PS, "-o", f"{ps_column}=", "-p", str(pid)], capture_output=True, text=True,
                          env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+    return out.stdout.strip() or None, False
+
+
+def _ppid(pid: int) -> int | None:
     try:
-        return int(out.stdout.strip())
-    except ValueError:
+        return int(_proc_field(pid, 1, "ppid")[0])                     # stat field 4
+    except (TypeError, ValueError):
         return None
 
 
 def proc_start(pid: int) -> str | None:
-    """When a process started (identifies it across pid reuse), from /proc or an absolute-path ps."""
-    stat = Path(f"/proc/{pid}/stat")
-    if stat.exists():
-        try:
-            return stat.read_text().rsplit(")", 1)[1].split()[19]            # field 22: starttime
-        except (OSError, IndexError):
-            return None
-    if _PS is None:
-        return None
-    import subprocess
-    out = subprocess.run([_PS, "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
-                         env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
-    return out.stdout.strip() or None
+    """When a process started (identifies it across pid reuse)."""
+    return _proc_field(pid, 19, "lstart")[0]                           # stat field 22: starttime
 
 
 def _zombie(pid: int) -> bool:
     """An exited process not yet reaped by its parent: it runs nothing any more."""
-    stat = Path(f"/proc/{pid}/stat")
-    if stat.exists():
-        try:
-            return stat.read_text().rsplit(")", 1)[1].split()[0] == "Z"
-        except (OSError, IndexError):
-            return False
-    if _PS is None:
-        return False
-    import subprocess
-    out = subprocess.run([_PS, "-o", "stat=", "-p", str(pid)], capture_output=True, text=True,
-                         env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
-    return out.stdout.strip().startswith("Z")
+    value, from_proc = _proc_field(pid, 0, "stat")                     # stat field 3: state
+    # /proc holds exactly one state letter; ps may add flags after it (Codex review of cleanup #1)
+    return value == "Z" if from_proc else (value or "").startswith("Z")
 
 
 def same_process(pid: int | None, start: str | None) -> bool:
@@ -142,26 +125,10 @@ def same_process(pid: int | None, start: str | None) -> bool:
             and not _zombie(pid))
 
 
-def group_state(pgid: int) -> str:
-    """Does a process group still have members? Asked of the kernel, not read from a ps listing (after four review
-    rounds of ps-parsing edge cases): "members", "empty" or "unknown". A worker leads its own group
-    (start_new_session), so its children are in it. "unknown" never counts as empty.
-    - kill(-pgid, 0) fails with ESRCH: no process is in the group -> "empty";
-    - it succeeds, or fails with EPERM (another user's process, or on macOS a group left with only zombies)
-      -> "members": conservative, a zombie not yet reaped keeps the task from running again; after a daemon
-      crash its orphaned workers are reaped by init/launchd, so that does not last;
-    - anything else -> "unknown"."""
-    if not pgid:
-        return "empty"
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return "empty"
-    except PermissionError:
-        return "members"
-    except OSError:
-        return "unknown"
-    return "members"
+def worker_tasks_of(ledger, agent: str, chain: set[int]) -> set[str]:
+    """The tasks of `agent` whose recorded, still running worker process is in `chain` (a process and its
+    ancestors): who the caller is as a worker, for the lease and for the owner-side actor check alike."""
+    return {task_id for pid, task_id in live_worker_runs(ledger, agent).items() if pid in chain}
 
 
 def live_worker_runs(ledger, agent: str) -> dict[int, str]:
@@ -193,11 +160,10 @@ def lease_refusal(ledger, agent: str) -> str | None:
     # session_pid is missing when the holder's MCP process runs older code (e2fb5d1) than this CLI, as during
     # an upgrade: then the MCP process's own parent is the session.
     session = row.get("session_pid") or next(iter(_ancestors(row["pid"])[:1]), None)
-    allowed = {row["pid"], session} - {None, 0}
+    chain = {os.getpid(), *_ancestors(os.getpid())}
     # auto_worker: a task the daemon started before the session came is finished, not interrupted (D-032a);
     # its processes descend from the pid the daemon recorded when it spawned them.
-    allowed |= set(live_worker_runs(ledger, agent))
-    if allowed & {os.getpid(), *_ancestors(os.getpid())}:
+    if ({row["pid"], session} - {None, 0}) & chain or worker_tasks_of(ledger, agent, chain):
         return None
     return (f"{agent} is held by another session (process {row['pid']}, directory {row.get('cwd')}); this process "
             "does not hold its session, so it may not read or answer its mail. One agent, one session.")
@@ -209,7 +175,7 @@ def public_session(fields: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in fields.items() if k in ("session", "session_seen")}
 
 
-def session_fields(session: dict[str, Any] | None, workdir: Path) -> dict[str, Any]:
+def session_fields(session: dict[str, Any] | None) -> dict[str, Any]:
     """Registry card view of an interactive agent's session, from its MCP process heartbeat.
     unknown: no session has ever registered (e.g. one without the mutmuas MCP server)."""
     if session is None:
@@ -219,10 +185,6 @@ def session_fields(session: dict[str, Any] | None, workdir: Path) -> dict[str, A
     out: dict[str, Any] = {"session": "online" if online else "offline", "session_seen": session["last_seen"]}
     if online and session.get("cwd"):
         out["session_cwd"] = session["cwd"]
-        if not Path(os.path.realpath(session["cwd"])).is_relative_to(os.path.realpath(workdir)):
-            # Claude Code keeps memory per start directory: the wrong one means an empty memory. A project
-            # directory below the workdir is the right one (staff system v4, D-029).
-            out["session_warning"] = f"session started in {session['cwd']}, not in its workdir {workdir}"
     return out
 
 
@@ -250,7 +212,8 @@ class NodeDaemon:
         self._queues: dict[str, asyncio.Queue[str]] = {}
         self._queued: dict[str, set[str]] = {}               # task ids queued or running, per agent
         self._running: dict[str, asyncio.Task] = {}          # task_id -> runner task
-        self._arriving: set[str] = set()                     # REQUESTs _on_request is still deciding about
+        self._retry: set[str] = set()                        # failed runs to lay out once more (D-040)
+        self._recheck: set[str] = set()                      # recovered tasks whose old worker still ran
         self._cancel_requested: set[str] = set()
         self._background: set[asyncio.Task] = set()          # e.g. observer-copy checks against the task KV
         self._outbox_wake = asyncio.Event()
@@ -351,7 +314,7 @@ class NodeDaemon:
             if agent is None or (agent.mode != "worker" and not agent.auto_worker):
                 continue
             if agent.auto_worker:
-                await self._recover_auto(agent, task)
+                await self._recover_auto(task)
                 continue
             if task["status"] not in ("PENDING", "ACCEPTED", "RUNNING"):
                 continue
@@ -363,9 +326,6 @@ class NodeDaemon:
             self._enqueue(task["owner"], task["task_id"])
         for task in hub.ledger.tasks(role="owner", limit=500):
             await hub.publish_task_record(task["task_id"])
-        # observer copies still waiting for their task record when the daemon stopped: look again
-        for env in hub.ledger.inbound_in_state("unverified"):
-            self._background_job(self._verify_observer_copy(env))
         await hub.flush_outbox()
 
     # ---- receive ------------------------------------------------------
@@ -379,7 +339,7 @@ class NodeDaemon:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                log.debug("fetch on %s failed: %r", addr, e)
+                self._failed("receive", e, address=addr)
                 await asyncio.sleep(1)
                 continue
             for msg in msgs:
@@ -390,8 +350,7 @@ class NodeDaemon:
         try:
             env = Envelope.from_json(msg.data)
         except ProtocolError as e:
-            log.warning("invalid message on %s: %s", msg.subject, e)
-            await self._error_back(msg.data, addr, e.code, str(e))
+            self._failed("receive", e, address=addr)                  # recorded and dropped (D-040)
             await msg.term()
             return
         claimed_node = Names.sender_node_from_subject(msg.subject)
@@ -405,17 +364,6 @@ class NodeDaemon:
         else:
             log.info("duplicate delivery ignored: %s", env.message_id)
         await msg.ack()
-
-    async def _error_back(self, raw: bytes, addr: str, code: str, text: str) -> None:
-        """Best effort: tell the sender its message was invalid, if we can tell who sent it."""
-        try:
-            d = json.loads(raw)
-            sender = Address.parse(d["from"])
-        except Exception:
-            return
-        env = Envelope(type="ERROR", sender=addr, to=str(sender), task_id=d.get("task_id"),
-                       body={"code": code, "message": text}, reply_to=d.get("message_id"))
-        await self.hub.send(env)
 
     # ---- dispatch -----------------------------------------------------
 
@@ -435,7 +383,7 @@ class NodeDaemon:
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    log.exception("handling %s failed", env.short())
+                    self._failed("handle", e, address=addr, task_id=env.task_id)
                     self.hub.ledger.mark_handled(env.message_id, "dropped", repr(e))
 
     async def _handle(self, agent: AgentConfig, env: Envelope) -> str | None:
@@ -469,7 +417,7 @@ class NodeDaemon:
             return "rejected"
         known = acl(self.hub.ledger, env.task_id)
         if known:
-            row = self._any_task_row(env.task_id)          # every row of a task has the same requester/owner
+            row = self.hub.ledger.task(env.task_id)        # every row of a task has the same requester/owner
             if env.sender not in (row["requester"], row["owner"]):
                 # Content copies come from the requester or owner only; an observer's grant is relayed by the
                 # owner (Codex reviews of 8c018ee and d13ffc8), so an observer never authors one.
@@ -484,36 +432,31 @@ class NodeDaemon:
     def _still_unverified(self, message_id: str) -> bool:
         return self.hub.ledger.inbound_state(message_id) in (None, "new", "unverified")
 
-    def _any_task_row(self, task_id: str) -> dict[str, Any]:
-        return self.hub.ledger.task(task_id)          # every row of a task has the same requester/owner
-
     # The copy and the owner's task record travel separately, so the record may not be there yet: look again
     # with growing gaps, then every last gap until it appears (Codex reviews of 8c018ee and d13ffc8).
-    VERIFY_BACKOFF_S = (0.05, 0.2, 1, 3, 10, 30, 60, 120, 300)
+    VERIFY_BACKOFF_S = (0.05, 0.2, 1, 3, 10, 30)
 
     async def _verify_observer_copy(self, env: Envelope) -> None:
         """Accept a copy about a task this node does not know only if the shared task record (written by the
         owner's node) names its sender as requester or owner. That is a consistency check, not an authorisation
-        boundary: any node credential can write the task KV (step 2, D-008)."""
-        record, attempt = None, 0
-        while not record:
-            # growing gaps at first, then the last gap for as long as the copy is still waiting: an owner that is
-            # offline may publish its record much later (Codex review of d13ffc8)
-            await asyncio.sleep(0 if attempt == 0 else
-                                self.VERIFY_BACKOFF_S[min(attempt, len(self.VERIFY_BACKOFF_S)) - 1])
-            attempt += 1
-            if not self.hub.bus:
-                return
-            if attempt > 1 and not self._still_unverified(env.message_id):
-                return                                     # decided elsewhere (e.g. a second verifier)
+        boundary: any node credential can write the task KV (step 2, D-008). A few tries with growing gaps; if
+        the record is still not there, the copy is recorded as a failure and dropped (D-040)."""
+        record = None
+        for gap in (0, *self.VERIFY_BACKOFF_S):
+            await asyncio.sleep(gap)
+            if not self.hub.bus or (gap and not self._still_unverified(env.message_id)):
+                return                                     # no bus, or decided elsewhere (a second verifier)
             try:
                 record = await self.hub._remote_task(env.task_id, None)
             except Exception as e:
-                log.warning("could not verify observer copy %s: %r", env.short(), e)
-                record = None
-            if not record and attempt == len(self.VERIFY_BACKOFF_S) + 1:
-                log.warning("observer copy %s still unverified: no task record for %s yet; checking every %ss",
-                            env.short(), env.task_id, self.VERIFY_BACKOFF_S[-1])
+                self._failed("observer-copy", e, address=env.to, task_id=env.task_id)
+            if record:
+                break
+        if not record:
+            self._failed("observer-copy", "no task record names its sender; dropped", address=env.to,
+                         task_id=env.task_id)
+            self.hub.ledger.mark_handled(env.message_id, "dropped")
+            return
         if env.sender not in (record.get("requester"), record.get("owner")):
             log.warning("dropped observer copy %s: the task record does not name %s", env.short(), env.sender)
             self.hub.ledger.mark_handled(env.message_id, "rejected")
@@ -551,6 +494,13 @@ class NodeDaemon:
             self._background_job(send_observer_copies(self.hub, env.to, env.task_id, new))
         return None
 
+    def _failed(self, stage: str, error: BaseException | str, address: str | None = None, task_id: str | None = None,
+                attempt: int | None = None) -> None:
+        """Supervision (D-040): skip, record, carry on; the next round tries again."""
+        log.warning("%s failed (%s %s): %r", stage, address or "-", task_id or "-", error)
+        with contextlib.suppress(Exception):
+            self.hub.ledger.record_failure(stage, error, address, task_id, attempt)
+
     def _background_job(self, coro) -> None:
         """A job outside the daemon's fixed loops (see _spawn), e.g. an observer-copy verifier that may run as long
         as the daemon: keep a reference, log a failure; stop() cancels and awaits every one before closing the Hub."""
@@ -564,15 +514,6 @@ class NodeDaemon:
         task.add_done_callback(done)
 
     async def _on_request(self, agent: AgentConfig, env: Envelope) -> str | None:
-        # While it decides (it awaits the task record's publication), the heartbeat's _auto_dispatch must not
-        # also take the new PENDING task, or it is accepted twice (found in the flaky-test review of 5576ad5).
-        self._arriving.add(env.task_id)
-        try:
-            return await self._decide_request(agent, env)
-        finally:
-            self._arriving.discard(env.task_id)
-
-    async def _decide_request(self, agent: AgentConfig, env: Envelope) -> str | None:
         hub = self.hub
         existing = hub.ledger.task(env.task_id, "owner")
         if existing:
@@ -586,10 +527,6 @@ class NodeDaemon:
         if denial:
             await hub.owner_transition(env.task_id, "FAILED", denial, msg_type="REJECT",
                                        body={"reason": denial})
-            if agent.mode == "interactive" and agent.accepts(env.sender):
-                # A colleague picked the wrong kind: still refused, but the session must see that it was
-                # asked, or the request silently disappears on both ends (2026-09-25, kind=code to A:claude).
-                return "handled", f"rejected: {denial}"
             return "rejected"
         await hub.publish_task_record(env.task_id)
         if agent.mode == "worker" or (agent.auto_worker and not session_present(hub.ledger, env.to)):
@@ -694,6 +631,9 @@ class NodeDaemon:
             finally:
                 self._running.pop(task_id, None)
                 self._queued[addr].discard(task_id)
+                if task_id in self._retry:
+                    self._retry.discard(task_id)
+                    self._enqueue(addr, task_id)
 
     async def _execute(self, agent: AgentConfig, task_id: str) -> None:
         hub = self.hub
@@ -702,8 +642,6 @@ class NodeDaemon:
             return
         if agent.auto_worker and same_process(task.get("runner_pid"), task.get("runner_start")):
             log.info("task %s: a worker from before a restart still runs; not started again", task_id)
-            return
-        if agent.auto_worker and task.get("runner") == "worker" and await self._deliver_draft(task_id):
             return
         if agent.auto_worker:
             # Claim it for the worker in one transaction with the session check: never done twice, and while
@@ -739,7 +677,8 @@ class NodeDaemon:
             try:
                 wt = await Worktree.create(Path(agent.repo), self.cfg.node, agent.id, task_id, base_ref)
             except GitError as e:
-                await hub.finish(task_id, result_body("failed", f"could not create worktree: {e}"))
+                await self._run_failed(agent, task_id, attempt,
+                                       result_body("failed", f"could not create worktree: {e}"))
                 return
             ctx.workdir, ctx.git_branch = wt.path, wt.branch
         where = f", branch {wt.branch}" if wt else ""
@@ -747,8 +686,8 @@ class NodeDaemon:
         try:
             outcome = await asyncio.wait_for(make_runtime(agent, self.cfg).run(ctx), timeout)
         except asyncio.TimeoutError:
-            await hub.finish(task_id, result_body("failed", f"timed out after {timeout:.0f}s",
-                                                  limitations=["process was killed at the deadline"]))
+            await self._run_failed(agent, task_id, attempt, result_body(
+                "failed", f"timed out after {timeout:.0f}s", limitations=["process was killed at the deadline"]))
             return
         except asyncio.CancelledError:
             if task_id in self._cancel_requested:
@@ -757,8 +696,7 @@ class NodeDaemon:
                 return
             raise
         except Exception as e:
-            log.exception("runtime failed for %s", task_id)
-            await hub.finish(task_id, result_body("failed", f"runtime error: {e!r}"))
+            await self._run_failed(agent, task_id, attempt, result_body("failed", f"runtime error: {e!r}"))
             return
 
         current = hub.ledger.task(task_id, "owner")
@@ -768,12 +706,28 @@ class NodeDaemon:
             return      # blocked and nothing to deliver: wait for the requester
         # A submitted result always wins over an earlier BLOCKED report.
         body, refs = _result_from(current.get("result_draft"), outcome)
+        if outcome.exit_code != 0 and not _structured(current.get("result_draft") or outcome.result):
+            await self._run_failed(agent, task_id, attempt, body, refs)     # it died without a result
+            return
         if wt:
             await self._attach_git(wt, agent, task_id, body, refs)
         await hub.finish(task_id, body, refs)
         await self._notify(agent, current["owner"], task_id,
                            f"FYI: {current['owner']} finished {task_id} for {current['requester']} "
                            f"({body['status']})")
+
+    async def _run_failed(self, agent: AgentConfig, task_id: str, attempt: int, body: dict[str, Any],
+                          refs: list[ArtifactRef] | None = None) -> None:
+        """Supervision (D-040): a failed run (crash, timeout, runtime error) is recorded and laid out once more;
+        the next failure finishes the task as failed. An agent's own 'failed' verdict is not a failed run."""
+        self._failed("run", body["summary"], address=self.hub.ledger.task(task_id, "owner")["owner"],
+                     task_id=task_id, attempt=attempt)
+        if attempt < agent.max_attempts:
+            await self.hub.owner_transition(task_id, "ACCEPTED", f"attempt {attempt} failed ({body['summary']}); "
+                                                                 "running it once more")
+            self._retry.add(task_id)                 # queued again once the runner has let go of it
+            return
+        await self.hub.finish(task_id, body, refs or [])
 
     async def _notify(self, agent: AgentConfig, sender: str, task_id: str, text: str) -> None:
         """Copy a node's lead (agent.notify) on work its workers take on. Best effort, informational only."""
@@ -782,7 +736,7 @@ class NodeDaemon:
                 await self.hub.send(Envelope(type="UPDATE", sender=sender, to=target, task_id=task_id,
                                              body={"message": text, "fyi": True}))
             except Exception as e:
-                log.warning("notify %s failed: %r", target, e)
+                self._failed("notify", e, address=target, task_id=task_id)
 
     async def _attach_git(self, wt: Worktree, agent: AgentConfig, task_id: str, body: dict[str, Any],
                           refs: list[ArtifactRef]) -> None:
@@ -821,28 +775,19 @@ class NodeDaemon:
             try:
                 await self._publish_cards()
                 await self._auto_dispatch()
+                for task_id in list(self._recheck):         # old workers still running at the last look
+                    task = self.hub.ledger.task(task_id, "owner")
+                    if task and task["status"] not in TERMINAL_STATES:
+                        await self._recover_auto(task)
+                    else:
+                        self._recheck.discard(task_id)
                 if asyncio.get_running_loop().time() - last_follow_up >= FOLLOW_UP_EVERY_S:
                     last_follow_up = asyncio.get_running_loop().time()
                     await self._follow_ups()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                log.debug("heartbeat failed: %r", e)
-
-    async def _warn_session_dir(self, addr: str, session: dict[str, Any] | None, workdir: Path) -> None:
-        """A session started outside its workdir gets an empty memory: tell the agent and the coordinators,
-        once per session."""
-        warning = session_fields(session, workdir).get("session_warning")
-        if not warning or not self.hub.ledger.notice_once(f"session:{addr}:{session['started_at']}", "cwd"):
-            return
-        for target, extra in ((addr, {"next": addr}), *((c, {}) for c in self.cfg.coordinators if c != addr)):
-            try:
-                await self.hub.send(Envelope(type="UPDATE", sender=addr, to=target,
-                                             task_id=f"session-{self.cfg.node}", body={
-                                                 "message": f"session warning for {addr}: {warning}",
-                                                 "fyi": True, "follow_up": "session_dir", **extra}))
-            except Exception as e:
-                log.warning("session warning to %s failed: %r", target, e)
+                self._failed("heartbeat", e)
 
     async def _follow_ups(self) -> None:
         """Chase replies this node is owed (like an email client's follow-up flag), each once:
@@ -879,92 +824,36 @@ class NodeDaemon:
                                              body={"message": f"follow-up ({reason}): {text}", "fyi": True,
                                                    "follow_up": reason, **extra}))
             except Exception as e:
-                log.warning("follow-up to %s failed: %r", target, e)
+                self._failed("follow-up", e, address=target, task_id=task["task_id"])
 
     def _record_worker(self, task_id: str, pid: int) -> None:
-        """Record the worker process with its start time; without one its identity cannot be proven later, so it
-        is stopped and the attempt fails (Codex review of f8c105e)."""
-        start = proc_start(pid)
-        if start is None:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(pid, signal.SIGKILL)
-            raise RuntimeError(f"could not read the start time of worker process {pid}; stopped it")
-        self.hub.ledger.set_runner_pid(task_id, pid, start)
+        self.hub.ledger.set_runner_pid(task_id, pid, proc_start(pid))
 
-    async def _recover_auto(self, agent: AgentConfig, task: dict[str, Any]) -> None:
-        """auto_worker after a restart (option B, Codex reviews of f8c105e and e6a9df9): no task is adopted, and
-        a task is run again only once nothing of its old worker runs.
-        - The recorded worker still runs (pid and start time match): stop its whole process group.
-        - Its leader is gone (or its start time was never recorded) but processes of the group, or the pid, still
-          run: nothing proves they are the worker's, nor that they are not. Do not run the task again and do not
-          signal them: fail it with the reason (quarantine).
-        - Then: deliver the draft the worker submitted, or queue the task again (the runner's claim still checks
-          the session). A PENDING task still claimed by the worker (a stop between its two steps) is released for
-          _auto_dispatch. A session's task stays the session's."""
+    async def _recover_auto(self, task: dict[str, Any]) -> None:
+        """auto_worker after a restart: deliver the draft its worker submitted, or run the task again. A worker
+        from before the restart that still runs is not stopped: skip it this round, record it once, look again at
+        the next heartbeat (D-040). A PENDING task still claimed by the worker is released for _auto_dispatch; a
+        session's task stays the session's."""
         hub, task_id = self.hub, task["task_id"]
         if task.get("runner") == "session":
             return
-        pid, start = task.get("runner_pid"), task.get("runner_start")
-        if pid and same_process(pid, start):
-            stopped = await self._stop_worker(pid, start)
-            if stopped != "stopped":
-                await self._quarantine(task_id, pid, "could not stop the worker from before the restart"
-                                       if stopped == "running" else
-                                       "stopped the worker from before the restart, but its process group could "
-                                       "not be checked afterwards")
-                return
-        elif pid:
-            state = group_state(pid)
-            alive = _pid_alive(pid) and not _zombie(pid)
-            if state == "unknown":
-                await self._quarantine(task_id, pid, "the process group of the worker from before the restart "
-                                                     "could not be checked (process list unavailable)")
-                return
-            if state == "members" or (alive and (start is None or proc_start(pid) is None)):
-                # Its leader is gone or cannot be identified, but something still runs there. A start time that
-                # was recorded and differs proves the pid now belongs to another process: that one is ignored.
-                await self._quarantine(task_id, pid, "processes of the worker from before the restart may still "
-                                                     "run and cannot be proven to be it")
-                return
         if task["status"] == "PENDING":
             if task.get("runner") == "worker":
                 hub.ledger.release_task(task_id, "worker")
             return
+        if same_process(task.get("runner_pid"), task.get("runner_start")):
+            if hub.ledger.notice_once(task_id, "old-worker-running"):
+                self._failed("recover", "a worker from before the restart still runs; checked again each heartbeat",
+                             address=task["owner"], task_id=task_id)
+            self._recheck.add(task_id)
+            return
+        self._recheck.discard(task_id)
         if await self._deliver_draft(task_id):
             return
         hub.ledger.set_runner_pid(task_id, None)
         if task["status"] != "ACCEPTED":
             await hub.owner_transition(task_id, "ACCEPTED", f"node {self.cfg.node} restarted; task will be run again")
         self._enqueue(task["owner"], task_id)
-
-    async def _quarantine(self, task_id: str, pid: int, why: str) -> None:
-        """Neither run the task again nor signal anything whose identity is not proven: fail it with the reason."""
-        await self.hub.finish(task_id, result_body(
-            "failed", f"{why} (process group {pid}); not run again and not signalled further",
-            limitations=[f"check and stop process group {pid} by hand, then send the request again"]))
-
-    async def _stop_worker(self, pid: int, start: str | None) -> str:
-        """Stop a worker's whole process group: TERM, then KILL after STOP_GRACE_S. "stopped" once no process of
-        the group runs any more (not merely its leader: Codex review of e6a9df9); "running" if something still
-        runs; "unknown" if the group could not be checked (Codex review of 0a9f031)."""
-        def gone() -> str:
-            if same_process(pid, start):
-                return "running"
-            return {"empty": "stopped", "members": "running"}.get(group_state(pid), "unknown")
-
-        for sig, wait_s in ((signal.SIGTERM, STOP_GRACE_S), (signal.SIGKILL, 2.0)):
-            try:
-                os.killpg(pid, sig)                 # a worker leads its own process group (start_new_session)
-            except (ProcessLookupError, PermissionError):
-                with contextlib.suppress(ProcessLookupError, PermissionError):
-                    os.kill(pid, sig)               # not a group leader: the process itself
-            deadline = asyncio.get_running_loop().time() + wait_s
-            while gone() == "running" and asyncio.get_running_loop().time() < deadline:
-                await asyncio.sleep(0.05)
-            result = gone()
-            if result != "running":
-                return result
-        return "running"
 
     async def _deliver_draft(self, task_id: str) -> bool:
         """A worker that submitted its result and ended while the daemon was down: deliver that result rather
@@ -986,8 +875,7 @@ class NodeDaemon:
             if not agent.auto_worker or session_present(hub.ledger, addr):
                 continue
             for task in hub.ledger.tasks(role="owner", local_agent=addr, statuses=("PENDING",), limit=None):
-                if (task.get("runner") is None and task["task_id"] not in self._queued[addr]
-                        and task["task_id"] not in self._arriving):
+                if task.get("runner") is None and task["task_id"] not in self._queued[addr]:
                     await self._accept(task["task_id"])
                     self._enqueue(addr, task["task_id"])
 
@@ -1023,13 +911,11 @@ class NodeDaemon:
                 # Public layer only (visibility.py): coarse availability, no current task, queue or inbox
                 # counts, no session directory. The agent reads its own details locally (whoami).
                 "state": state, "availability": "busy" if running or owned_open else "available",
-                **(public_session(session_fields(hub.ledger.session_of(addr), agent.workdir_path))
+                **(public_session(session_fields(hub.ledger.session_of(addr)))
                    if agent.mode == "interactive" else {}),
                 "heartbeat_s": self.cfg.heartbeat_s, "last_heartbeat": now}
             await bus.kv_put(bus.names.agents_kv, f"{self.cfg.node}.{agent.id}",
                              {k: v for k, v in card.items() if k in CARD_KEYS})
-            if agent.mode == "interactive":
-                await self._warn_session_dir(addr, hub.ledger.session_of(addr), agent.workdir_path)
 
     # ---- outbox -------------------------------------------------------
 
@@ -1043,17 +929,21 @@ class NodeDaemon:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                log.debug("outbox flush failed: %r", e)
+                self._failed("outbox", e)
 
     def _agent_cfg(self, address: str) -> AgentConfig | None:
         addr = Address.parse(address)
         return next((a for a in self.cfg.agents if a.id == addr.agent and addr.node == self.cfg.node), None)
 
 
+def _structured(candidate: dict[str, Any] | None) -> bool:
+    return bool(candidate and candidate.get("status") in ("complete", "partial", "failed") and candidate.get("summary"))
+
+
 def _result_from(draft: dict[str, Any] | None, outcome) -> tuple[dict[str, Any], list[ArtifactRef]]:
     """Pick the agent's structured result. Never upgrade an unstructured finish to 'complete'."""
     candidate = draft or outcome.result
-    if candidate and candidate.get("status") in ("complete", "partial", "failed") and candidate.get("summary"):
+    if _structured(candidate):
         refs = [ArtifactRef.from_dict(a) for a in candidate.get("artifacts", [])]
         body = {k: v for k, v in candidate.items() if k != "artifacts"}
         if outcome.exit_code != 0 and body["status"] == "complete":

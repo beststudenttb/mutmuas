@@ -88,6 +88,15 @@ elif action == "wait_file":
     agentctl("update", "released, finishing")
     print(json.dumps({"status": "complete", "summary": f"waited for {release.name}"}))
 
+elif action == "fail_once":
+    # The first run dies without a result; the next one succeeds (a transient failure).
+    flag = Path(inputs["flag"])
+    if not flag.exists():
+        flag.write_text("failed once")
+        print("transient error", file=sys.stderr)
+        sys.exit(3)
+    print(json.dumps({"status": "complete", "summary": "worked the second time"}))
+
 elif action == "crash":
     print("fatal error: about to crash", file=sys.stderr)
     sys.exit(3)

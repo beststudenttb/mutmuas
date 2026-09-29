@@ -192,11 +192,8 @@ Runtime notes:
   allowed by the agent's permissions (ARCHITECTURE_V1 §5). `extra_args` are appended to the command line.
   Tools come from node.yaml only (D-032): `--tools` limits the built-in tools that exist (`--allowedTools` only
   pre-approves); setting source `project` only, not `user` (its allow rules, plugin hooks) nor `local` (a
-  session's "don't ask again" approvals); a `.claude/settings.json` from the project directory up (including
-  `~/.claude/settings.json`) that grants tools stops the run.
-  HANDOFF.md: the worker's file tools (Edit/Write) may not touch `<workdir>/HANDOFF.md`, and its prompt says
-  so. That is a **convention, not a boundary**, for a worker with Bash (RUN_EXPERIMENT, or git via
-  WRITE_WORKTREE): any program it runs can still write the file (Codex review of 6c2a60a).
+  session's "don't ask again" approvals).
+  HANDOFF.md belongs to the interactive session: the worker's prompt says not to edit it (a convention only).
 - Staff system v4 (D-029..D-031): workdir is the function x project directory, e.g.
   `~/mutmuas/work/paper/visualrl/` (not inside any git repo). LLM workers start there, so the function's
   `CLAUDE.md` one level up and the project's auto memory load; a code task's worktree (copy) or `code_dirs`
@@ -300,12 +297,43 @@ ls ~/.mutmuas/visual_rl/B/runs/  # per-task agent output (<task>.attemptN.log)
 |---|---|
 | NATS server stops | Nodes keep running. New messages queue in each node's outbox (`agentctl status` shows `outbox=N` once the server is back). Restart the server: `systemctl restart nats-server`. Everything flushes automatically and nothing needs replaying. |
 | Server machine lost | Messages and artifacts live in `store_dir`, so back up `/var/lib/nats/jetstream`. Without a backup: start a fresh server with the same `nats-server.conf`. Nodes re-register on their next heartbeat, and each node's `ledger.sqlite3` still holds its own tasks and messages. Messages in flight and object-store artifacts are lost. |
-| Node daemon crashes / machine reboots | The service manager restarts it. On start it re-queues unfinished tasks (attempt+1, requester notified "restarted"). After `max_attempts` a task fails with an explanation. **auto_worker exception** (v4): a worker from before the restart that still runs (pid and start time both match) is stopped first (TERM, KILL after 5 s; if it cannot be stopped the task fails with the reason and is not run again). If the worker had submitted its result, that result is delivered instead of running the task again. A session's task is left to the session. **Quarantine:** when nothing proves what still runs (the recorded leader is gone or has no start time but its process group, or the pid, still has members; or the kernel's answer about the group is neither "exists" nor "no such group"), the task fails with the reason and the process group to check; it is not run again and nothing is signalled. A recorded start time that differs proves the pid belongs to another process now; the task is run again, unless a process group with the old id still has members (for example the reused pid leads its own group): then it is quarantined, conservatively. Whether the group still has members is asked of the kernel (`kill(-pgid, 0)`: "no such group" means empty; success or "not permitted" means members), not read from a `ps` listing. A zombie not yet reaped counts as a member, so the task is quarantined rather than run again; the orphaned workers of a crashed daemon are reaped by init/launchd, so this is short-lived. **Residual risks:** (1) an unrelated process group that reuses the old group id is quarantined needlessly (a false alarm); (2) between confirming the worker (pid and start time) and sending TERM/KILL to its group there is a short window (TOCTOU): if the worker exits and its pid and group id are reused in that window, the signal can reach an unrelated process group; (3) a descendant that left the group (`setsid`, double fork) is neither seen nor stopped. auto_worker guards against mistakes, not against a worker that hides on purpose (same OS user). |
-| Rolling back from v4 | Back up `data/ledger.sqlite3` before deploying v4. The ledger keeps working with the old code (it ignores the new `tasks.runner*` columns). Remove the v4 fields from `node.yaml` first (`auto_worker`, `code_mode`, `code_dirs`): the old code rejects unknown keys and would not start. |
+| Node daemon crashes / machine reboots | The service manager restarts it. On start it re-queues unfinished tasks (attempt+1, requester notified "restarted"). After `max_attempts` a task fails with an explanation. **auto_worker exception** (v4, D-040): a task whose worker submitted its result is delivered, not run again; a task whose worker from before the restart still runs (pid and start time both match) is skipped, recorded once in the failure log (`agentctl failures`) and looked at again every heartbeat until that worker has ended; any other task is run again. The old worker is not stopped. A session's task is left to the session. |
+| Rolling back from v4 | Back up `data/ledger.sqlite3` before deploying v4. The ledger keeps working with the old code (it ignores the new `tasks.runner*` columns and the `failures` table). Remove the v4 fields from `node.yaml` first (`auto_worker`, `code_mode`, `code_dirs`): the old code rejects unknown keys and would not start. |
 | A task is stuck | `agentctl cancel <id>` from the requester. On the owner, `agentctl task <id>` and the run log show why. |
 | Wrong credentials | The daemon logs `Authorization Violation` and retries. Check `nats.credentials_file` and that the server config includes the node. |
 | Reset one node completely | Stop its daemon and delete its `data_dir`. Its durable mailbox on the server still holds unacknowledged messages, which are delivered again. |
 | Rotate a node's password | Delete `<out>/<NODE>.env`, re-run `server-config`, reload the server, copy the new file to the node, and restart the node. |
+
+## 8a. Supervision and known risks
+
+Errors are skipped and recorded rather than defended against (D-039, D-040); patches follow once the records
+show a pattern.
+
+- **Failure log**: every node writes skipped errors to its ledger (`failures` table: time, stage, address,
+  task, attempt, error). `agentctl failures [--limit N]` lists them, newest first.
+- **Failed runs are laid out once more**: a run that crashed without a result, timed out, hit a runtime error or
+  could not get its worktree is recorded and queued again once (`max_attempts`, default 2); the next failure
+  finishes the task as failed. An agent's own "failed" result is final.
+- **Background loops** (heartbeat, receive, handle, outbox, notify, follow-ups) record their errors and carry on.
+
+Known risks (protections removed on purpose; one line each):
+
+- An old worker's children that outlive their leader after a daemon crash are not looked for; a retry can run
+  next to them.
+- An observer copy whose owner publishes its task record only much later (owner offline for long) is dropped
+  after a few tries.
+- A session started from the wrong directory (empty memory, other rules) is not told so.
+- A `.claude/settings.json` in or above a worker's project directory that allows tools is trusted.
+- The session holding an agent does not learn that a second session tried to take it over.
+- A malformed optional REQUEST field (timeout_s, observers, deadline, next) is accepted and may fail later.
+- In a rare interleaving the heartbeat accepts a task `_on_request` is still handling: a second ACK (never a
+  second run).
+- The recipient of a request refused for its kind does not see it; only the requester gets the REJECT.
+- A worker with write tools can edit HANDOFF.md by mistake (the prompt asks it not to).
+- An unparsable incoming message gets no ERROR back; it is only in the receiving node's failure log.
+- A result printed only inside a Markdown fence, mid-output or over several lines is not parsed (use
+  submit_result).
+- A typo in a node.yaml key gives Python's TypeError instead of a one-line message.
 
 ## 9. Uninstall
 

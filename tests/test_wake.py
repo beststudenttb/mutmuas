@@ -84,7 +84,7 @@ async def test_channel_push_and_session_presence(make_config, cluster, tmp_path)
         card = await eventually(lambda: _card(hub_a, "B:desk", "online"), what="session online on the card")
         assert "session_cwd" not in card                                      # the directory is private
         mine = await tools.whoami(hub_b, "B:desk")
-        assert mine["session_cwd"] == str(workdir) and "session_warning" not in mine
+        assert mine["session_cwd"] == str(workdir)
 
         sent = await tools.send_request(hub_a, "A:main", "B:desk", "wake up and review PR 7", "channel test")
         note = await read_until(lambda m: m.get("method") == "notifications/claude/channel")
@@ -138,14 +138,12 @@ async def _follow_ups(hub):
 
 def test_session_card_fields(tmp_path):
     now = datetime.now(timezone.utc).isoformat()
-    assert session_fields(None, tmp_path) == {"session": "unknown"}
-    here = session_fields({"pid": os.getpid(), "cwd": str(tmp_path), "last_seen": now}, tmp_path)
-    assert here["session"] == "online" and "session_warning" not in here
-    wrong = session_fields({"pid": os.getpid(), "cwd": "/", "last_seen": now}, tmp_path)
-    assert "not in its workdir" in wrong["session_warning"]
+    assert session_fields(None) == {"session": "unknown"}
+    here = session_fields({"pid": os.getpid(), "cwd": str(tmp_path), "last_seen": now})
+    assert here["session"] == "online" and here["session_cwd"] == str(tmp_path)
     stale = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
-    assert session_fields({"pid": os.getpid(), "cwd": "/", "last_seen": stale}, tmp_path)["session"] == "offline"
-    assert session_fields({"pid": 0, "cwd": "/", "last_seen": now}, tmp_path)["session"] == "offline"
+    assert session_fields({"pid": os.getpid(), "cwd": "/", "last_seen": stale})["session"] == "offline"
+    assert session_fields({"pid": 0, "cwd": "/", "last_seen": now})["session"] == "offline"
 
 
 def test_due_parsing():
@@ -156,23 +154,6 @@ def test_due_parsing():
     for bad in ("+90", "tomorrow", "2026-09-25T18:00:00"):
         with pytest.raises(SystemExit):
             _parse_due(bad)
-
-
-async def test_wrong_kind_from_a_colleague_is_refused_but_seen(make_config, cluster):
-    a = make_config("A", [interactive("main"), interactive("stranger")])
-    b = make_config("B", [interactive("desk", accept_from=["A:main"])])
-    await cluster.start(a)
-    await cluster.start(b)
-    hub_a, hub_b = await cluster.client(a), await cluster.client(b)
-    wrong = await tools.send_request(hub_a, "A:main", "B:desk", "please fix these 4 things", "review", kind="code")
-    await tools.send_request(hub_a, "A:stranger", "B:desk", "let me in", "not allowed")
-    assert (await tools.wait_for_result(hub_a, wrong["task_id"], 20))["status"] == "FAILED"   # still refused
-    rows = await eventually(lambda: tools.inbox(hub_b, "B:desk", peek=True, types=tools.WAKE), what="seen")
-    await asyncio.sleep(0.5)
-    rows = await tools.inbox(hub_b, "B:desk", peek=True, types=tools.WAKE)
-    assert [m["task_id"] for m in rows] == [wrong["task_id"]]                  # the stranger stays invisible
-    assert rows[0]["note"].startswith("rejected: permission denied") and "kind=code" in rows[0]["note"]
-    assert "[rejected: permission denied" in channel_notice(rows[0])["content"]
 
 
 async def test_clear_inbox_marks_a_backlog_read(make_config, cluster):
@@ -234,7 +215,6 @@ async def test_one_agent_one_session(make_config, cluster):
         return next((n for n in notes if n["meta"].get("session") == kind), None)
     dup = await eventually(lambda: note(second_notes, "duplicate"), what="second session told it is a duplicate")
     assert str(first.pid) in dup["content"]
-    await eventually(lambda: note(first_notes, "contender"), what="first session told about the second")
 
     sent = await tools.send_request(hub_a, "A:main", "B:desk", "who gets woken", "lease test")
     await eventually(lambda: _pushed(first_notes, sent["task_id"]), what="holder woken")

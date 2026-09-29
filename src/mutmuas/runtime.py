@@ -208,23 +208,6 @@ Rules:
 """
 
 
-def _refuse_granting_project_settings(workdir: Path) -> None:
-    """A worker loads project settings; from its directory up (where Claude Code may look for them), a
-    .claude/settings.json may restrict tools, never grant them. Fails closed, ~/.claude/settings.json included."""
-    for directory in (workdir, *workdir.parents):
-        path = directory / ".claude" / "settings.json"
-        try:
-            allow = (json.loads(path.read_text()).get("permissions") or {}).get("allow")
-        except (FileNotFoundError, NotADirectoryError):
-            continue
-        except (OSError, ValueError, AttributeError) as e:
-            raise PermissionError(f"cannot check {path} for tool grants: {e!r}") from e
-        if allow:
-            raise PermissionError(f"{path} grants tools ({', '.join(map(str, allow))}); a worker's tools come "
-                                  "from node.yaml only (D-032): move these rules out of the project directory "
-                                  "and its parents")
-
-
 class ClaudeCodeRuntime(SubprocessRuntime):
     name = "claude-code"
 
@@ -246,16 +229,9 @@ class ClaudeCodeRuntime(SubprocessRuntime):
         # Tools come from node.yaml alone (D-032; Codex review of 6c2a60a): --tools limits what exists, since
         # --allowedTools only pre-approves. Setting source "project" only: not "user" (its allow rules and
         # plugin hooks) nor "local" (a session's "don't ask again" approvals); "project" still loads the
-        # function CLAUDE.md above the project directory and the project's memory. A settings file from the
-        # project directory up that grants tools stops the run.
-        _refuse_granting_project_settings(self.agent.workdir_path)
-        # HANDOFF.md belongs to the session (D-030). This deny covers the file tools only; a worker with Bash can
-        # still write it, so for such a worker it is a convention, not a boundary (Codex review of 6c2a60a).
-        handoff = "/" + os.path.realpath(self.agent.workdir_path / "HANDOFF.md")   # //abs: an absolute rule path
-        settings_path = self.node.data_path / "runs" / f"{ctx.task_id}.settings.json"
-        settings_path.write_text(json.dumps({"permissions": {"deny": [f"Edit({handoff})", f"Write({handoff})"]}}))
+        # function CLAUDE.md above the project directory and the project's memory.
         argv = ["claude", "-p", "--output-format", "json", "--mcp-config", str(cfg_path), "--strict-mcp-config",
-                "--setting-sources", "project", "--settings", str(settings_path),
+                "--setting-sources", "project",
                 "--tools", ",".join(available), "--allowedTools", ",".join(tools)]
         for d in extra_dirs(ctx):
             argv += ["--add-dir", str(d)]
@@ -304,22 +280,15 @@ def make_runtime(agent: AgentConfig, node: NodeConfig) -> SubprocessRuntime:
 
 
 def _last_json(text: str) -> dict[str, Any] | None:
-    """The last line (or fenced block) of text that parses as a JSON object."""
-    if not text:
-        return None
-    candidates: list[str] = []
-    if "```" in text:
-        for block in text.split("```")[1::2]:
-            candidates.append(block.removeprefix("json").strip())
-    candidates.extend(line.strip() for line in text.splitlines() if line.strip().startswith("{"))
-    candidates.append(text.strip())
-    for cand in reversed(candidates):
-        try:
-            value = json.loads(cand)
-        except ValueError:
-            continue
-        if isinstance(value, dict):
-            return value
+    """The last line of text that starts a JSON object, if it is one (a script's result line, claude -p's output).
+    A result is normally submitted through submit_result; this is the fallback."""
+    for line in reversed((text or "").splitlines()):
+        if line.strip().startswith("{"):
+            try:
+                value = json.loads(line)
+            except ValueError:
+                return None
+            return value if isinstance(value, dict) else None
     return None
 
 

@@ -12,26 +12,15 @@ import subprocess
 import sys
 
 import pytest
+from conftest import auto_worker_node, owned_task
 
 from mutmuas import tools
-from mutmuas.config import AgentConfig, NodeConfig
-from mutmuas.hub import Hub
-from mutmuas.ledger import Ledger
 from mutmuas.node import NodeDaemon, lease_refusal
-from mutmuas.protocol import Envelope, request_body
 
 
 def _setup(tmp_path):
-    agent = AgentConfig(id="desk", mode="interactive", auto_worker=True,
-                        runtime="script", command=["true"], workdir=str(tmp_path / "work"))
-    cfg = NodeConfig(project="p", node="B", data_dir=str(tmp_path / "data"), agents=[agent])
-    ledger = Ledger(cfg.db_path)
-    return agent, cfg, ledger, Hub(cfg, None, ledger)
-
-
-def _request(ledger, task_id):
-    ledger.create_owned_task(Envelope(type="REQUEST", sender="A:sender", to="B:desk", task_id=task_id,
-                                      body=request_body("test task", "test", kind="query")))
+    agent, cfg, ledger, hub, _ = auto_worker_node(tmp_path)
+    return agent, cfg, ledger, hub
 
 
 def _holder():
@@ -43,8 +32,8 @@ async def test_worker_without_task_env_still_cannot_finish_session_task(tmp_path
     """A child of a worker can lose its environment but is still the worker, not the interactive session."""
     agent, _, ledger, hub = _setup(tmp_path)
     worker_task, session_task = "T-worker", "T-session"
-    _request(ledger, worker_task)
-    _request(ledger, session_task)
+    owned_task(ledger, worker_task)
+    owned_task(ledger, session_task)
     ledger.update_task(worker_task, "owner", status="RUNNING")
     assert ledger.claim_task(worker_task, "worker", ("RUNNING",)) is None
     from mutmuas.node import proc_start
@@ -68,10 +57,10 @@ async def test_worker_without_task_env_still_cannot_finish_session_task(tmp_path
 @pytest.mark.asyncio
 async def test_recovery_does_not_release_a_still_running_worker_to_the_session(tmp_path):
     """An unclean daemon restart must not hand off a task while its detached worker process is alive.
-    Option B: the restart stops it first; only then may the session get the task (no two actors)."""
+    D-040: the old worker is not stopped; the task is skipped while it runs (never two actors)."""
     agent, cfg, ledger, hub = _setup(tmp_path)
     task_id = "T-worker-survives"
-    _request(ledger, task_id)
+    owned_task(ledger, task_id)
     ledger.update_task(task_id, "owner", status="RUNNING")
     assert ledger.claim_task(task_id, "worker", ("RUNNING",)) is None
     worker, session = _holder(), _holder()
@@ -84,10 +73,10 @@ async def test_recovery_does_not_release_a_still_running_worker_to_the_session(t
     daemon._queued["B:desk"] = set()
     try:
         await daemon.recover()
-        worker.wait(5)                              # option B: the surviving worker is stopped at the restart
+        assert worker.poll() is None                # D-040: not stopped, skipped and looked at again
         await daemon._execute(agent, task_id)  # dequeued after restart while the session is present
         task = ledger.task(task_id, "owner")
-        assert task["status"] == "PENDING" and task["runner"] is None     # the session's to decide, worker gone
+        assert task["runner"] == "worker" and task["status"] != "PENDING"
     finally:
         for proc in (worker, session):
             proc.terminate()

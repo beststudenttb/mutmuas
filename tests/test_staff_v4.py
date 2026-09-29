@@ -3,35 +3,6 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
-
-from mutmuas.node import session_fields
-
-
-def _live(cwd) -> dict:
-    return {"pid": os.getpid(), "cwd": str(cwd), "last_seen": datetime.now(timezone.utc).isoformat()}
-
-
-# --------------------------------------------------------------------------- C1: sub-directories of the workdir
-
-
-def test_session_in_a_subdirectory_of_the_workdir_is_not_warned(tmp_path):
-    workdir = tmp_path / "paper"
-    (workdir / "visualrl" / "notes").mkdir(parents=True)
-    assert "session_warning" not in session_fields(_live(workdir / "visualrl"), workdir)
-    assert "session_warning" not in session_fields(_live(workdir / "visualrl" / "notes"), workdir)
-    link = tmp_path / "shortcut"
-    link.symlink_to(workdir / "visualrl")
-    assert "session_warning" not in session_fields(_live(link), workdir)
-
-
-def test_session_outside_the_workdir_is_still_warned(tmp_path):
-    workdir = tmp_path / "paper"
-    workdir.mkdir()
-    sibling = tmp_path / "paper-2"            # shares the prefix, but is not inside the workdir
-    sibling.mkdir()
-    assert "not in its workdir" in session_fields(_live(sibling), workdir)["session_warning"]
-    assert "not in its workdir" in session_fields(_live(tmp_path), workdir)["session_warning"]
 
 
 # --------------------------------------------------------------------------- C2: worker tools come from node.yaml only
@@ -71,43 +42,6 @@ def test_available_tools_are_exactly_what_node_yaml_grants(tmp_path):
     argv, _ = runtime.command(ctx)
     assert argv[argv.index("--tools") + 1] == "Read,Glob,Grep,Edit,Write,Bash"
     assert "Bash(git:*)" in argv[argv.index("--allowedTools") + 1].split(",")
-
-
-def test_worker_refuses_grants_in_an_ancestor_settings_file(tmp_path):
-    """Any .claude/settings.json from the project directory up could widen Bash(git:*) to all of Bash."""
-    import json
-
-    import pytest
-    runtime, ctx, workdir = _claude_ctx(tmp_path, kind="code", permissions=("READ", "WRITE_WORKTREE"))
-    (workdir.parent / ".claude").mkdir()
-    (workdir.parent / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": ["Bash"]}}))
-    with pytest.raises(PermissionError, match="settings.json"):
-        runtime.command(ctx)
-
-
-def test_worker_may_not_edit_the_handoff(tmp_path):
-    """HANDOFF.md belongs to the interactive session (D-030); the worker only appends to worker-log.md."""
-    import json
-    runtime, ctx, workdir = _claude_ctx(tmp_path, kind="code", permissions=("READ", "WRITE_WORKTREE"))
-    argv, _ = runtime.command(ctx)
-    settings = json.loads(open(argv[argv.index("--settings") + 1]).read())
-    handoff = "/" + os.path.realpath(workdir / "HANDOFF.md")          # //abs: an absolute path in a rule
-    assert {f"Edit({handoff})", f"Write({handoff})"} <= set(settings["permissions"]["deny"])
-
-
-def test_worker_refuses_a_project_settings_file_that_grants_tools(tmp_path):
-    """.claude/settings.json of the project directory is loaded (source "project"); tools must come from
-    node.yaml alone (D-032 item 4), so a grant there stops the run instead of silently widening it."""
-    import json
-
-    import pytest
-    runtime, ctx, workdir = _claude_ctx(tmp_path)
-    (workdir / ".claude").mkdir()
-    (workdir / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": ["Bash"]}}))
-    with pytest.raises(PermissionError, match="settings.json"):
-        runtime.command(ctx)
-    (workdir / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"deny": ["Bash"]}}))
-    runtime.command(ctx)                                              # restricting is fine
 
 
 # --------------------------------------------------------------------------- C3: start in the project directory
@@ -219,44 +153,28 @@ async def test_session_cannot_report_progress_on_a_worker_task(tmp_path):
         ledger.close()
 
 
-async def test_restart_stops_a_surviving_worker_and_delivers_its_draft(tmp_path):
-    """Option B (Codex review of f8c105e): no adoption. A worker that submitted its result and still runs at the
-    restart is stopped, and the result it submitted is delivered rather than run again."""
-    import asyncio
-    import subprocess
-    import sys
+async def test_an_old_worker_that_still_runs_gets_its_draft_delivered_once_it_ends(tmp_path):
+    """D-040: a worker that outlived the daemon is not stopped; once it has ended, the draft it submitted is
+    delivered at the next look instead of running the task again."""
+    from conftest import Orphan, auto_worker_node, owned_task
 
-    from mutmuas.config import AgentConfig, NodeConfig
-    from mutmuas.hub import Hub
-    from mutmuas.ledger import Ledger
-    from mutmuas.node import NodeDaemon, proc_start
-    from mutmuas.protocol import Envelope, request_body
-    agent = AgentConfig(id="desk", mode="interactive", auto_worker=True, runtime="script", command=["true"],
-                        workdir=str(tmp_path / "work"))
-    cfg = NodeConfig(project="p", node="B", data_dir=str(tmp_path / "data"), agents=[agent])
-    ledger = Ledger(cfg.db_path)
-    hub = Hub(cfg, None, ledger)
-    ledger.create_owned_task(Envelope(type="REQUEST", sender="A:x", to="B:desk", task_id="T-orphan",
-                                      body=request_body("t", "t")))
-    ledger.update_task("T-orphan", "owner", status="RUNNING")
-    assert ledger.claim_task("T-orphan", "worker", ("RUNNING",)) is None
-    from conftest import Orphan
-    orphan = Orphan("import time; time.sleep(30)")                     # as after a crash: reaped by init
+    from mutmuas.node import proc_start
+    _, _, ledger, _, daemon = auto_worker_node(tmp_path)
+    owned_task(ledger, "T-orphan", "RUNNING", claim="worker")
+    orphan = Orphan("import time; time.sleep(30)")
     ledger.set_runner_pid("T-orphan", orphan.pid, proc_start(orphan.pid))
     ledger.update_task("T-orphan", "owner", result_draft={"status": "complete", "summary": "done by the orphan"})
-    daemon = NodeDaemon(cfg)
-    daemon.hub = hub
-    daemon._queues["B:desk"] = asyncio.Queue()
-    daemon._queued["B:desk"] = set()
     try:
         await daemon.recover()
-        orphan.wait(5)                                                   # stopped at the restart
+        assert ledger.task("T-orphan", "owner")["status"] == "RUNNING"          # skipped while it runs
+        orphan.terminate()
+        orphan.wait(5)
+        await daemon._recover_auto(ledger.task("T-orphan", "owner"))           # the next heartbeat's look
         task = ledger.task("T-orphan", "owner")
         assert task["status"] == "COMPLETED" and task["result"]["summary"] == "done by the orphan"
-        assert not daemon._queued["B:desk"] and not daemon._background
+        assert not daemon._queued["B:desk"]
     finally:
-        if orphan.poll() is None:
-            orphan.kill()
+        orphan.kill()
         ledger.close()
 
 
