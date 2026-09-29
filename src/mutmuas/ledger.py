@@ -114,6 +114,21 @@ CREATE TABLE IF NOT EXISTS failures (
     attempt         INTEGER,
     error           TEXT NOT NULL            -- "<ExceptionType>: <message>"
 );
+
+-- Background jobs a task waits on (D-050): the heartbeat wakes the post when one ends. No time limit.
+CREATE TABLE IF NOT EXISTS jobs (
+    job_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         TEXT NOT NULL,
+    owner           TEXT NOT NULL,
+    pid             INTEGER,                 -- ends when this process is gone (same machine) ...
+    pid_start       TEXT,                    -- ... its start time, since pids get reused
+    done_file       TEXT,                    -- ... or when this file appears
+    log             TEXT,
+    note            TEXT,
+    created_at      TEXT NOT NULL,
+    ended_at        TEXT,
+    ended           TEXT                     -- how it ended: process gone / done-file and its first lines
+);
 """
 
 TASK_JSON_FIELDS = ("request", "result", "result_draft", "input_refs", "output_refs")
@@ -462,6 +477,29 @@ class Ledger:
         text = error if isinstance(error, str) else f"{type(error).__name__}: {error}"
         self.db.execute("INSERT INTO failures (at, stage, address, task_id, attempt, error) VALUES (?,?,?,?,?,?)",
                         (now_iso(), stage, address, task_id, attempt, text))
+
+    def add_job(self, task_id: str, owner: str, pid: int | None, pid_start: str | None, done_file: str | None,
+                log: str | None, note: str | None) -> int:
+        cur = self.db.execute("INSERT INTO jobs (task_id, owner, pid, pid_start, done_file, log, note, created_at)"
+                              " VALUES (?,?,?,?,?,?,?,?)", (task_id, owner, pid, pid_start, done_file, log, note,
+                                                            now_iso()))
+        return cur.lastrowid
+
+    def jobs(self, task_id: str | None = None, owner: str | None = None,
+             open_only: bool = True) -> list[dict[str, Any]]:
+        sql, args = "SELECT * FROM jobs WHERE 1=1", []
+        if task_id:
+            sql += " AND task_id=?"
+            args.append(task_id)
+        if owner:
+            sql += " AND owner=?"
+            args.append(owner)
+        if open_only:
+            sql += " AND ended_at IS NULL"
+        return [dict(r) for r in self.db.execute(sql + " ORDER BY job_id", args)]
+
+    def end_job(self, job_id: int, ended: str) -> None:
+        self.db.execute("UPDATE jobs SET ended_at=?, ended=? WHERE job_id=?", (now_iso(), ended, job_id))
 
     def failures(self, limit: int = 50) -> list[dict[str, Any]]:
         return [dict(r) for r in self.db.execute("SELECT * FROM failures ORDER BY rowid DESC LIMIT ?", (limit,))]

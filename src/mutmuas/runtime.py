@@ -41,6 +41,7 @@ class TaskContext:
     workdir: Path | None = None          # isolated git worktree for code tasks
     git_branch: str | None = None
     on_spawn: Any = None                 # called with the process id once the agent process exists
+    jobs: list[dict[str, Any]] = field(default_factory=list)   # background jobs of this task that have ended
 
     @property
     def cwd(self) -> Path:
@@ -184,6 +185,11 @@ def worker_prompt(ctx: TaskContext) -> str:
     if git_note:
         git_note += ("Run git as `git -C <dir> ...`: only commands that start with git are allowed, so "
                      "`cd <dir> && git ...` is refused.\n")
+    jobs = "".join(f"\n- job {j['job_id']} ({j['note'] or '-'}): {j['ended']}; log {j['log'] or '-'}"
+                   for j in ctx.jobs)
+    if jobs:
+        jobs = ("\nThis task is being resumed: background jobs you registered have ended. Read your PLAN.md and "
+                f"the logs, judge whether each job succeeded, and carry on.{jobs}\n")
     return f"""You are {ctx.address} (role: {ctx.agent.role or ctx.agent.id}) in the mutmuas multi-agent system,
 project "{ctx.node.project}", running on node {ctx.node.node}. Another agent delegated a task to you.
 
@@ -194,8 +200,8 @@ REQUEST:
 Attached artifact references: {json.dumps([a.to_dict() for a in req.artifacts], ensure_ascii=False)}
 
 You have the MCP server "mutmuas" with tools: report_progress, publish_artifact, fetch_artifact,
-submit_result, list_agents, find_agent, send_request, wait_for_result, check_task.
-
+submit_result, list_agents, find_agent, send_request, wait_for_result, check_task, add_job.
+{jobs}
 {git_note}
 Rules:
 1. Work only inside your working directory ({llm_start_dir(ctx)}){' and ' + ', '.join(map(str, code)) if code else ''}
@@ -209,6 +215,9 @@ Rules:
    failed = nothing usable. Never report partial work as complete. List limitations.
 5. If you need something only the requester can provide, say so in follow_up and use status partial or failed.
 6. This task was accepted for you when this run started: do not call accept_task.
+7. Work that runs long (e.g. training): start it detached, `nohup <command> > <log> 2>&1 < /dev/null &`
+   (then `echo $!` is its pid), register it with add_job (pid and/or done_file, log, a one-line note), note in
+   PLAN.md what you wait for, and end this run without submit_result. You are started again when the job ends.
 """
 
 

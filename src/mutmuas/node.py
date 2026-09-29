@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import platform
+import signal
 import socket
 from datetime import datetime, timezone
 from pathlib import Path
@@ -317,6 +318,8 @@ class NodeDaemon:
             agent = self._agent_cfg(task["owner"])
             if agent is None or (agent.mode != "worker" and not agent.auto_worker):
                 continue
+            if hub.ledger.jobs(task["task_id"]):
+                continue        # waits on a background job: the heartbeat wakes it when the job ends
             if agent.auto_worker:
                 await self._recover_auto(task)
                 continue
@@ -572,6 +575,7 @@ class NodeDaemon:
                                             env.body.get("reason") or "withdrawn before it was accepted")
             self.hub.ledger.mark_seen(env.task_id)
             return None
+        self._stop_jobs(env.task_id)
         self._cancel_requested.add(env.task_id)
         runner = self._running.get(env.task_id)
         if runner:
@@ -673,7 +677,8 @@ class NodeDaemon:
         request = hub.ledger.request_envelope(task_id)
         timeout = float(request.body.get("timeout_s") or agent.task_timeout_s)
         hub.ledger.update_task(task_id, "owner", result_draft=None)
-        ctx = TaskContext(task_id, request, agent, self.cfg, attempt)
+        ctx = TaskContext(task_id, request, agent, self.cfg, attempt,
+                          jobs=[j for j in hub.ledger.jobs(task_id, open_only=False) if j["ended_at"]])
         if agent.auto_worker:
             ctx.on_spawn = lambda pid: self._record_worker(task_id, pid)
         wt = None
@@ -708,6 +713,8 @@ class NodeDaemon:
         current = hub.ledger.task(task_id, "owner")
         if current["status"] in TERMINAL_STATES:
             return      # the agent already closed the task through its tools
+        if hub.ledger.jobs(task_id):
+            return      # it waits on a background job it registered: the heartbeat wakes it when the job ends
         if current["status"] == "BLOCKED" and not current.get("result_draft"):
             return      # blocked and nothing to deliver: wait for the requester
         # A submitted result always wins over an earlier BLOCKED report.
@@ -781,6 +788,7 @@ class NodeDaemon:
             try:
                 await self._publish_cards()
                 await self._auto_dispatch()
+                await self._check_jobs()
                 for task_id in list(self._recheck):         # old workers still running at the last look
                     task = self.hub.ledger.task(task_id, "owner")
                     if task and task["status"] not in TERMINAL_STATES:
@@ -794,6 +802,52 @@ class NodeDaemon:
                 raise
             except Exception as e:
                 self._failed("heartbeat", e)
+
+    async def _check_jobs(self) -> None:
+        """Background jobs (D-050): one has ended when its process is gone or its done-file is there. A task whose
+        last job ended is woken: a worker's is queued again (a fresh run, attempts reset), a session is told."""
+        hub = self.hub
+        for job in hub.ledger.jobs():
+            done = Path(job["done_file"]) if job["done_file"] else None
+            if done and done.exists():
+                ended = f"done-file {done} appeared: {done.read_text(errors='replace')[:300].strip()!r}"
+            elif job["pid"] and not same_process(job["pid"], job["pid_start"]):
+                ended = f"process {job['pid']} ended (exit code unknown: write it to a done-file to pass it on)"
+            else:
+                continue
+            hub.ledger.end_job(job["job_id"], ended)
+            task = hub.ledger.task(job["task_id"], "owner")
+            if task["status"] in TERMINAL_STATES or hub.ledger.jobs(job["task_id"]):
+                continue            # closed meanwhile, or still waiting on another job
+            await self._wake_for_job(task, job, ended)
+
+    def _stop_jobs(self, task_id: str) -> None:
+        """A cancelled task's background jobs: a job whose process still runs gets SIGTERM (that pid only, R4.1);
+        a done-file-only job has no process the node knows and is not stopped. Either way it is closed, so it
+        wakes nobody."""
+        for job in self.hub.ledger.jobs(task_id):
+            ended = "cancelled with its task"
+            if job["pid"] and same_process(job["pid"], job["pid_start"]):
+                os.kill(job["pid"], signal.SIGTERM)
+                ended += f"; SIGTERM sent to pid {job['pid']}"
+            elif not job["pid"]:
+                ended += "; a done-file-only job is not stopped (the node knows no process for it)"
+            self.hub.ledger.end_job(job["job_id"], ended)
+
+    async def _wake_for_job(self, task: dict[str, Any], job: dict[str, Any], ended: str) -> None:
+        hub, task_id, owner = self.hub, task["task_id"], task["owner"]
+        text = f"background job ended: {ended}; log {job['log'] or '-'}; note {job['note'] or '-'}"
+        agent = self._agent_cfg(owner)
+        if agent.mode == "worker" or (agent.auto_worker and task.get("runner") != "session"):
+            hub.ledger.update_task(task_id, "owner", attempts=0)
+            await hub.owner_transition(task_id, "ACCEPTED", text)
+            self._enqueue(owner, task_id)
+            return
+        # A session: a note in its own inbox that hands it the baton (next), which wakes it like a REQUEST.
+        wake = Envelope(type="UPDATE", sender=owner, to=owner, task_id=task_id, body={"message": text, "next": owner})
+        hub.ledger.ingest(wake)
+        hub.ledger.mark_handled(wake.message_id)
+        await hub.owner_transition(task_id, "RUNNING", text)
 
     async def _follow_ups(self) -> None:
         """Chase replies this node is owed (like an email client's follow-up flag), each once:

@@ -139,7 +139,8 @@ async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, 
     show=False: a notifier's read (watch, push), which does not count as showing the mail to the session."""
     addr, _ = hub.local_agent(me)
     # A message that hands me the baton (body.next == me) needs me as much as a REQUEST does.
-    next_to = str(addr) if types == WAKE else None
+    # (a notifier's ACTIONABLE view too: Codex's watch, which then sees a background job's wake-up)
+    next_to = str(addr) if types in (WAKE, ACTIONABLE) else None
     own_results = bool(next_to) and hub.local_agent(me)[1].wake_on_own_results   # no-stall G2, per agent, off
                                                                                  # unless the leader turns it on
     if wait_s and not include_seen:
@@ -234,6 +235,28 @@ async def accept_task(hub: Hub, me: str, task_id: str) -> dict[str, Any]:
     ok = await hub.owner_transition(task_id, "RUNNING", f"accepted by {me}", msg_type="ACK",
                                     body={"state": "RUNNING", "message": f"accepted by {me}"})
     return {"task_id": task_id, "accepted": ok}
+
+
+async def add_job(hub: Hub, me: str, task_id: str | None = None, pid: int | None = None,
+                  done_file: str | None = None, log: str | None = None, note: str | None = None) -> dict[str, Any]:
+    """Register a background job (e.g. training) the task waits on (D-050). The task becomes WAITING; a worker may
+    then exit without a result, and is not treated as failed. The node's heartbeat notices when the job ends
+    (process pid gone, or done_file appears) and wakes the post: a worker's task is queued again, a session gets
+    a wake-up. No time limit."""
+    from .node import proc_start
+    task_id = task_id or _current_task()
+    if not task_id:
+        raise ValueError("task_id is required outside of a delegated task")
+    if pid is None and not done_file:
+        raise ValueError("give pid or done_file: how the node tells that the job has ended")
+    task = _owned(hub, me, task_id)
+    _check_actor(hub, task)
+    job_id = hub.ledger.add_job(task_id, task["owner"], pid, proc_start(pid) if pid else None, done_file, log,
+                                note)
+    what = note or (f"pid {pid}" if pid else f"until {done_file}")
+    await hub.owner_transition(task_id, "WAITING", f"waiting on a background job ({what}); resumes when it ends",
+                               body={"state": "WAITING", "message": f"waiting on a background job ({what})"})
+    return {"task_id": task_id, "job_id": job_id, "state": "WAITING"}
 
 
 async def reject_task(hub: Hub, me: str, task_id: str, reason: str) -> dict[str, Any]:
@@ -395,6 +418,8 @@ async def whoami(hub: Hub, me: str | None = None) -> dict[str, Any]:
            "coordinator": str(addr) in (hub.cfg.coordinators or [])}
     if agent.mode == "interactive":
         out.update(session_fields(hub.ledger.session_of(str(addr))))
+    out["jobs_waiting"] = [{k: j[k] for k in ("job_id", "task_id", "pid", "done_file", "log", "note", "created_at")}
+                           for j in hub.ledger.jobs(owner=str(addr))]
     if agent.auto_worker:
         out["auto_worker"] = True
         out["worker_running"] = [_worker_run(hub, t, agent) for t in hub.ledger.tasks(

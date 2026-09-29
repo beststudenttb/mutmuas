@@ -35,7 +35,7 @@ Addresses and ids used in subjects allow `[A-Za-z0-9_-]` only.
 | `BLOCKED` | owner → requester | `reason` | `needs` | BLOCKED |
 | `RESULT` | owner → requester | `status`, `summary` | `outputs`, `evidence`, `limitations`, `follow_up` | COMPLETED (complete/partial) · FAILED (failed) |
 | `REJECT` | owner → requester | `reason` | – | FAILED |
-| `CANCEL` | requester → owner | – | `reason` | CANCELLED (running process is killed) |
+| `CANCEL` | requester → owner | – | `reason` | CANCELLED (running process is killed; so are its registered background jobs' processes) |
 | `ERROR` | either | `code`, `message` | – | requester side: FAILED |
 
 `kind` (REQUEST) selects the permission the owner must hold:
@@ -74,6 +74,14 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   (`agentctl ask --leader`, `leader` in a `send` file or in the MCP `send_request`); it is not checked (D-035).
   A worker's queue runs such tasks first, the rest in arrival order; a running task is not stopped. The
   session's inbox lists them first; a watcher's `--peek` keeps arrival order (its cursor is the last row).
+- **Long jobs** (D-050): the owner of a task registers a background job it waits on (`agentctl job add --pid
+  <pid> --done-file <path> --log <path> --note <line>`, or the MCP `add_job`). The task becomes WAITING, and a worker
+  may end its run without a result: it is neither finished nor retried, and a restart leaves it alone. Each
+  heartbeat checks every open job; a job has ended when its process is gone (same machine; the exit code is not
+  known, so write it into the done-file) or its done-file exists. When the task's last job ends, a worker's task is
+  queued again as a fresh run (attempts reset; the prompt says how each job ended). A session instead gets a note
+  in its own inbox with `next` set to itself, which wakes it. There is no time limit; `whoami` lists
+  `jobs_waiting`.
 - `next: <address>` on RESULT, UPDATE, QUESTION or ANSWER names whose move it is. That agent is woken exactly
   as by a REQUEST, even by an UPDATE. Put it on the last message of every thread whose next step belongs to
   someone.

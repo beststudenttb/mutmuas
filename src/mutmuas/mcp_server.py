@@ -308,6 +308,15 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         return dump(await tools.report_progress(hub(), state["me"], message, task_id, state_, next=next))
 
     @server.tool()
+    async def add_job(pid: int | None = None, done_file: str | None = None, log: str | None = None,
+                      note: str | None = None, task_id: str | None = None) -> str:
+        """Register a background job (e.g. training, started detached) your task waits on. The task becomes
+        WAITING; you may then end without a result. The node wakes you when the job ends: pid gone, or done_file
+        appears (write the exit code into it). note: one line on what runs and what to do next."""
+        return dump(await tools.add_job(hub(), state["me"], task_id, pid=pid, done_file=done_file, log=log,
+                                        note=note))
+
+    @server.tool()
     async def submit_result(status: str, summary: str, task_id: str | None = None,
                             outputs: dict[str, Any] | None = None, artifacts: list[dict[str, Any]] | None = None,
                             evidence: list[str] | None = None, limitations: list[str] | None = None,

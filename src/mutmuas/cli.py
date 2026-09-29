@@ -323,7 +323,8 @@ async def cmd_watch(args, hub: Hub):
         text = f"{len(rows)} new: {first['type']} from {first['from']}"
         if not args.headers_only:
             body = first["body"]
-            note = body.get("objective") or body.get("summary") or body.get("question") or body.get("reason") or ""
+            note = (body.get("objective") or body.get("summary") or body.get("question") or body.get("reason")
+                    or body.get("message") or "")
             text += f": {str(note)[:120]}"
         _desktop_notify(f"mutmuas → {addr}", text, dry_run=args.dry_run)
         cursor_file.write_text(str(max(r["seq"] for r in rows)))
@@ -357,6 +358,11 @@ async def cmd_reject(args, hub: Hub):
 async def cmd_update(args, hub: Hub):
     _print(await tools.report_progress(hub, _me(args), args.message, args.task, args.state, next=args.next),
            args.json)
+
+
+async def cmd_job(args, hub: Hub):
+    _print(await tools.add_job(hub, _me(args), args.task, pid=args.pid, done_file=args.done_file, log=args.log,
+                               note=args.note), args.json)
 
 
 async def cmd_submit(args, hub: Hub):
@@ -791,6 +797,13 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--task")
     p.add_argument("--state", choices=["RUNNING", "WAITING", "BLOCKED"])
     p.add_argument("--next", metavar="ADDR", help="whose move it is now (wakes them)")
+    p = add("job", cmd_job, "register a background job my task waits on; the node wakes me when it ends", bus=False)
+    p.add_argument("action", choices=["add"])
+    p.add_argument("--task", help="default: $MUTMUAS_TASK_ID (inside a worker run)")
+    p.add_argument("--pid", type=int, help="ends when this process is gone (same machine)")
+    p.add_argument("--done-file", help="ends when this file appears (write the exit code into it)")
+    p.add_argument("--log")
+    p.add_argument("--note", help="one line: what runs, and what to do when it ends")
     p = add("submit-result", cmd_submit, "finish a task I own", bus=False)
     p.add_argument("--task")
     p.add_argument("--status", choices=["complete", "partial", "failed"])
