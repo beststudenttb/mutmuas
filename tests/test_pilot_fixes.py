@@ -47,3 +47,11 @@ async def test_a_plain_workers_accept_does_not_hand_its_task_to_the_session(tmp_
 def test_the_worker_prompt_says_the_task_is_already_accepted(tmp_path):
     _, ctx, _ = _claude_ctx(tmp_path)
     assert "do not call accept_task" in worker_prompt(ctx)
+
+
+def test_the_worker_prompt_says_how_to_run_git(tmp_path):
+    """The pilot's worker ran 'cd <worktree> && git ...', which Bash(git:*) does not match."""
+    _, ctx, _ = _claude_ctx(tmp_path, kind="code", permissions=("READ", "WRITE_WORKTREE"))
+    ctx.git_branch = "mutmuas/C/paper-visualrl/T-1"
+    prompt = worker_prompt(ctx)
+    assert "git -C <dir>" in prompt and "cd <dir> && git" in prompt

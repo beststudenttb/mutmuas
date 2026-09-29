@@ -181,6 +181,9 @@ def worker_prompt(ctx: TaskContext) -> str:
     if ctx.agent.code_mode == "direct" and code:
         git_note += (f"\nThe project code is in {', '.join(map(str, code))}. Edit it in place and commit promptly "
                      "with a clear message (git -C <dir>); a mistake is undone with git.\n")
+    if git_note:
+        git_note += ("Run git as `git -C <dir> ...`: only commands that start with git are allowed, so "
+                     "`cd <dir> && git ...` is refused.\n")
     return f"""You are {ctx.address} (role: {ctx.agent.role or ctx.agent.id}) in the mutmuas multi-agent system,
 project "{ctx.node.project}", running on node {ctx.node.node}. Another agent delegated a task to you.
 
