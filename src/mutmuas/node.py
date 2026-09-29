@@ -360,7 +360,7 @@ class NodeDaemon:
             if agent is None or (agent.mode != "worker" and not agent.auto_worker):
                 continue
             if agent.auto_worker:
-                await self._recover_auto(agent, task)
+                await self._recover_auto(task)
                 continue
             if task["status"] not in ("PENDING", "ACCEPTED", "RUNNING"):
                 continue
@@ -897,7 +897,7 @@ class NodeDaemon:
             raise RuntimeError(f"could not read the start time of worker process {pid}; stopped it")
         self.hub.ledger.set_runner_pid(task_id, pid, start)
 
-    async def _recover_auto(self, agent: AgentConfig, task: dict[str, Any]) -> None:
+    async def _recover_auto(self, task: dict[str, Any]) -> None:
         """auto_worker after a restart (option B, Codex reviews of f8c105e and e6a9df9): no task is adopted, and
         a task is run again only once nothing of its old worker runs.
         - The recorded worker still runs (pid and start time match): stop its whole process group.
