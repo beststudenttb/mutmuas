@@ -478,7 +478,7 @@ class NodeDaemon:
             return "rejected"
         known = acl(self.hub.ledger, env.task_id)
         if known:
-            row = self._any_task_row(env.task_id)          # every row of a task has the same requester/owner
+            row = self.hub.ledger.task(env.task_id)        # every row of a task has the same requester/owner
             if env.sender not in (row["requester"], row["owner"]):
                 # Content copies come from the requester or owner only; an observer's grant is relayed by the
                 # owner (Codex reviews of 8c018ee and d13ffc8), so an observer never authors one.
@@ -492,9 +492,6 @@ class NodeDaemon:
 
     def _still_unverified(self, message_id: str) -> bool:
         return self.hub.ledger.inbound_state(message_id) in (None, "new", "unverified")
-
-    def _any_task_row(self, task_id: str) -> dict[str, Any]:
-        return self.hub.ledger.task(task_id)          # every row of a task has the same requester/owner
 
     # The copy and the owner's task record travel separately, so the record may not be there yet: look again
     # with growing gaps, then every last gap until it appears (Codex reviews of 8c018ee and d13ffc8).
