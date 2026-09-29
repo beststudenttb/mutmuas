@@ -280,22 +280,15 @@ def make_runtime(agent: AgentConfig, node: NodeConfig) -> SubprocessRuntime:
 
 
 def _last_json(text: str) -> dict[str, Any] | None:
-    """The last line (or fenced block) of text that parses as a JSON object."""
-    if not text:
-        return None
-    candidates: list[str] = []
-    if "```" in text:
-        for block in text.split("```")[1::2]:
-            candidates.append(block.removeprefix("json").strip())
-    candidates.extend(line.strip() for line in text.splitlines() if line.strip().startswith("{"))
-    candidates.append(text.strip())
-    for cand in reversed(candidates):
-        try:
-            value = json.loads(cand)
-        except ValueError:
-            continue
-        if isinstance(value, dict):
-            return value
+    """The last line of text that starts a JSON object, if it is one (a script's result line, claude -p's output).
+    A result is normally submitted through submit_result; this is the fallback."""
+    for line in reversed((text or "").splitlines()):
+        if line.strip().startswith("{"):
+            try:
+                value = json.loads(line)
+            except ValueError:
+                return None
+            return value if isinstance(value, dict) else None
     return None
 
 
