@@ -187,7 +187,7 @@ async def cmd_ask(args, hub: Hub):
         inputs=_parse_kv(args.input) or None, expected_outputs=args.expect, acceptance_criteria=args.accept,
         constraints=args.constraint, timeout_s=args.timeout, priority=args.priority,
         reply=args.reply, deadline=_parse_due(args.due), observers=args.observer,
-        artifacts=[{"uri": uri} for uri in args.artifact or []])
+        artifacts=[{"uri": uri} for uri in args.artifact or []], leader=args.leader)
     if args.wait is not None:
         out = await tools.wait_for_result(hub, out["task_id"], args.wait, me=_me(args))
     _print(out, args.json)
@@ -200,7 +200,7 @@ async def cmd_send(args, hub: Hub):
     msg_type = args.type.upper()
     if msg_type == "REQUEST":
         fields = ("kind", "inputs", "expected_outputs", "constraints", "acceptance_criteria", "timeout_s", "deadline",
-                  "reply", "observers")
+                  "reply", "observers", "leader")
         unknown = sorted(set(body) - set(fields) - {"objective", "reason", "priority"})
         if unknown:   # never drop content silently; free-form data belongs in inputs
             raise SystemExit(f"error: unknown REQUEST field(s) {unknown}; put free-form data under 'inputs'. "
@@ -731,6 +731,8 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p = add("ask", cmd_ask, "send a REQUEST quickly")
     p.add_argument("to")
     p.add_argument("objective")
+    p.add_argument("--leader", action="store_true",
+                   help="the leader asked for this task: it goes first in the owner's queue (D-049)")
     p.add_argument("--reason")
     p.add_argument("--kind", default="query", choices=["query", "artifact", "experiment", "code"])
     p.add_argument("--input", action="append", help="key=value (value may be JSON)")

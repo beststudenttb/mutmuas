@@ -334,6 +334,8 @@ Known risks (protections removed on purpose; one line each):
 - A result printed only inside a Markdown fence, mid-output or over several lines is not parsed (use
   submit_result).
 - A typo in a node.yaml key gives Python's TypeError instead of a one-line message.
+- Tasks created in the same millisecond may run in either order after a restart (the queue orders by created_at;
+  Codex T-20260929122530-54280d88).
 
 ## 9. Uninstall
 

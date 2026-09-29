@@ -24,7 +24,7 @@ def _node(tmp_path, mode="worker", **extra):
     ledger = Ledger(cfg.db_path)
     daemon = NodeDaemon(cfg)
     daemon.hub = Hub(cfg, None, ledger)
-    daemon._queues["B:desk"] = asyncio.Queue()
+    daemon._queues["B:desk"] = asyncio.PriorityQueue()
     daemon._queued["B:desk"] = set()
     return agent, ledger, daemon
 
@@ -144,3 +144,26 @@ async def test_agentctl_job_add(monkeypatch):
                                              "--note", "n", "--as", "B:desk"])
     await cli.cmd_job(args, None)
     assert calls == [("T-j", {"pid": 42, "done_file": None, "log": "l", "note": "n"})]
+
+
+async def test_a_woken_task_keeps_the_leader_first_order(tmp_path):
+    """Woken tasks are queued like any other (D-049): a leader task whose job ended goes before queued ones."""
+    from mutmuas.protocol import Envelope, request_body
+    _, ledger, daemon = _node(tmp_path)
+    for task_id in ("T-1", "T-2"):
+        owned_task(ledger, task_id, "ACCEPTED", ingest=True)
+        daemon._enqueue("B:desk", task_id)
+    env = Envelope(type="REQUEST", sender="A:sender", to="B:desk", task_id="T-L",
+                   body=request_body("train", "test", leader=True))
+    ledger.ingest(env)
+    ledger.create_owned_task(env)
+    ledger.update_task("T-L", "owner", status="RUNNING")
+    done = tmp_path / "train.done"
+    await tools.add_job(daemon.hub, "B:desk", "T-L", done_file=str(done))
+    done.write_text("0")
+    try:
+        await daemon._check_jobs()
+        queue = daemon._queues["B:desk"]
+        assert [queue.get_nowait()[-1] for _ in range(queue.qsize())] == ["T-L", "T-1", "T-2"]
+    finally:
+        ledger.close()
