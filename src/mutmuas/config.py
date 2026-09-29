@@ -186,11 +186,7 @@ def _build(cls, raw: dict[str, Any], where: str):
         raw = {}
     if not isinstance(raw, dict):
         raise ConfigError(f"{where} must be a mapping")
-    known = cls.__dataclass_fields__
-    unknown = sorted(set(raw) - set(known))
-    if unknown:
-        raise ConfigError(f"{where}: unknown key(s) {unknown}")
-    return cls(**raw)
+    return cls(**raw)                    # an unknown key raises TypeError (no friendlier message: D-039)
 
 
 def load_config(path: str | Path) -> NodeConfig:

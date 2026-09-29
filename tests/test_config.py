@@ -31,12 +31,18 @@ def test_example_configs_load(tmp_path, name):
     ({"agents": [{"id": "x", "mode": "worker"}]}, "need runtime"),
     ({"agents": [{"id": "x", "mode": "interactive", "permissions": ["GOD"]}]}, "unknown permission"),
     ({"agents": [{"id": "x", "mode": "interactive"}, {"id": "x", "mode": "interactive"}]}, "duplicate"),
-    ({"agnets": []}, "unknown key"),
 ])
 def test_config_errors(tmp_path, patch, message):
     path = tmp_path / "n.yaml"
     path.write_text(yaml.safe_dump({"project": "p", "node": "A", **patch}))
     with pytest.raises(ConfigError, match=message):
+        load_config(path)
+
+
+def test_an_unknown_key_is_refused(tmp_path):
+    path = tmp_path / "n.yaml"
+    path.write_text(yaml.safe_dump({"project": "p", "node": "A", "agnets": []}))
+    with pytest.raises(TypeError, match="agnets"):
         load_config(path)
 
 
