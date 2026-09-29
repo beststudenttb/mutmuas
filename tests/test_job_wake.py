@@ -167,3 +167,54 @@ async def test_a_woken_task_keeps_the_leader_first_order(tmp_path):
         assert [queue.get_nowait()[-1] for _ in range(queue.qsize())] == ["T-L", "T-1", "T-2"]
     finally:
         ledger.close()
+
+
+async def test_codex_watch_announces_a_job_wake_up(tmp_path, monkeypatch):
+    """agentctl watch (Codex's notifier) reads the ACTIONABLE view, which has no UPDATE; the wake-up hands the
+    session the baton (next), which that view now includes (Codex light review T-20260929123848-7f5ea09e ①)."""
+    _, ledger, daemon = _node(tmp_path, mode="interactive")
+    owned_task(ledger, "T-j", "RUNNING", ingest=True)
+    done = tmp_path / "train.done"
+    await tools.add_job(daemon.hub, "B:desk", "T-j", done_file=str(done), note="training")
+    shown = []
+    monkeypatch.setattr(cli, "_desktop_notify", lambda title, text, dry_run=False: shown.append(text))
+    args = cli.agentctl_parser().parse_args(["watch", "--interval", "5", "--dry-run", "--as", "B:desk"])
+    watch = asyncio.create_task(cli.cmd_watch(args, daemon.hub))
+    try:
+        await asyncio.sleep(0.2)                  # the watch has set its cursor
+        done.write_text("exit 0\n")
+        await daemon._check_jobs()
+        for _ in range(50):
+            if shown:
+                break
+            await asyncio.sleep(0.1)
+        assert shown and "UPDATE from B:desk" in shown[0] and "background job ended" in shown[0]
+    finally:
+        watch.cancel()
+        await asyncio.gather(watch, return_exceptions=True)
+        ledger.close()
+
+
+async def test_cancelling_a_waiting_task_stops_its_job_and_nothing_wakes_later(tmp_path):
+    """Codex light review ②: the worker has exited, so there is no runner to cancel; the job's process is stopped
+    and its jobs are closed. A done-file-only job is closed but not stopped (no process known)."""
+    from mutmuas.protocol import Envelope
+    _, ledger, daemon = _node(tmp_path)
+    owned_task(ledger, "T-j", "RUNNING", ingest=True)
+    job = _sleeper()
+    done = tmp_path / "eval.done"
+    await tools.add_job(daemon.hub, "B:desk", "T-j", pid=job.pid, note="training")
+    await tools.add_job(daemon.hub, "B:desk", "T-j", done_file=str(done), note="eval")
+    try:
+        await daemon._on_cancel(Envelope(type="CANCEL", sender="A:sender", to="B:desk", task_id="T-j",
+                                         body={"reason": "not needed"}))
+        job.wait(5)                                                     # the process is gone
+        assert ledger.task("T-j", "owner")["status"] == "CANCELLED" and ledger.jobs("T-j") == []
+        ended = {j["note"]: j["ended"] for j in ledger.jobs("T-j", open_only=False)}
+        assert "SIGTERM" in ended["training"] and "not stopped" in ended["eval"]
+        done.write_text("0")
+        await daemon._check_jobs()
+        assert "T-j" not in daemon._queued["B:desk"]
+    finally:
+        job.kill()
+        ledger.close()

@@ -35,7 +35,7 @@ Addresses and ids used in subjects allow `[A-Za-z0-9_-]` only.
 | `BLOCKED` | owner → requester | `reason` | `needs` | BLOCKED |
 | `RESULT` | owner → requester | `status`, `summary` | `outputs`, `evidence`, `limitations`, `follow_up` | COMPLETED (complete/partial) · FAILED (failed) |
 | `REJECT` | owner → requester | `reason` | – | FAILED |
-| `CANCEL` | requester → owner | – | `reason` | CANCELLED (running process is killed) |
+| `CANCEL` | requester → owner | – | `reason` | CANCELLED (running process is killed; so are its registered background jobs' processes) |
 | `ERROR` | either | `code`, `message` | – | requester side: FAILED |
 
 `kind` (REQUEST) selects the permission the owner must hold:

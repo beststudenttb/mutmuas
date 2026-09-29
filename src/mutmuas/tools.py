@@ -139,7 +139,8 @@ async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, 
     show=False: a notifier's read (watch, push), which does not count as showing the mail to the session."""
     addr, _ = hub.local_agent(me)
     # A message that hands me the baton (body.next == me) needs me as much as a REQUEST does.
-    next_to = str(addr) if types == WAKE else None
+    # (a notifier's ACTIONABLE view too: Codex's watch, which then sees a background job's wake-up)
+    next_to = str(addr) if types in (WAKE, ACTIONABLE) else None
     own_results = bool(next_to) and hub.local_agent(me)[1].wake_on_own_results   # no-stall G2, per agent, off
                                                                                  # unless the leader turns it on
     if wait_s and not include_seen:

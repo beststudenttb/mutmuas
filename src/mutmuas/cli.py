@@ -323,7 +323,8 @@ async def cmd_watch(args, hub: Hub):
         text = f"{len(rows)} new: {first['type']} from {first['from']}"
         if not args.headers_only:
             body = first["body"]
-            note = body.get("objective") or body.get("summary") or body.get("question") or body.get("reason") or ""
+            note = (body.get("objective") or body.get("summary") or body.get("question") or body.get("reason")
+                    or body.get("message") or "")
             text += f": {str(note)[:120]}"
         _desktop_notify(f"mutmuas → {addr}", text, dry_run=args.dry_run)
         cursor_file.write_text(str(max(r["seq"] for r in rows)))

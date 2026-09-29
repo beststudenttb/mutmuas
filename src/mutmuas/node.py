@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import platform
+import signal
 import socket
 from datetime import datetime, timezone
 from pathlib import Path
@@ -574,6 +575,7 @@ class NodeDaemon:
                                             env.body.get("reason") or "withdrawn before it was accepted")
             self.hub.ledger.mark_seen(env.task_id)
             return None
+        self._stop_jobs(env.task_id)
         self._cancel_requested.add(env.task_id)
         runner = self._running.get(env.task_id)
         if runner:
@@ -818,6 +820,19 @@ class NodeDaemon:
             if task["status"] in TERMINAL_STATES or hub.ledger.jobs(job["task_id"]):
                 continue            # closed meanwhile, or still waiting on another job
             await self._wake_for_job(task, job, ended)
+
+    def _stop_jobs(self, task_id: str) -> None:
+        """A cancelled task's background jobs: a job whose process still runs gets SIGTERM (that pid only, R4.1);
+        a done-file-only job has no process the node knows and is not stopped. Either way it is closed, so it
+        wakes nobody."""
+        for job in self.hub.ledger.jobs(task_id):
+            ended = "cancelled with its task"
+            if job["pid"] and same_process(job["pid"], job["pid_start"]):
+                os.kill(job["pid"], signal.SIGTERM)
+                ended += f"; SIGTERM sent to pid {job['pid']}"
+            elif not job["pid"]:
+                ended += "; a done-file-only job is not stopped (the node knows no process for it)"
+            self.hub.ledger.end_job(job["job_id"], ended)
 
     async def _wake_for_job(self, task: dict[str, Any], job: dict[str, Any], ended: str) -> None:
         hub, task_id, owner = self.hub, task["task_id"], task["owner"]
