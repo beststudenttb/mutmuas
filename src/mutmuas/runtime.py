@@ -181,6 +181,9 @@ def worker_prompt(ctx: TaskContext) -> str:
     if ctx.agent.code_mode == "direct" and code:
         git_note += (f"\nThe project code is in {', '.join(map(str, code))}. Edit it in place and commit promptly "
                      "with a clear message (git -C <dir>); a mistake is undone with git.\n")
+    if git_note:
+        git_note += ("Run git as `git -C <dir> ...`: only commands that start with git are allowed, so "
+                     "`cd <dir> && git ...` is refused.\n")
     return f"""You are {ctx.address} (role: {ctx.agent.role or ctx.agent.id}) in the mutmuas multi-agent system,
 project "{ctx.node.project}", running on node {ctx.node.node}. Another agent delegated a task to you.
 
@@ -205,6 +208,7 @@ Rules:
    complete = every acceptance criterion met; partial = some output but not all criteria;
    failed = nothing usable. Never report partial work as complete. List limitations.
 5. If you need something only the requester can provide, say so in follow_up and use status partial or failed.
+6. This task was accepted for you when this run started: do not call accept_task.
 """
 
 
@@ -218,8 +222,9 @@ class ClaudeCodeRuntime(SubprocessRuntime):
         cfg_path = self.node.data_path / "runs" / f"{ctx.task_id}.mcp.json"
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         cfg_path.write_text(json.dumps({"mcpServers": {"mutmuas": _mcp_server_spec(ctx)}}))
-        tools = ["mcp__mutmuas", "Read", "Glob", "Grep"]          # pre-approved (--allowedTools)
-        available = ["Read", "Glob", "Grep"]                       # all that exists (--tools; MCP tools stay)
+        # Skill: the project's skills (pilot 2026-09-29: without it in --tools a worker could not use them)
+        tools = ["mcp__mutmuas", "Read", "Glob", "Grep", "Skill"]   # pre-approved (--allowedTools)
+        available = ["Read", "Glob", "Grep", "Skill"]                # all that exists (--tools; MCP tools stay)
         if ctx.allows("WRITE_WORKTREE"):
             tools += ["Edit", "Write", "Bash(git:*)"]
             available += ["Edit", "Write", "Bash"]
