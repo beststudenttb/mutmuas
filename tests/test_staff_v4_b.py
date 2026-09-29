@@ -268,3 +268,17 @@ async def test_an_unreadable_start_time_of_a_live_pid_quarantines(tmp_path, monk
         other.kill()
         other.wait(5)
         ledger.close()
+
+
+def test_process_probes_contract(monkeypatch):
+    """_ppid, proc_start and _zombie read /proc or an absolute-path ps; on failure they say "not known" (None or
+    False), never a guess (pinned before cleanup #1 merged their shared reading)."""
+    me = os.getpid()
+    assert node_mod._ppid(me) == os.getppid()
+    assert node_mod.proc_start(me) and node_mod.proc_start(me) == node_mod.proc_start(me)
+    assert node_mod._zombie(me) is False
+    gone = 2 ** 22 + 54321                                             # no such process
+    assert node_mod._ppid(gone) is None and node_mod.proc_start(gone) is None and node_mod._zombie(gone) is False
+    monkeypatch.setattr(node_mod, "_PS", None)
+    if not os.path.exists(f"/proc/{me}/stat"):                         # macOS: no /proc, and now no ps either
+        assert node_mod._ppid(me) is None and node_mod.proc_start(me) is None and node_mod._zombie(me) is False
