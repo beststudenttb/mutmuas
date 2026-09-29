@@ -389,7 +389,7 @@ async def whoami(hub: Hub, me: str | None = None) -> dict[str, Any]:
            "inbox_unread": hub.ledger.unseen_count(str(addr)),
            "coordinator": str(addr) in (hub.cfg.coordinators or [])}
     if agent.mode == "interactive":
-        out.update(session_fields(hub.ledger.session_of(str(addr)), agent.workdir_path))
+        out.update(session_fields(hub.ledger.session_of(str(addr))))
     if agent.auto_worker:
         out["auto_worker"] = True
         out["worker_running"] = [_worker_run(hub, t, agent) for t in hub.ledger.tasks(

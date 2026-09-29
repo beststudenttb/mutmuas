@@ -62,7 +62,7 @@ def _pid_alive(pid: int) -> bool:
 
 
 def session_alive(session: dict[str, Any]) -> bool:
-    return session_fields(session, Path("/")).get("session") == "online"
+    return session_fields(session).get("session") == "online"
 
 
 def session_present(ledger, agent: str) -> str | None:
@@ -175,7 +175,7 @@ def public_session(fields: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in fields.items() if k in ("session", "session_seen")}
 
 
-def session_fields(session: dict[str, Any] | None, workdir: Path) -> dict[str, Any]:
+def session_fields(session: dict[str, Any] | None) -> dict[str, Any]:
     """Registry card view of an interactive agent's session, from its MCP process heartbeat.
     unknown: no session has ever registered (e.g. one without the mutmuas MCP server)."""
     if session is None:
@@ -185,10 +185,6 @@ def session_fields(session: dict[str, Any] | None, workdir: Path) -> dict[str, A
     out: dict[str, Any] = {"session": "online" if online else "offline", "session_seen": session["last_seen"]}
     if online and session.get("cwd"):
         out["session_cwd"] = session["cwd"]
-        if not Path(os.path.realpath(session["cwd"])).is_relative_to(os.path.realpath(workdir)):
-            # Claude Code keeps memory per start directory: the wrong one means an empty memory. A project
-            # directory below the workdir is the right one (staff system v4, D-029).
-            out["session_warning"] = f"session started in {session['cwd']}, not in its workdir {workdir}"
     return out
 
 
@@ -798,21 +794,6 @@ class NodeDaemon:
             except Exception as e:
                 self._failed("heartbeat", e)
 
-    async def _warn_session_dir(self, addr: str, session: dict[str, Any] | None, workdir: Path) -> None:
-        """A session started outside its workdir gets an empty memory: tell the agent and the coordinators,
-        once per session."""
-        warning = session_fields(session, workdir).get("session_warning")
-        if not warning or not self.hub.ledger.notice_once(f"session:{addr}:{session['started_at']}", "cwd"):
-            return
-        for target, extra in ((addr, {"next": addr}), *((c, {}) for c in self.cfg.coordinators if c != addr)):
-            try:
-                await self.hub.send(Envelope(type="UPDATE", sender=addr, to=target,
-                                             task_id=f"session-{self.cfg.node}", body={
-                                                 "message": f"session warning for {addr}: {warning}",
-                                                 "fyi": True, "follow_up": "session_dir", **extra}))
-            except Exception as e:
-                log.warning("session warning to %s failed: %r", target, e)
-
     async def _follow_ups(self) -> None:
         """Chase replies this node is owed (like an email client's follow-up flag), each once:
         - overdue: reply required, deadline passed, no RESULT yet;
@@ -935,13 +916,11 @@ class NodeDaemon:
                 # Public layer only (visibility.py): coarse availability, no current task, queue or inbox
                 # counts, no session directory. The agent reads its own details locally (whoami).
                 "state": state, "availability": "busy" if running or owned_open else "available",
-                **(public_session(session_fields(hub.ledger.session_of(addr), agent.workdir_path))
+                **(public_session(session_fields(hub.ledger.session_of(addr)))
                    if agent.mode == "interactive" else {}),
                 "heartbeat_s": self.cfg.heartbeat_s, "last_heartbeat": now}
             await bus.kv_put(bus.names.agents_kv, f"{self.cfg.node}.{agent.id}",
                              {k: v for k, v in card.items() if k in CARD_KEYS})
-            if agent.mode == "interactive":
-                await self._warn_session_dir(addr, hub.ledger.session_of(addr), agent.workdir_path)
 
     # ---- outbox -------------------------------------------------------
 
