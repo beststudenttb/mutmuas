@@ -24,7 +24,7 @@ def _current_task() -> str | None:
 
 
 def card_summary(card: dict[str, Any]) -> dict[str, Any]:
-    keys = ("address", "display", "role", "mode", "runtime", "provider", "model", "capabilities", "permissions",
+    keys = ("address", "display", "role", "mode", "auto_worker", "runtime", "provider", "model", "capabilities", "permissions",
             "accept_from", "state", "availability", "online", "last_heartbeat", "session", "session_seen",
             "description")
     return {k: card.get(k) for k in keys if card.get(k) not in (None, "", [])}

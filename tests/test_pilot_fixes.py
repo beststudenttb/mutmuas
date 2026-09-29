@@ -55,3 +55,9 @@ def test_the_worker_prompt_says_how_to_run_git(tmp_path):
     ctx.git_branch = "mutmuas/C/paper-visualrl/T-1"
     prompt = worker_prompt(ctx)
     assert "git -C <dir>" in prompt and "cd <dir> && git" in prompt
+
+
+def test_agents_json_shows_auto_worker():
+    """The card carries auto_worker (CARD_KEYS); the summary agents and find_agent print dropped it."""
+    card = {"address": "B:desk", "mode": "interactive", "auto_worker": True}
+    assert tools.card_summary(card)["auto_worker"] is True
