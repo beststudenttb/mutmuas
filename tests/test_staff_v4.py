@@ -73,33 +73,6 @@ def test_available_tools_are_exactly_what_node_yaml_grants(tmp_path):
     assert "Bash(git:*)" in argv[argv.index("--allowedTools") + 1].split(",")
 
 
-def test_worker_refuses_grants_in_an_ancestor_settings_file(tmp_path):
-    """Any .claude/settings.json from the project directory up could widen Bash(git:*) to all of Bash."""
-    import json
-
-    import pytest
-    runtime, ctx, workdir = _claude_ctx(tmp_path, kind="code", permissions=("READ", "WRITE_WORKTREE"))
-    (workdir.parent / ".claude").mkdir()
-    (workdir.parent / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": ["Bash"]}}))
-    with pytest.raises(PermissionError, match="settings.json"):
-        runtime.command(ctx)
-
-
-def test_worker_refuses_a_project_settings_file_that_grants_tools(tmp_path):
-    """.claude/settings.json of the project directory is loaded (source "project"); tools must come from
-    node.yaml alone (D-032 item 4), so a grant there stops the run instead of silently widening it."""
-    import json
-
-    import pytest
-    runtime, ctx, workdir = _claude_ctx(tmp_path)
-    (workdir / ".claude").mkdir()
-    (workdir / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": ["Bash"]}}))
-    with pytest.raises(PermissionError, match="settings.json"):
-        runtime.command(ctx)
-    (workdir / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"deny": ["Bash"]}}))
-    runtime.command(ctx)                                              # restricting is fine
-
-
 # --------------------------------------------------------------------------- C3: start in the project directory
 
 

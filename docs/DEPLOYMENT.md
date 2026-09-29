@@ -192,8 +192,7 @@ Runtime notes:
   allowed by the agent's permissions (ARCHITECTURE_V1 §5). `extra_args` are appended to the command line.
   Tools come from node.yaml only (D-032): `--tools` limits the built-in tools that exist (`--allowedTools` only
   pre-approves); setting source `project` only, not `user` (its allow rules, plugin hooks) nor `local` (a
-  session's "don't ask again" approvals); a `.claude/settings.json` from the project directory up (including
-  `~/.claude/settings.json`) that grants tools stops the run.
+  session's "don't ask again" approvals).
   HANDOFF.md belongs to the interactive session: the worker's prompt says not to edit it (a convention only).
 - Staff system v4 (D-029..D-031): workdir is the function x project directory, e.g.
   `~/mutmuas/work/paper/visualrl/` (not inside any git repo). LLM workers start there, so the function's

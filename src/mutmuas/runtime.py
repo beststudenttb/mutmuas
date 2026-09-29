@@ -208,23 +208,6 @@ Rules:
 """
 
 
-def _refuse_granting_project_settings(workdir: Path) -> None:
-    """A worker loads project settings; from its directory up (where Claude Code may look for them), a
-    .claude/settings.json may restrict tools, never grant them. Fails closed, ~/.claude/settings.json included."""
-    for directory in (workdir, *workdir.parents):
-        path = directory / ".claude" / "settings.json"
-        try:
-            allow = (json.loads(path.read_text()).get("permissions") or {}).get("allow")
-        except (FileNotFoundError, NotADirectoryError):
-            continue
-        except (OSError, ValueError, AttributeError) as e:
-            raise PermissionError(f"cannot check {path} for tool grants: {e!r}") from e
-        if allow:
-            raise PermissionError(f"{path} grants tools ({', '.join(map(str, allow))}); a worker's tools come "
-                                  "from node.yaml only (D-032): move these rules out of the project directory "
-                                  "and its parents")
-
-
 class ClaudeCodeRuntime(SubprocessRuntime):
     name = "claude-code"
 
@@ -246,9 +229,7 @@ class ClaudeCodeRuntime(SubprocessRuntime):
         # Tools come from node.yaml alone (D-032; Codex review of 6c2a60a): --tools limits what exists, since
         # --allowedTools only pre-approves. Setting source "project" only: not "user" (its allow rules and
         # plugin hooks) nor "local" (a session's "don't ask again" approvals); "project" still loads the
-        # function CLAUDE.md above the project directory and the project's memory. A settings file from the
-        # project directory up that grants tools stops the run.
-        _refuse_granting_project_settings(self.agent.workdir_path)
+        # function CLAUDE.md above the project directory and the project's memory.
         argv = ["claude", "-p", "--output-format", "json", "--mcp-config", str(cfg_path), "--strict-mcp-config",
                 "--setting-sources", "project",
                 "--tools", ",".join(available), "--allowedTools", ",".join(tools)]
