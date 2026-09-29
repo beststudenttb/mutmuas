@@ -70,6 +70,14 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
     earlier than `timeout_s` + 30 min, so a long task is not chased while it still runs.
   - Such a filled-in deadline is marked `deadline_default: true` in the REQUEST body, so the owner can tell it
     from one the requester chose. An explicit `deadline` is kept as given; notices (`reply: none`) get none.
+- **Long jobs** (D-050): the owner of a task registers a background job it waits on (`agentctl job add --pid
+  <pid> --done-file <path> --log <path> --note <line>`, or the MCP `add_job`). The task becomes WAITING, and a worker
+  may end its run without a result: it is neither finished nor retried, and a restart leaves it alone. Each
+  heartbeat checks every open job; a job has ended when its process is gone (same machine; the exit code is not
+  known, so write it into the done-file) or its done-file exists. When the task's last job ends, a worker's task is
+  queued again as a fresh run (attempts reset; the prompt says how each job ended). A session instead gets a note
+  in its own inbox with `next` set to itself, which wakes it. There is no time limit; `whoami` lists
+  `jobs_waiting`.
 - `next: <address>` on RESULT, UPDATE, QUESTION or ANSWER names whose move it is. That agent is woken exactly
   as by a REQUEST, even by an UPDATE. Put it on the last message of every thread whose next step belongs to
   someone.
