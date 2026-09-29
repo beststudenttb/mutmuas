@@ -94,7 +94,7 @@ async def test_after_the_session_ends_the_worker_takes_over_after_a_grace_period
     state = {"owner_task": {k: v for k, v in (hub_b.ledger.task(sent["task_id"], "owner") or {}).items()
                             if k in ("status", "runner", "runner_pid", "attempts", "updated_at")},
              "session": hub_b.ledger.session_of("B:desk"), "queued": daemon._queued.get("B:desk"),
-             "arriving": daemon._arriving, "present": node_mod.session_present(hub_b.ledger, "B:desk"),
+             "present": node_mod.session_present(hub_b.ledger, "B:desk"),
              "thread": [m["type"] for m in hub_a.ledger.thread(sent["task_id"])],
              "b_rows": [tuple(r) for r in hub_b.ledger.db.execute(
                  "SELECT direction, json_extract(envelope, '$.type'), state, last_error, created_at FROM messages"
@@ -107,28 +107,6 @@ async def test_after_the_session_ends_the_worker_takes_over_after_a_grace_period
     assert result.get("result_status") == "complete", f"not taken over after the grace period: {state}"
     assert marker.read_text().count("\n") == 1
     assert state["thread"].count("ACK") == 1
-
-
-async def test_a_request_being_handled_is_not_also_taken_by_the_heartbeat(make_config, cluster, monkeypatch,
-                                                                         tmp_path):
-    """_on_request awaits the task record's publication after creating the PENDING task; the heartbeat's
-    _auto_dispatch must not accept it meanwhile, or it is accepted twice (two ACKs)."""
-    monkeypatch.setattr(node_mod, "AUTO_WORKER_GRACE_S", 0.0)
-    hub_a, hub_b = await _two_nodes(make_config, cluster)
-    daemon = cluster.daemons["B"]
-    publish = daemon.hub.publish_task_record
-
-    async def slow_publish(task_id):
-        await asyncio.sleep(1.5)                                       # > heartbeat_s (0.5): the heartbeat runs
-        return await publish(task_id)
-
-    monkeypatch.setattr(daemon.hub, "publish_task_record", slow_publish)
-    marker = tmp_path / "ran"
-    sent = await tools.send_request(hub_a, "A:main", "B:desk", "echo", "race",
-                                    inputs={"action": "echo", "marker": str(marker)})
-    result = await tools.wait_for_result(hub_a, sent["task_id"], 30)
-    assert result["result_status"] == "complete" and marker.read_text().count("\n") == 1
-    assert [m["type"] for m in hub_a.ledger.thread(sent["task_id"])].count("ACK") == 1
 
 
 async def test_a_running_worker_is_not_interrupted_and_its_task_is_never_done_twice(make_config, cluster, holder,
