@@ -298,11 +298,42 @@ ls ~/.mutmuas/visual_rl/B/runs/  # per-task agent output (<task>.attemptN.log)
 | NATS server stops | Nodes keep running. New messages queue in each node's outbox (`agentctl status` shows `outbox=N` once the server is back). Restart the server: `systemctl restart nats-server`. Everything flushes automatically and nothing needs replaying. |
 | Server machine lost | Messages and artifacts live in `store_dir`, so back up `/var/lib/nats/jetstream`. Without a backup: start a fresh server with the same `nats-server.conf`. Nodes re-register on their next heartbeat, and each node's `ledger.sqlite3` still holds its own tasks and messages. Messages in flight and object-store artifacts are lost. |
 | Node daemon crashes / machine reboots | The service manager restarts it. On start it re-queues unfinished tasks (attempt+1, requester notified "restarted"). After `max_attempts` a task fails with an explanation. **auto_worker exception** (v4, D-040): a task whose worker submitted its result is delivered, not run again; a task whose worker from before the restart still runs (pid and start time both match) is skipped, recorded once in the failure log (`agentctl failures`) and looked at again every heartbeat until that worker has ended; any other task is run again. The old worker is not stopped. A session's task is left to the session. |
-| Rolling back from v4 | Back up `data/ledger.sqlite3` before deploying v4. The ledger keeps working with the old code (it ignores the new `tasks.runner*` columns). Remove the v4 fields from `node.yaml` first (`auto_worker`, `code_mode`, `code_dirs`): the old code rejects unknown keys and would not start. |
+| Rolling back from v4 | Back up `data/ledger.sqlite3` before deploying v4. The ledger keeps working with the old code (it ignores the new `tasks.runner*` columns and the `failures` table). Remove the v4 fields from `node.yaml` first (`auto_worker`, `code_mode`, `code_dirs`): the old code rejects unknown keys and would not start. |
 | A task is stuck | `agentctl cancel <id>` from the requester. On the owner, `agentctl task <id>` and the run log show why. |
 | Wrong credentials | The daemon logs `Authorization Violation` and retries. Check `nats.credentials_file` and that the server config includes the node. |
 | Reset one node completely | Stop its daemon and delete its `data_dir`. Its durable mailbox on the server still holds unacknowledged messages, which are delivered again. |
 | Rotate a node's password | Delete `<out>/<NODE>.env`, re-run `server-config`, reload the server, copy the new file to the node, and restart the node. |
+
+## 8a. Supervision and known risks
+
+Errors are skipped and recorded rather than defended against (D-039, D-040); patches follow once the records
+show a pattern.
+
+- **Failure log**: every node writes skipped errors to its ledger (`failures` table: time, stage, address,
+  task, attempt, error). `agentctl failures [--limit N]` lists them, newest first.
+- **Failed runs are laid out once more**: a run that crashed without a result, timed out, hit a runtime error or
+  could not get its worktree is recorded and queued again once (`max_attempts`, default 2); the next failure
+  finishes the task as failed. An agent's own "failed" result is final.
+- **Background loops** (heartbeat, receive, handle, outbox, notify, follow-ups) record their errors and carry on.
+
+Known risks (protections removed on purpose; one line each):
+
+- An old worker's children that outlive their leader after a daemon crash are not looked for; a retry can run
+  next to them.
+- An observer copy whose owner publishes its task record only much later (owner offline for long) is dropped
+  after a few tries.
+- A session started from the wrong directory (empty memory, other rules) is not told so.
+- A `.claude/settings.json` in or above a worker's project directory that allows tools is trusted.
+- The session holding an agent does not learn that a second session tried to take it over.
+- A malformed optional REQUEST field (timeout_s, observers, deadline, next) is accepted and may fail later.
+- In a rare interleaving the heartbeat accepts a task `_on_request` is still handling: a second ACK (never a
+  second run).
+- The recipient of a request refused for its kind does not see it; only the requester gets the REJECT.
+- A worker with write tools can edit HANDOFF.md by mistake (the prompt asks it not to).
+- An unparsable incoming message gets no ERROR back; it is only in the receiving node's failure log.
+- A result printed only inside a Markdown fence, mid-output or over several lines is not parsed (use
+  submit_result).
+- A typo in a node.yaml key gives Python's TypeError instead of a one-line message.
 
 ## 9. Uninstall
 
