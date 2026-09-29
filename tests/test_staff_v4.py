@@ -85,16 +85,6 @@ def test_worker_refuses_grants_in_an_ancestor_settings_file(tmp_path):
         runtime.command(ctx)
 
 
-def test_worker_may_not_edit_the_handoff(tmp_path):
-    """HANDOFF.md belongs to the interactive session (D-030); the worker only appends to worker-log.md."""
-    import json
-    runtime, ctx, workdir = _claude_ctx(tmp_path, kind="code", permissions=("READ", "WRITE_WORKTREE"))
-    argv, _ = runtime.command(ctx)
-    settings = json.loads(open(argv[argv.index("--settings") + 1]).read())
-    handoff = "/" + os.path.realpath(workdir / "HANDOFF.md")          # //abs: an absolute path in a rule
-    assert {f"Edit({handoff})", f"Write({handoff})"} <= set(settings["permissions"]["deny"])
-
-
 def test_worker_refuses_a_project_settings_file_that_grants_tools(tmp_path):
     """.claude/settings.json of the project directory is loaded (source "project"); tools must come from
     node.yaml alone (D-032 item 4), so a grant there stops the run instead of silently widening it."""

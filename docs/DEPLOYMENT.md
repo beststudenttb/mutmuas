@@ -194,9 +194,7 @@ Runtime notes:
   pre-approves); setting source `project` only, not `user` (its allow rules, plugin hooks) nor `local` (a
   session's "don't ask again" approvals); a `.claude/settings.json` from the project directory up (including
   `~/.claude/settings.json`) that grants tools stops the run.
-  HANDOFF.md: the worker's file tools (Edit/Write) may not touch `<workdir>/HANDOFF.md`, and its prompt says
-  so. That is a **convention, not a boundary**, for a worker with Bash (RUN_EXPERIMENT, or git via
-  WRITE_WORKTREE): any program it runs can still write the file (Codex review of 6c2a60a).
+  HANDOFF.md belongs to the interactive session: the worker's prompt says not to edit it (a convention only).
 - Staff system v4 (D-029..D-031): workdir is the function x project directory, e.g.
   `~/mutmuas/work/paper/visualrl/` (not inside any git repo). LLM workers start there, so the function's
   `CLAUDE.md` one level up and the project's auto memory load; a code task's worktree (copy) or `code_dirs`

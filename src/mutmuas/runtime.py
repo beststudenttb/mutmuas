@@ -249,13 +249,8 @@ class ClaudeCodeRuntime(SubprocessRuntime):
         # function CLAUDE.md above the project directory and the project's memory. A settings file from the
         # project directory up that grants tools stops the run.
         _refuse_granting_project_settings(self.agent.workdir_path)
-        # HANDOFF.md belongs to the session (D-030). This deny covers the file tools only; a worker with Bash can
-        # still write it, so for such a worker it is a convention, not a boundary (Codex review of 6c2a60a).
-        handoff = "/" + os.path.realpath(self.agent.workdir_path / "HANDOFF.md")   # //abs: an absolute rule path
-        settings_path = self.node.data_path / "runs" / f"{ctx.task_id}.settings.json"
-        settings_path.write_text(json.dumps({"permissions": {"deny": [f"Edit({handoff})", f"Write({handoff})"]}}))
         argv = ["claude", "-p", "--output-format", "json", "--mcp-config", str(cfg_path), "--strict-mcp-config",
-                "--setting-sources", "project", "--settings", str(settings_path),
+                "--setting-sources", "project",
                 "--tools", ",".join(available), "--allowedTools", ",".join(tools)]
         for d in extra_dirs(ctx):
             argv += ["--add-dir", str(d)]
