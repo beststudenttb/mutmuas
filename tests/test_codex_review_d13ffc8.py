@@ -38,44 +38,6 @@ def _request(task_id: str) -> Envelope:
     )
 
 
-async def test_unverified_copy_is_not_abandoned_after_retry_window(tmp_path, monkeypatch):
-    """An offline owner may publish its task record after the initial retry window."""
-    _, ledger, hub, daemon = _local_stack(tmp_path, "peer")
-    hub.bus = object()
-    daemon.VERIFY_BACKOFF_S = (0.01,)
-    record_available = False
-
-    async def remote_task(task_id, owner):
-        if not record_available:
-            return None
-        return {"task_id": task_id, "requester": "A:main", "owner": "B:desk"}
-
-    monkeypatch.setattr(hub, "_remote_task", remote_task)
-    copy = Envelope(
-        type="UPDATE",
-        sender="A:main",
-        to="A:peer",
-        task_id="T-offline-owner",
-        body={
-            "message": "observer copy",
-            "fyi": True,
-            "participants": ["A:main", "A:peer", "B:desk"],
-            "copy_of": _request("T-offline-owner").to_dict(),
-        },
-    )
-    ledger.ingest(copy)
-    try:
-        assert daemon._on_observer_copy(copy) == "unverified"
-        ledger.mark_handled(copy.message_id, "unverified")
-        await asyncio.sleep(0.05)  # the bounded verifier has stopped
-        record_available = True
-        await asyncio.sleep(0.1)
-
-        assert is_participant(ledger, "A:peer", copy.task_id)
-    finally:
-        ledger.close()
-
-
 def test_existing_observer_cannot_send_task_content_copy_directly(tmp_path):
     """Observer grants are owner-relayed; observers do not get to author task copies."""
     _, ledger, _, daemon = _local_stack(tmp_path, "main", "peer")

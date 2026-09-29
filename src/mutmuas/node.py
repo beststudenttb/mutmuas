@@ -326,9 +326,6 @@ class NodeDaemon:
             self._enqueue(task["owner"], task["task_id"])
         for task in hub.ledger.tasks(role="owner", limit=500):
             await hub.publish_task_record(task["task_id"])
-        # observer copies still waiting for their task record when the daemon stopped: look again
-        for env in hub.ledger.inbound_in_state("unverified"):
-            self._background_job(self._verify_observer_copy(env))
         await hub.flush_outbox()
 
     # ---- receive ------------------------------------------------------
@@ -437,31 +434,29 @@ class NodeDaemon:
 
     # The copy and the owner's task record travel separately, so the record may not be there yet: look again
     # with growing gaps, then every last gap until it appears (Codex reviews of 8c018ee and d13ffc8).
-    VERIFY_BACKOFF_S = (0.05, 0.2, 1, 3, 10, 30, 60, 120, 300)
+    VERIFY_BACKOFF_S = (0.05, 0.2, 1, 3, 10, 30)
 
     async def _verify_observer_copy(self, env: Envelope) -> None:
         """Accept a copy about a task this node does not know only if the shared task record (written by the
         owner's node) names its sender as requester or owner. That is a consistency check, not an authorisation
-        boundary: any node credential can write the task KV (step 2, D-008)."""
-        record, attempt = None, 0
-        while not record:
-            # growing gaps at first, then the last gap for as long as the copy is still waiting: an owner that is
-            # offline may publish its record much later (Codex review of d13ffc8)
-            await asyncio.sleep(0 if attempt == 0 else
-                                self.VERIFY_BACKOFF_S[min(attempt, len(self.VERIFY_BACKOFF_S)) - 1])
-            attempt += 1
-            if not self.hub.bus:
-                return
-            if attempt > 1 and not self._still_unverified(env.message_id):
-                return                                     # decided elsewhere (e.g. a second verifier)
+        boundary: any node credential can write the task KV (step 2, D-008). A few tries with growing gaps; if
+        the record is still not there, the copy is recorded as a failure and dropped (D-040)."""
+        record = None
+        for gap in (0, *self.VERIFY_BACKOFF_S):
+            await asyncio.sleep(gap)
+            if not self.hub.bus or (gap and not self._still_unverified(env.message_id)):
+                return                                     # no bus, or decided elsewhere (a second verifier)
             try:
                 record = await self.hub._remote_task(env.task_id, None)
             except Exception as e:
-                log.warning("could not verify observer copy %s: %r", env.short(), e)
-                record = None
-            if not record and attempt == len(self.VERIFY_BACKOFF_S) + 1:
-                log.warning("observer copy %s still unverified: no task record for %s yet; checking every %ss",
-                            env.short(), env.task_id, self.VERIFY_BACKOFF_S[-1])
+                self._failed("observer-copy", e, address=env.to, task_id=env.task_id)
+            if record:
+                break
+        if not record:
+            self._failed("observer-copy", "no task record names its sender; dropped", address=env.to,
+                         task_id=env.task_id)
+            self.hub.ledger.mark_handled(env.message_id, "dropped")
+            return
         if env.sender not in (record.get("requester"), record.get("owner")):
             log.warning("dropped observer copy %s: the task record does not name %s", env.short(), env.sender)
             self.hub.ledger.mark_handled(env.message_id, "rejected")
