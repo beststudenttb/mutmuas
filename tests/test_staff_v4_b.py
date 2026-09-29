@@ -304,3 +304,28 @@ async def test_an_unreadable_start_time_of_a_live_pid_quarantines(tmp_path, monk
         other.kill()
         other.wait(5)
         ledger.close()
+
+
+# ours (Codex review of b8ec89b): every row must be exactly "pid pgid stat" with a real state code
+@pytest.mark.parametrize("row", ["{me} {grp} S EXTRA", "{me} {grp}", "{me} {grp} ??", "{me} 1 S"],
+                         ids=["extra-field", "missing-field", "bad-stat", "own-group-wrong"])
+def test_malformed_ps_rows_are_unknown(row, monkeypatch):
+    listing = row.format(me=os.getpid(), grp=os.getpgrp()) + "\n"
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a[0], 0, listing, ""))
+    assert node_mod.group_state(os.getpgrp()) == ("unknown", [])
+
+
+# ours: the documented choice, pinned: a reused pid that now leads a group of that id is quarantined
+async def test_a_reused_pid_that_leads_its_own_group_is_quarantined(tmp_path):
+    _, ledger, daemon = _setup(tmp_path, "RUNNING")
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+    ledger.set_runner_pid("T-b", other.pid, "a start time of the old worker")
+    try:
+        await daemon.recover()
+        assert other.poll() is None and "T-b" not in daemon._queued["B:desk"]
+        assert ledger.task("T-b", "owner")["status"] == "FAILED"
+    finally:
+        other.kill()
+        other.wait(5)
+        ledger.close()

@@ -21,6 +21,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import signal
 import platform
 import socket
@@ -142,6 +143,10 @@ def same_process(pid: int | None, start: str | None) -> bool:
             and not _zombie(pid))
 
 
+# A ps STAT value: one state letter (Linux and macOS), then optional flag characters.
+_STAT = re.compile(r"[DIRSTUWXZtL][<NLsl+WPuxEJKV]*")
+
+
 def group_state(pgid: int) -> tuple[str, list[int]]:
     """Which processes of a process group still run (zombies excluded): ("members", pids), ("empty", []), or
     ("unknown", []) when the process list cannot be trusted: no ps, ps failed, empty or malformed output, or a
@@ -164,11 +169,13 @@ def group_state(pgid: int) -> tuple[str, list[int]]:
         if not line.strip():
             continue
         parts = line.split()
-        if len(parts) < 3 or not parts[0].isdigit() or not parts[1].isdigit():
+        # exactly "pid pgid stat", with a real process state code; anything else is not evidence (Codex review
+        # of b8ec89b: an extra field let a malformed listing prove a group empty)
+        if len(parts) != 3 or not parts[0].isdigit() or not parts[1].isdigit() or not _STAT.fullmatch(parts[2]):
             return "unknown", []
         rows.append((int(parts[0]), int(parts[1]), parts[2]))
-    if not any(pid == os.getpid() for pid, _, _ in rows):
-        return "unknown", []
+    if (os.getpid(), os.getpgrp()) not in {(pid, group) for pid, group, _ in rows}:
+        return "unknown", []                         # a listing that gets this very process wrong proves nothing
     members = [pid for pid, group, stat in rows if group == pgid and not stat.startswith("Z")]
     return ("members", members) if members else ("empty", [])
 
