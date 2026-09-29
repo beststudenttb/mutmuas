@@ -103,15 +103,17 @@ async def test_invalid_message_does_not_break_the_node(make_config, cluster):
     a = make_config("A", [interactive("main")])
     b = make_config("B", [worker("lab", "lab.py")])
     await cluster.start(a)
-    await cluster.start(b)
+    daemon_b = await cluster.start(b)
     hub = await cluster.client(a)
     subject = hub.bus.names.inbox_subject(Envelope(type="ACK", sender="A:main", to="B:lab").to_addr, "A")
     await hub.bus.js.publish(subject, b"this is not json")
     bad = Envelope(type="REQUEST", sender="A:main", to="B:lab", task_id="T-bad", body={"objective": "x"}).to_dict()
     await hub.bus.js.publish(subject, json.dumps(bad).encode())        # missing 'reason'
 
-    err = await eventually(lambda: [m for m in hub.ledger.unseen("A:main") if m.type == "ERROR"], what="ERROR")
-    assert "reason" in err[0].body["message"]
+    # recorded and dropped on the receiving node (D-040); no ERROR is sent back
+    bad_ones = await eventually(lambda: [r for r in daemon_b.hub.ledger.failures() if r["stage"] == "receive"][1:],
+                                what="both invalid messages recorded")
+    assert any("reason" in r["error"] for r in daemon_b.hub.ledger.failures())
     ok = await tools.wait_for_result(hub, await _request(hub, "B:lab", {"action": "echo", "text": "still alive"}), 30)
     assert ok["result"]["summary"] == "echo: still alive"
 

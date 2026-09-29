@@ -357,8 +357,7 @@ class NodeDaemon:
         try:
             env = Envelope.from_json(msg.data)
         except ProtocolError as e:
-            log.warning("invalid message on %s: %s", msg.subject, e)
-            await self._error_back(msg.data, addr, e.code, str(e))
+            self._failed("receive", e, address=addr)                  # recorded and dropped (D-040)
             await msg.term()
             return
         claimed_node = Names.sender_node_from_subject(msg.subject)
@@ -372,17 +371,6 @@ class NodeDaemon:
         else:
             log.info("duplicate delivery ignored: %s", env.message_id)
         await msg.ack()
-
-    async def _error_back(self, raw: bytes, addr: str, code: str, text: str) -> None:
-        """Best effort: tell the sender its message was invalid, if we can tell who sent it."""
-        try:
-            d = json.loads(raw)
-            sender = Address.parse(d["from"])
-        except Exception:
-            return
-        env = Envelope(type="ERROR", sender=addr, to=str(sender), task_id=d.get("task_id"),
-                       body={"code": code, "message": text}, reply_to=d.get("message_id"))
-        await self.hub.send(env)
 
     # ---- dispatch -----------------------------------------------------
 
