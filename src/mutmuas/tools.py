@@ -50,7 +50,8 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                        acceptance_criteria: Any = None, timeout_s: float | None = None,
                        deadline: str | None = None, artifacts: list[dict] | None = None,
                        parent_task: str | None = None, priority: str = "normal",
-                       reply: str | None = None, observers: list[str] | None = None) -> dict[str, Any]:
+                       reply: str | None = None, observers: list[str] | None = None,
+                       leader: bool = False) -> dict[str, Any]:
     default_deadline = None
     if not deadline and reply != "none" and hub.cfg.default_reply_deadline_s > 0:
         # Without a deadline nothing ever chases a missing reply (no-stall design, G3): take the node's default,
@@ -63,7 +64,8 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
     body = request_body(objective, reason, kind=kind, inputs=inputs, expected_outputs=expected_outputs,
                         constraints=constraints, acceptance_criteria=acceptance_criteria,
                         deadline=deadline or default_deadline, timeout_s=timeout_s, reply=reply, observers=observers,
-                        deadline_default=bool(default_deadline))  # the owner can tell it from a chosen one
+                        deadline_default=bool(default_deadline),  # the owner can tell it from a chosen one
+                        leader=leader)
     sender = str(hub.local_agent(me)[0])
     for ref in artifacts or []:
         # Attaching grants the recipient access (visibility.artifact_visible), so only what the sender may see
@@ -150,8 +152,9 @@ async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, 
     if include_seen:
         envs = hub.ledger.list_recent_inbound(str(addr), limit, show=show)
     else:
+        # The leader's mail first (D-049). A watcher's peek keeps arrival order: its cursor is the last row.
         envs = hub.ledger.unseen(str(addr), limit, mark=not peek, types=types, since=since, next_to=next_to,
-                                 show=show, own_results=own_results)
+                                 show=show, own_results=own_results, leader_first=not peek)
         if not peek:
             await _read_receipts(hub, str(addr), envs)
     meta = {r[0]: (r[1], r[2], r[3]) for r in hub.ledger.db.execute(

@@ -174,7 +174,7 @@ def auto_worker_node(tmp_path, **agent_extra):
     hub = Hub(cfg, None, ledger)
     daemon = NodeDaemon(cfg)
     daemon.hub = hub
-    daemon._queues["B:desk"] = asyncio.Queue()
+    daemon._queues["B:desk"] = asyncio.PriorityQueue()
     daemon._queued["B:desk"] = set()
     return agent, cfg, ledger, hub, daemon
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
 import logging
 import os
@@ -209,7 +210,10 @@ class NodeDaemon:
         self.hub: Hub | None = None
         self._tasks: list[asyncio.Task] = []
         self._wake: dict[str, asyncio.Event] = {}
-        self._queues: dict[str, asyncio.Queue[str]] = {}
+        # (0 = the leader's task, task created_at, tie-break, task_id): the leader's tasks first, the rest in the
+        # order they came (D-049). created_at is the ledger's, so recover() (newest first) keeps that order too.
+        self._queues: dict[str, asyncio.PriorityQueue[tuple[int, str, int, str]]] = {}
+        self._arrivals = itertools.count()
         self._queued: dict[str, set[str]] = {}               # task ids queued or running, per agent
         self._running: dict[str, asyncio.Task] = {}          # task_id -> runner task
         self._retry: set[str] = set()                        # failed runs to lay out once more (D-040)
@@ -234,7 +238,7 @@ class NodeDaemon:
             self._spawn(self._receiver(addr, sub), f"recv:{addr}")
             self._spawn(self._dispatcher(agent, addr), f"dispatch:{addr}")
             if agent.mode == "worker" or agent.auto_worker:
-                self._queues[addr] = asyncio.Queue()
+                self._queues[addr] = asyncio.PriorityQueue()
                 for i in range(max(1, agent.max_concurrent)):
                     self._spawn(self._runner(agent, addr), f"run:{addr}:{i}")
         self._spawn(self._heartbeat(), "heartbeat")
@@ -612,12 +616,14 @@ class NodeDaemon:
         if task_id in self._queued[addr]:
             return
         self._queued[addr].add(task_id)
-        self._queues[addr].put_nowait(task_id)
+        task = self.hub.ledger.task(task_id, "owner")
+        self._queues[addr].put_nowait((0 if task["request"].get("leader") else 1, task["created_at"],
+                                       next(self._arrivals), task_id))
 
     async def _runner(self, agent: AgentConfig, addr: str) -> None:
         queue = self._queues[addr]
         while True:
-            task_id = await queue.get()
+            *_, task_id = await queue.get()
             try:
                 runner = asyncio.create_task(self._execute(agent, task_id), name=f"task:{task_id}")
                 self._running[task_id] = runner

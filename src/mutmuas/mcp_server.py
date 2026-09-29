@@ -228,15 +228,17 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
                            constraints: list[str] | None = None, acceptance_criteria: list[str] | None = None,
                            timeout_s: float | None = None, artifacts: list[dict[str, Any]] | None = None,
                            priority: str = "normal", reply: str = "required", deadline: str | None = None,
-                           observers: list[str] | None = None) -> str:
+                           observers: list[str] | None = None, leader: bool = False) -> str:
         """Delegate a task to another agent. kind: query | artifact | experiment | code.
+        leader: true only when the leader asked for this task (it goes first in their queue).
         reply: required (the default: they owe you a RESULT) | none (a notice; closed once they read it).
         deadline: ISO time with timezone by which you need the reply; overdue replies are followed up.
         Returns a task_id; the message is durable even if the target is offline."""
         return dump(await tools.send_request(
             hub(), state["me"], to, objective, reason, kind=kind, inputs=inputs, expected_outputs=expected_outputs,
             constraints=constraints, acceptance_criteria=acceptance_criteria, timeout_s=timeout_s,
-            artifacts=artifacts, priority=priority, reply=reply, deadline=deadline, observers=observers))
+            artifacts=artifacts, priority=priority, reply=reply, deadline=deadline, observers=observers,
+            leader=leader))
 
     @server.tool()
     async def check_task(task_id: str) -> str:

@@ -27,7 +27,7 @@ Addresses and ids used in subjects allow `[A-Za-z0-9_-]` only.
 
 | type | direction | required body | optional body | effect on task |
 |---|---|---|---|---|
-| `REQUEST` | requester → owner | `objective`, `reason` | `kind`, `inputs`, `expected_outputs`, `constraints`, `acceptance_criteria`, `deadline`, `deadline_default`, `timeout_s`, `parent_task`, `reply` | creates task (PENDING) |
+| `REQUEST` | requester → owner | `objective`, `reason` | `kind`, `inputs`, `expected_outputs`, `constraints`, `acceptance_criteria`, `deadline`, `deadline_default`, `timeout_s`, `parent_task`, `reply`, `leader` | creates task (PENDING) |
 | `ACK` | owner → requester | – | `state`, `message` | ACCEPTED (or RUNNING when an interactive agent accepts) |
 | `UPDATE` | owner → requester | `message` | `state` (task state), `progress` | `state` if given |
 | `QUESTION` | either | `question` | – | requester side: WAITING |
@@ -70,6 +70,10 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
     earlier than `timeout_s` + 30 min, so a long task is not chased while it still runs.
   - Such a filled-in deadline is marked `deadline_default: true` in the REQUEST body, so the owner can tell it
     from one the requester chose. An explicit `deadline` is kept as given; notices (`reply: none`) get none.
+- `leader: true` on a REQUEST: the leader asked for this task (D-049). The session sending it on his behalf sets it
+  (`agentctl ask --leader`, `leader` in a `send` file or in the MCP `send_request`); it is not checked (D-035).
+  A worker's queue runs such tasks first, the rest in arrival order; a running task is not stopped. The
+  session's inbox lists them first; a watcher's `--peek` keeps arrival order (its cursor is the last row).
 - `next: <address>` on RESULT, UPDATE, QUESTION or ANSWER names whose move it is. That agent is woken exactly
   as by a REQUEST, even by an UPDATE. Put it on the last message of every thread whose next step belongs to
   someone.
