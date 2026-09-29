@@ -257,8 +257,14 @@ class Hub:
                 for key in ("status", "result_status", "result", "output_refs", "updated_at"):
                     if local.get(key) not in (None, [], ""):
                         view[key] = local[key]
+            # The owner's record carries no result; a result this ledger holds is never dropped because the
+            # record is newer (it is republished).
+            for key in ("result_status", "result", "output_refs"):
+                if view.get(key) in (None, [], "") and local.get(key) not in (None, [], ""):
+                    view[key] = local[key]
             view["thread"] = self.ledger.thread(task_id)
             view["local_role"] = local["role"]
+            view["local_status"] = local["status"]      # the snapshot wait_result decides on
         return view
 
     async def _remote_task(self, task_id: str, owner: str | None) -> dict[str, Any] | None:
@@ -296,11 +302,12 @@ class Hub:
     def _closed_here(self, task_id: str, view: dict[str, Any]) -> bool:
         """The requester's own ledger has handled the message that closed the task (RESULT, REJECT, CANCEL).
         The owner's KV record can arrive first, and returning then gives a finished task without its result
-        (found through the v4 grace test on B, 8de9448). Others (observers, coordinators) only get the record."""
+        (found through the v4 grace test on B, 8de9448). Others (observers, coordinators) only get the record.
+        Decided on the snapshot the view was built from, not on a second read: the RESULT could be handled in
+        between and the stale view returned (717d7e0 on B)."""
         if view.get("local_role") != "requester":
             return True
-        local = self.ledger.task(task_id, "requester")
-        return local is None or local["status"] in TERMINAL_STATES
+        return view.get("local_status") in TERMINAL_STATES
 
     # ---- owner side ---------------------------------------------------
 
