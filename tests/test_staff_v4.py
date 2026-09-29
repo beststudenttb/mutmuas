@@ -219,44 +219,28 @@ async def test_session_cannot_report_progress_on_a_worker_task(tmp_path):
         ledger.close()
 
 
-async def test_restart_stops_a_surviving_worker_and_delivers_its_draft(tmp_path):
-    """Option B (Codex review of f8c105e): no adoption. A worker that submitted its result and still runs at the
-    restart is stopped, and the result it submitted is delivered rather than run again."""
-    import asyncio
-    import subprocess
-    import sys
+async def test_an_old_worker_that_still_runs_gets_its_draft_delivered_once_it_ends(tmp_path):
+    """D-040: a worker that outlived the daemon is not stopped; once it has ended, the draft it submitted is
+    delivered at the next look instead of running the task again."""
+    from conftest import Orphan, auto_worker_node, owned_task
 
-    from mutmuas.config import AgentConfig, NodeConfig
-    from mutmuas.hub import Hub
-    from mutmuas.ledger import Ledger
-    from mutmuas.node import NodeDaemon, proc_start
-    from mutmuas.protocol import Envelope, request_body
-    agent = AgentConfig(id="desk", mode="interactive", auto_worker=True, runtime="script", command=["true"],
-                        workdir=str(tmp_path / "work"))
-    cfg = NodeConfig(project="p", node="B", data_dir=str(tmp_path / "data"), agents=[agent])
-    ledger = Ledger(cfg.db_path)
-    hub = Hub(cfg, None, ledger)
-    ledger.create_owned_task(Envelope(type="REQUEST", sender="A:x", to="B:desk", task_id="T-orphan",
-                                      body=request_body("t", "t")))
-    ledger.update_task("T-orphan", "owner", status="RUNNING")
-    assert ledger.claim_task("T-orphan", "worker", ("RUNNING",)) is None
-    from conftest import Orphan
-    orphan = Orphan("import time; time.sleep(30)")                     # as after a crash: reaped by init
+    from mutmuas.node import proc_start
+    _, _, ledger, _, daemon = auto_worker_node(tmp_path)
+    owned_task(ledger, "T-orphan", "RUNNING", claim="worker")
+    orphan = Orphan("import time; time.sleep(30)")
     ledger.set_runner_pid("T-orphan", orphan.pid, proc_start(orphan.pid))
     ledger.update_task("T-orphan", "owner", result_draft={"status": "complete", "summary": "done by the orphan"})
-    daemon = NodeDaemon(cfg)
-    daemon.hub = hub
-    daemon._queues["B:desk"] = asyncio.Queue()
-    daemon._queued["B:desk"] = set()
     try:
         await daemon.recover()
-        orphan.wait(5)                                                   # stopped at the restart
+        assert ledger.task("T-orphan", "owner")["status"] == "RUNNING"          # skipped while it runs
+        orphan.terminate()
+        orphan.wait(5)
+        await daemon._recover_auto(ledger.task("T-orphan", "owner"))           # the next heartbeat's look
         task = ledger.task("T-orphan", "owner")
         assert task["status"] == "COMPLETED" and task["result"]["summary"] == "done by the orphan"
-        assert not daemon._queued["B:desk"] and not daemon._background
+        assert not daemon._queued["B:desk"]
     finally:
-        if orphan.poll() is None:
-            orphan.kill()
+        orphan.kill()
         ledger.close()
 
 

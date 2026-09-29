@@ -57,7 +57,7 @@ async def test_worker_without_task_env_still_cannot_finish_session_task(tmp_path
 @pytest.mark.asyncio
 async def test_recovery_does_not_release_a_still_running_worker_to_the_session(tmp_path):
     """An unclean daemon restart must not hand off a task while its detached worker process is alive.
-    Option B: the restart stops it first; only then may the session get the task (no two actors)."""
+    D-040: the old worker is not stopped; the task is skipped while it runs (never two actors)."""
     agent, cfg, ledger, hub = _setup(tmp_path)
     task_id = "T-worker-survives"
     owned_task(ledger, task_id)
@@ -73,10 +73,10 @@ async def test_recovery_does_not_release_a_still_running_worker_to_the_session(t
     daemon._queued["B:desk"] = set()
     try:
         await daemon.recover()
-        worker.wait(5)                              # option B: the surviving worker is stopped at the restart
+        assert worker.poll() is None                # D-040: not stopped, skipped and looked at again
         await daemon._execute(agent, task_id)  # dequeued after restart while the session is present
         task = ledger.task(task_id, "owner")
-        assert task["status"] == "PENDING" and task["runner"] is None     # the session's to decide, worker gone
+        assert task["runner"] == "worker" and task["status"] != "PENDING"
     finally:
         for proc in (worker, session):
             proc.terminate()

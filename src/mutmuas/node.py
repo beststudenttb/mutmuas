@@ -21,7 +21,6 @@ import contextlib
 import json
 import logging
 import os
-import signal
 import platform
 import socket
 from datetime import datetime, timezone
@@ -46,8 +45,6 @@ log = logging.getLogger(__name__)
 # auto_worker (D-030): after a session ends, wait this long before running tasks as a worker again (it may only
 # be the leader restarting his terminal).
 AUTO_WORKER_GRACE_S = 120
-# Stopping a worker that outlived the daemon (restart): TERM, then KILL after this many seconds.
-STOP_GRACE_S = 5
 SESSION_STALE_S = 50          # the session's MCP process beats every 15 s (mcp_server.HEARTBEAT_S)
 FOLLOW_UP_EVERY_S = 30
 
@@ -126,28 +123,6 @@ def same_process(pid: int | None, start: str | None) -> bool:
     recorded start time nothing proves it is the same process (fail closed; Codex review of f8c105e)."""
     return (bool(pid) and start is not None and _pid_alive(pid) and proc_start(pid) == start
             and not _zombie(pid))
-
-
-def group_state(pgid: int) -> str:
-    """Does a process group still have members? Asked of the kernel, not read from a ps listing (after four review
-    rounds of ps-parsing edge cases): "members", "empty" or "unknown". A worker leads its own group
-    (start_new_session), so its children are in it. "unknown" never counts as empty.
-    - kill(-pgid, 0) fails with ESRCH: no process is in the group -> "empty";
-    - it succeeds, or fails with EPERM (another user's process, or on macOS a group left with only zombies)
-      -> "members": conservative, a zombie not yet reaped keeps the task from running again; after a daemon
-      crash its orphaned workers are reaped by init/launchd, so that does not last;
-    - anything else -> "unknown"."""
-    if not pgid:
-        return "empty"
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return "empty"
-    except PermissionError:
-        return "members"
-    except OSError:
-        return "unknown"
-    return "members"
 
 
 def worker_tasks_of(ledger, agent: str, chain: set[int]) -> set[str]:
@@ -242,6 +217,7 @@ class NodeDaemon:
         self._queued: dict[str, set[str]] = {}               # task ids queued or running, per agent
         self._running: dict[str, asyncio.Task] = {}          # task_id -> runner task
         self._retry: set[str] = set()                        # failed runs to lay out once more (D-040)
+        self._recheck: set[str] = set()                      # recovered tasks whose old worker still ran
         self._arriving: set[str] = set()                     # REQUESTs _on_request is still deciding about
         self._cancel_requested: set[str] = set()
         self._background: set[asyncio.Task] = set()          # e.g. observer-copy checks against the task KV
@@ -702,8 +678,6 @@ class NodeDaemon:
         if agent.auto_worker and same_process(task.get("runner_pid"), task.get("runner_start")):
             log.info("task %s: a worker from before a restart still runs; not started again", task_id)
             return
-        if agent.auto_worker and task.get("runner") == "worker" and await self._deliver_draft(task_id):
-            return
         if agent.auto_worker:
             # Claim it for the worker in one transaction with the session check: never done twice, and while
             # the leader's session is there, a task that has not started yet is his to decide (D-032a).
@@ -836,6 +810,12 @@ class NodeDaemon:
             try:
                 await self._publish_cards()
                 await self._auto_dispatch()
+                for task_id in list(self._recheck):         # old workers still running at the last look
+                    task = self.hub.ledger.task(task_id, "owner")
+                    if task and task["status"] not in TERMINAL_STATES:
+                        await self._recover_auto(task)
+                    else:
+                        self._recheck.discard(task_id)
                 if asyncio.get_running_loop().time() - last_follow_up >= FOLLOW_UP_EVERY_S:
                     last_follow_up = asyncio.get_running_loop().time()
                     await self._follow_ups()
@@ -897,89 +877,33 @@ class NodeDaemon:
                 self._failed("follow-up", e, address=target, task_id=task["task_id"])
 
     def _record_worker(self, task_id: str, pid: int) -> None:
-        """Record the worker process with its start time; without one its identity cannot be proven later, so it
-        is stopped and the attempt fails (Codex review of f8c105e)."""
-        start = proc_start(pid)
-        if start is None:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(pid, signal.SIGKILL)
-            raise RuntimeError(f"could not read the start time of worker process {pid}; stopped it")
-        self.hub.ledger.set_runner_pid(task_id, pid, start)
+        self.hub.ledger.set_runner_pid(task_id, pid, proc_start(pid))
 
     async def _recover_auto(self, task: dict[str, Any]) -> None:
-        """auto_worker after a restart (option B, Codex reviews of f8c105e and e6a9df9): no task is adopted, and
-        a task is run again only once nothing of its old worker runs.
-        - The recorded worker still runs (pid and start time match): stop its whole process group.
-        - Its leader is gone (or its start time was never recorded) but processes of the group, or the pid, still
-          run: nothing proves they are the worker's, nor that they are not. Do not run the task again and do not
-          signal them: fail it with the reason (quarantine).
-        - Then: deliver the draft the worker submitted, or queue the task again (the runner's claim still checks
-          the session). A PENDING task still claimed by the worker (a stop between its two steps) is released for
-          _auto_dispatch. A session's task stays the session's."""
+        """auto_worker after a restart: deliver the draft its worker submitted, or run the task again. A worker
+        from before the restart that still runs is not stopped: skip it this round, record it once, look again at
+        the next heartbeat (D-040). A PENDING task still claimed by the worker is released for _auto_dispatch; a
+        session's task stays the session's."""
         hub, task_id = self.hub, task["task_id"]
         if task.get("runner") == "session":
             return
-        pid, start = task.get("runner_pid"), task.get("runner_start")
-        if pid and same_process(pid, start):
-            stopped = await self._stop_worker(pid, start)
-            if stopped != "stopped":
-                await self._quarantine(task_id, pid, "could not stop the worker from before the restart"
-                                       if stopped == "running" else
-                                       "stopped the worker from before the restart, but its process group could "
-                                       "not be checked afterwards")
-                return
-        elif pid:
-            state = group_state(pid)
-            alive = _pid_alive(pid) and not _zombie(pid)
-            if state == "unknown":
-                await self._quarantine(task_id, pid, "the process group of the worker from before the restart "
-                                                     "could not be checked (process list unavailable)")
-                return
-            if state == "members" or (alive and (start is None or proc_start(pid) is None)):
-                # Its leader is gone or cannot be identified, but something still runs there. A start time that
-                # was recorded and differs proves the pid now belongs to another process: that one is ignored.
-                await self._quarantine(task_id, pid, "processes of the worker from before the restart may still "
-                                                     "run and cannot be proven to be it")
-                return
         if task["status"] == "PENDING":
             if task.get("runner") == "worker":
                 hub.ledger.release_task(task_id, "worker")
             return
+        if same_process(task.get("runner_pid"), task.get("runner_start")):
+            if hub.ledger.notice_once(task_id, "old-worker-running"):
+                self._failed("recover", "a worker from before the restart still runs; checked again each heartbeat",
+                             address=task["owner"], task_id=task_id)
+            self._recheck.add(task_id)
+            return
+        self._recheck.discard(task_id)
         if await self._deliver_draft(task_id):
             return
         hub.ledger.set_runner_pid(task_id, None)
         if task["status"] != "ACCEPTED":
             await hub.owner_transition(task_id, "ACCEPTED", f"node {self.cfg.node} restarted; task will be run again")
         self._enqueue(task["owner"], task_id)
-
-    async def _quarantine(self, task_id: str, pid: int, why: str) -> None:
-        """Neither run the task again nor signal anything whose identity is not proven: fail it with the reason."""
-        await self.hub.finish(task_id, result_body(
-            "failed", f"{why} (process group {pid}); not run again and not signalled further",
-            limitations=[f"check and stop process group {pid} by hand, then send the request again"]))
-
-    async def _stop_worker(self, pid: int, start: str | None) -> str:
-        """Stop a worker's whole process group: TERM, then KILL after STOP_GRACE_S. "stopped" once no process of
-        the group runs any more (not merely its leader: Codex review of e6a9df9); "running" if something still
-        runs; "unknown" if the group could not be checked (Codex review of 0a9f031)."""
-        def gone() -> str:
-            if same_process(pid, start):
-                return "running"
-            return {"empty": "stopped", "members": "running"}.get(group_state(pid), "unknown")
-
-        for sig, wait_s in ((signal.SIGTERM, STOP_GRACE_S), (signal.SIGKILL, 2.0)):
-            try:
-                os.killpg(pid, sig)                 # a worker leads its own process group (start_new_session)
-            except (ProcessLookupError, PermissionError):
-                with contextlib.suppress(ProcessLookupError, PermissionError):
-                    os.kill(pid, sig)               # not a group leader: the process itself
-            deadline = asyncio.get_running_loop().time() + wait_s
-            while gone() == "running" and asyncio.get_running_loop().time() < deadline:
-                await asyncio.sleep(0.05)
-            result = gone()
-            if result != "running":
-                return result
-        return "running"
 
     async def _deliver_draft(self, task_id: str) -> bool:
         """A worker that submitted its result and ended while the daemon was down: deliver that result rather
