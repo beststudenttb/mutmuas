@@ -240,7 +240,8 @@ async def test_restart_stops_a_surviving_worker_and_delivers_its_draft(tmp_path)
                                       body=request_body("t", "t")))
     ledger.update_task("T-orphan", "owner", status="RUNNING")
     assert ledger.claim_task("T-orphan", "worker", ("RUNNING",)) is None
-    orphan = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+    from conftest import Orphan
+    orphan = Orphan("import time; time.sleep(30)")                     # as after a crash: reaped by init
     ledger.set_runner_pid("T-orphan", orphan.pid, proc_start(orphan.pid))
     ledger.update_task("T-orphan", "owner", result_draft={"status": "complete", "summary": "done by the orphan"})
     daemon = NodeDaemon(cfg)

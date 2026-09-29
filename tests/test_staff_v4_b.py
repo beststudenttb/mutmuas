@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 import pytest
+from conftest import Orphan
 
 from mutmuas import node as node_mod
 from mutmuas.config import AgentConfig, NodeConfig
@@ -39,7 +40,8 @@ def _setup(tmp_path, status, **agent_extra):
 
 
 def _worker(code="import time; time.sleep(30)"):
-    return subprocess.Popen([sys.executable, "-c", code], start_new_session=True)
+    """A worker as it is after a daemon crash: an orphan in its own group, reaped by init/launchd."""
+    return Orphan(code)
 
 
 # 1 (Codex, unchanged)
@@ -101,7 +103,7 @@ async def test_restart_kills_a_worker_that_ignores_term(tmp_path, monkeypatch):
         ledger.set_runner_pid("T-b", worker.pid, proc_start(worker.pid))
         await asyncio.wait_for(daemon.recover(), timeout=5)
         worker.wait(5)
-        assert worker.returncode == -9                                   # killed, not terminated
+        assert worker.poll() is not None                                 # it ignored TERM, so KILL stopped it
         assert "T-b" in daemon._queued["B:desk"]
     finally:
         if worker.poll() is None:
@@ -139,6 +141,7 @@ async def test_a_worker_that_cannot_be_stopped_fails_the_task(tmp_path, monkeypa
         assert task["status"] == "FAILED" and "could not stop" in task["result"]["summary"]
         assert "T-b" not in daemon._queued["B:desk"]
     finally:
+        monkeypatch.undo()                                                 # os.killpg works again for cleanup
         worker.kill()
         worker.wait(5)
         ledger.close()
@@ -176,7 +179,7 @@ async def test_restart_stops_the_whole_process_group_before_the_retry(tmp_path, 
         ledger.set_runner_pid("T-b", leader.pid, proc_start(leader.pid))
         await daemon.recover()
         leader.wait(5)
-        assert not node_mod.group_members(leader.pid), "a process of the old worker's group still runs"
+        assert node_mod.group_state(leader.pid) == "empty", "a process of the old worker's group still runs"
         assert not same_process(child, proc_start(child) or "gone")
         assert "T-b" in daemon._queued["B:desk"]
     finally:
@@ -245,7 +248,7 @@ async def _run_with_group_child(tmp_path, monkeypatch, ps):
         await daemon.recover()
         task = ledger.task("T-b", "owner")
         assert "T-b" not in daemon._queued["B:desk"], "retried although the group could not be checked"
-        assert task["status"] == "FAILED" and "could not be checked" in task["result"]["summary"]
+        assert task["status"] == "FAILED" and "may still" in task["result"]["summary"]
         os.killpg(leader.pid, 0)                                         # quarantined, not signalled
     finally:
         with __import__("contextlib").suppress(ProcessLookupError):
@@ -253,27 +256,35 @@ async def _run_with_group_child(tmp_path, monkeypatch, ps):
         ledger.close()
 
 
-async def test_failing_ps_is_unknown_not_empty(tmp_path, monkeypatch):
-    """A ps that lists processes but exits non-zero: the list may be partial, so it proves nothing."""
+def _failing_ps(tmp_path):
     fake = tmp_path / "ps-fails"
-    fake.write_text(f"#!/bin/sh\n{node_mod._PS} \"$@\"\nexit 1\n")
+    fake.write_text("#!/bin/sh\n/bin/ps \"$@\"\nexit 1\n")
     fake.chmod(0o755)
-    await _run_with_group_child(tmp_path, monkeypatch, str(fake))
+    return str(fake)
 
 
-async def test_ps_with_no_output_is_unknown_not_empty(tmp_path, monkeypatch):
-    await _run_with_group_child(tmp_path, monkeypatch, "/usr/bin/true")
-
-
-async def test_no_ps_at_all_is_unknown_not_empty(tmp_path, monkeypatch):
-    await _run_with_group_child(tmp_path, monkeypatch, None)
+# The group is asked of the kernel (kill(-pgid, 0)), not read from ps: however ps behaves, a surviving child in
+# the old group is found and the task is quarantined (these replaced the ps-parsing cases of rounds 2-4).
+@pytest.mark.parametrize("ps", [_failing_ps, lambda tmp_path: "/usr/bin/true", lambda tmp_path: None],
+                         ids=["ps-lists-then-exits-1", "ps-prints-nothing", "no-ps"])
+async def test_a_surviving_child_is_found_whatever_ps_does(tmp_path, monkeypatch, ps):
+    await _run_with_group_child(tmp_path, monkeypatch, ps(tmp_path))
 
 
 def test_group_state_answers_members_empty_or_unknown(monkeypatch):
-    assert node_mod.group_state(os.getpgid(0))[0] == "members"        # this test's own group
-    assert node_mod.group_state(2 ** 22 + 12345) == ("empty", [])     # no such group
-    monkeypatch.setattr(node_mod, "_PS", "/usr/bin/false")
-    assert node_mod.group_state(os.getpgid(0))[0] == "unknown"
+    assert node_mod.group_state(os.getpgrp()) == "members"            # this test's own group
+    assert node_mod.group_state(2 ** 22 + 12345) == "empty"           # no such group
+
+    def raises(error):
+        def killpg(pgid, sig):
+            raise error
+        return killpg
+
+    # EPERM: another user's process, or (macOS) a group left with only zombies: members, conservatively
+    monkeypatch.setattr(node_mod.os, "killpg", raises(PermissionError(1, "Operation not permitted")))
+    assert node_mod.group_state(os.getpgrp()) == "members"
+    monkeypatch.setattr(node_mod.os, "killpg", raises(OSError(22, "Invalid argument")))
+    assert node_mod.group_state(os.getpgrp()) == "unknown"
 
 
 # ours (non-blocking item, choice written down): a start time that differs proves the pid now belongs to
@@ -304,16 +315,6 @@ async def test_an_unreadable_start_time_of_a_live_pid_quarantines(tmp_path, monk
         other.kill()
         other.wait(5)
         ledger.close()
-
-
-# ours (Codex review of b8ec89b): every row must be exactly "pid pgid stat" with a real state code
-@pytest.mark.parametrize("row", ["{me} {grp} S EXTRA", "{me} {grp}", "{me} {grp} ??", "{me} 1 S"],
-                         ids=["extra-field", "missing-field", "bad-stat", "own-group-wrong"])
-def test_malformed_ps_rows_are_unknown(row, monkeypatch):
-    listing = row.format(me=os.getpid(), grp=os.getpgrp()) + "\n"
-    monkeypatch.setattr(subprocess, "run",
-                        lambda *a, **k: subprocess.CompletedProcess(a[0], 0, listing, ""))
-    assert node_mod.group_state(os.getpgrp()) == ("unknown", [])
 
 
 # ours: the documented choice, pinned: a reused pid that now leads a group of that id is quarantined

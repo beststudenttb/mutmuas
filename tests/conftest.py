@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -159,6 +160,48 @@ async def eventually(predicate, timeout: float = 20, interval: float = 0.1, what
         if asyncio.get_running_loop().time() > deadline:
             raise AssertionError(f"timed out waiting for {what}")
         await asyncio.sleep(interval)
+
+
+class Orphan:
+    """A process in its own group whose parent has already exited, as a daemon's workers are after the daemon
+    crashed: init/launchd reaps it when it ends, so no zombie stays behind (a zombie child of the test process
+    would still count as a group member). The Popen-like part of the interface the recovery tests use."""
+
+    def __init__(self, code: str):
+        launcher = ("import subprocess, sys; p = subprocess.Popen([sys.executable, '-c', sys.argv[1]], "
+                    "start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+                    "stderr=subprocess.DEVNULL); print(p.pid, flush=True)")
+        out = subprocess.run([sys.executable, "-c", launcher, code], capture_output=True, text=True, check=True)
+        self.pid = int(out.stdout)
+
+    def poll(self):
+        try:
+            os.kill(self.pid, 0)
+        except ProcessLookupError:
+            return 0
+        except PermissionError:
+            pass
+        return None
+
+    def wait(self, timeout: float = 5):
+        deadline = time.time() + timeout
+        while self.poll() is None:
+            if time.time() > deadline:
+                raise subprocess.TimeoutExpired(str(self.pid), timeout)
+            time.sleep(0.02)
+        return 0
+
+    def _signal(self, sig) -> None:
+        try:
+            os.killpg(self.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    def terminate(self) -> None:
+        self._signal(signal.SIGTERM)
+
+    def kill(self) -> None:
+        self._signal(signal.SIGKILL)
 
 
 def thread_types(hub: Hub, task_id: str) -> list[str]:

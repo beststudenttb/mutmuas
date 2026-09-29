@@ -1,14 +1,12 @@
-"""Review regression for b8ec89b: malformed ps output must not prove an old group empty.
-
-Round 5 (kernel query, no ps parsing): ps is not consulted any more, so the bogus listing is irrelevant and the
-old group is found by kill(-pgid, 0): "members", not "unknown". Same outcome for the task (quarantined, not
-run again). The original is kept in tests/reviews/codex_review_staff_v4b_r3_original.py."""
+"""Round-four regression: ps STAT validation must reject invalid codes and accept documented macOS flags."""
 
 import asyncio
 import contextlib
 import os
 import subprocess
 import sys
+
+import pytest
 
 from mutmuas import node as node_mod
 from mutmuas.config import AgentConfig, NodeConfig
@@ -18,13 +16,24 @@ from mutmuas.node import NodeDaemon, proc_start
 from mutmuas.protocol import Envelope, request_body
 
 
-async def test_malformed_ps_output_does_not_retry_while_old_child_runs(tmp_path, monkeypatch):
+@pytest.mark.parametrize("stat", ["SX", "S>", "SA", "SS"])
+def test_documented_macos_stat_suffix_does_not_poison_listing(stat, monkeypatch):
+    # Apple ps(1) documents >, A, S and X; current Apple ps source emits X for P_TRACED.
+    # The flagged process is unrelated: ps -A includes it anyway, so rejecting its
+    # valid state would poison inspection of every process group on the machine.
+    listing = f"{os.getpid()} {os.getpgrp()} S\n987654 987654 {stat}\n"
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k:
+                        subprocess.CompletedProcess(a[0], 0, listing, ""))
+    assert node_mod.group_state(os.getpgrp()) == ("members", [os.getpid()])
+
+
+async def test_invalid_stat_cannot_prove_old_group_empty_while_child_runs(tmp_path, monkeypatch):
     agent = AgentConfig(id="desk", mode="interactive", auto_worker=True, runtime="script",
                         command=["true"], workdir=str(tmp_path / "work"))
     cfg = NodeConfig(project="p", node="B", data_dir=str(tmp_path / "data"), agents=[agent])
     ledger = Ledger(cfg.db_path)
     hub = Hub(cfg, None, ledger)
-    request = Envelope(type="REQUEST", sender="A:sender", to="B:desk", task_id="T-malformed-ps",
+    request = Envelope(type="REQUEST", sender="A:sender", to="B:desk", task_id="T-invalid-stat",
                        body=request_body("test task", "test", kind="query"))
     ledger.ingest(request)
     ledger.create_owned_task(request)
@@ -51,19 +60,18 @@ async def test_malformed_ps_output_does_not_retry_while_old_child_runs(tmp_path,
         ledger.set_runner_pid(request.task_id, leader.pid, proc_start(leader.pid))
         release.write_text("go")
         leader.wait(5)
-        os.killpg(leader.pid, 0)  # the child is still running in the old group
+        os.killpg(leader.pid, 0)  # the old child is still alive
 
-        # One ps row names this process, satisfying the current completeness check,
-        # but has an extra field. The target group is omitted: this output is malformed,
-        # not evidence that the target group is empty.
-        bogus = f"{os.getpid()} {os.getpgrp()} S EXTRA\n"
-        monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs:
-                            subprocess.CompletedProcess(args[0], 0, bogus, ""))
-        state = node_mod.group_state(leader.pid)
+        # L is a suffix flag, not a leading run state, in both Apple and
+        # procps-ng ps manuals. This malformed listing omits the old child.
+        bogus = f"{os.getpid()} {os.getpgrp()} L\n"
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k:
+                            subprocess.CompletedProcess(a[0], 0, bogus, ""))
+        state = node_mod.group_state(leader.pid)[0]
         await daemon.recover()
         task = ledger.task(request.task_id, "owner")
         assert (state, task["status"], request.task_id in daemon._queued["B:desk"]) == (
-            "members", "FAILED", False)
+            "unknown", "FAILED", False)
     finally:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(leader.pid, 9)
