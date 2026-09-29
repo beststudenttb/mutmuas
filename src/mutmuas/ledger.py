@@ -113,6 +113,16 @@ CREATE TABLE IF NOT EXISTS notices (
     created_at      TEXT NOT NULL,
     PRIMARY KEY (task_id, reason)
 );
+
+-- Supervision (D-040): errors are skipped and recorded here, not defended against; `agentctl failures` lists them.
+CREATE TABLE IF NOT EXISTS failures (
+    at              TEXT NOT NULL,
+    stage           TEXT NOT NULL,           -- heartbeat | outbox | receive | handle | recover | run | ...
+    address         TEXT,
+    task_id         TEXT,
+    attempt         INTEGER,
+    error           TEXT NOT NULL            -- "<ExceptionType>: <message>"
+);
 """
 
 TASK_JSON_FIELDS = ("request", "result", "result_draft", "input_refs", "output_refs")
@@ -460,6 +470,15 @@ class Ledger:
                 request["observers"] = sorted(set(request.get("observers") or []) | set(observers))
                 db.execute("UPDATE tasks SET request=?, updated_at=? WHERE task_id=? AND role=?",
                            (json.dumps(request, ensure_ascii=False), now_iso(), task_id, row["role"]))
+
+    def record_failure(self, stage: str, error: BaseException | str, address: str | None = None,
+                       task_id: str | None = None, attempt: int | None = None) -> None:
+        text = error if isinstance(error, str) else f"{type(error).__name__}: {error}"
+        self.db.execute("INSERT INTO failures (at, stage, address, task_id, attempt, error) VALUES (?,?,?,?,?,?)",
+                        (now_iso(), stage, address, task_id, attempt, text))
+
+    def failures(self, limit: int = 50) -> list[dict[str, Any]]:
+        return [dict(r) for r in self.db.execute("SELECT * FROM failures ORDER BY rowid DESC LIMIT ?", (limit,))]
 
     def notice_once(self, task_id: str, reason: str) -> bool:
         """True the first time (task_id, reason) is recorded: send that follow-up now, and never again."""

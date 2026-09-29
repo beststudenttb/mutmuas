@@ -391,6 +391,16 @@ async def cmd_artifact(args, hub: Hub):
     _print(out, args.json)
 
 
+async def cmd_failures(args, hub: Hub):
+    """Errors this node skipped and recorded (D-040), newest first."""
+    rows = hub.ledger.failures(args.limit)
+    if args.json:
+        return _print(rows, True)
+    for r in rows:
+        print(f"{r['at']}  {r['stage']:<10} {r['address'] or '-':<18} {r['task_id'] or '-':<30} "
+              f"{r['attempt'] or '':<2} {r['error'][:90]}")
+
+
 async def cmd_history(args, hub: Hub):
     """Audit trail from the message stream: the messages I sent or received."""
     rows = await tools.history(hub, _me(args), args.task, args.limit)
@@ -802,6 +812,8 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--backend", default="object", choices=["object", "file"])
     p.add_argument("--task", help="file the artifact under this task id")
     p.add_argument("--dest")
+    p = add("failures", cmd_failures, "errors this node skipped and recorded (supervision, D-040)", bus=False)
+    p.add_argument("--limit", type=int, default=50)
     p = add("history", cmd_history, "raw audit trail from the message stream")
     p.add_argument("--task")
     p.add_argument("--limit", type=int, default=500)
