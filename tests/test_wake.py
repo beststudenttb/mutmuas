@@ -158,23 +158,6 @@ def test_due_parsing():
             _parse_due(bad)
 
 
-async def test_wrong_kind_from_a_colleague_is_refused_but_seen(make_config, cluster):
-    a = make_config("A", [interactive("main"), interactive("stranger")])
-    b = make_config("B", [interactive("desk", accept_from=["A:main"])])
-    await cluster.start(a)
-    await cluster.start(b)
-    hub_a, hub_b = await cluster.client(a), await cluster.client(b)
-    wrong = await tools.send_request(hub_a, "A:main", "B:desk", "please fix these 4 things", "review", kind="code")
-    await tools.send_request(hub_a, "A:stranger", "B:desk", "let me in", "not allowed")
-    assert (await tools.wait_for_result(hub_a, wrong["task_id"], 20))["status"] == "FAILED"   # still refused
-    rows = await eventually(lambda: tools.inbox(hub_b, "B:desk", peek=True, types=tools.WAKE), what="seen")
-    await asyncio.sleep(0.5)
-    rows = await tools.inbox(hub_b, "B:desk", peek=True, types=tools.WAKE)
-    assert [m["task_id"] for m in rows] == [wrong["task_id"]]                  # the stranger stays invisible
-    assert rows[0]["note"].startswith("rejected: permission denied") and "kind=code" in rows[0]["note"]
-    assert "[rejected: permission denied" in channel_notice(rows[0])["content"]
-
-
 async def test_clear_inbox_marks_a_backlog_read(make_config, cluster):
     a, b, hub_a, hub_b = await _pair(make_config, cluster)
     for i in range(3):

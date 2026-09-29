@@ -548,10 +548,6 @@ class NodeDaemon:
         if denial:
             await hub.owner_transition(env.task_id, "FAILED", denial, msg_type="REJECT",
                                        body={"reason": denial})
-            if agent.mode == "interactive" and agent.accepts(env.sender):
-                # A colleague picked the wrong kind: still refused, but the session must see that it was
-                # asked, or the request silently disappears on both ends (2026-09-25, kind=code to A:claude).
-                return "handled", f"rejected: {denial}"
             return "rejected"
         await hub.publish_task_record(env.task_id)
         if agent.mode == "worker" or (agent.auto_worker and not session_present(hub.ledger, env.to)):
