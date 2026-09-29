@@ -152,8 +152,9 @@ async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, 
     if include_seen:
         envs = hub.ledger.list_recent_inbound(str(addr), limit, show=show)
     else:
+        # The leader's mail first (D-049). A watcher's peek keeps arrival order: its cursor is the last row.
         envs = hub.ledger.unseen(str(addr), limit, mark=not peek, types=types, since=since, next_to=next_to,
-                                 show=show, own_results=own_results)
+                                 show=show, own_results=own_results, leader_first=not peek)
         if not peek:
             await _read_receipts(hub, str(addr), envs)
     meta = {r[0]: (r[1], r[2], r[3]) for r in hub.ledger.db.execute(
@@ -168,9 +169,6 @@ async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, 
         if note:
             row["note"] = note          # e.g. "rejected: permission denied: …" — already refused, FYI
         rows.append(row)
-    if not peek:
-        # The leader's mail first (D-049). A watcher's peek keeps arrival order: its cursor is the last row.
-        rows.sort(key=lambda r: not (r["body"] or {}).get("leader"))
     return rows
 
 

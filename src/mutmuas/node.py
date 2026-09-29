@@ -210,8 +210,9 @@ class NodeDaemon:
         self.hub: Hub | None = None
         self._tasks: list[asyncio.Task] = []
         self._wake: dict[str, asyncio.Event] = {}
-        # (0 = the leader's task, arrival number, task_id): the leader's tasks first, the rest in order (D-049)
-        self._queues: dict[str, asyncio.PriorityQueue[tuple[int, int, str]]] = {}
+        # (0 = the leader's task, task created_at, tie-break, task_id): the leader's tasks first, the rest in the
+        # order they came (D-049). created_at is the ledger's, so recover() (newest first) keeps that order too.
+        self._queues: dict[str, asyncio.PriorityQueue[tuple[int, str, int, str]]] = {}
         self._arrivals = itertools.count()
         self._queued: dict[str, set[str]] = {}               # task ids queued or running, per agent
         self._running: dict[str, asyncio.Task] = {}          # task_id -> runner task
@@ -615,8 +616,9 @@ class NodeDaemon:
         if task_id in self._queued[addr]:
             return
         self._queued[addr].add(task_id)
-        leader = self.hub.ledger.task(task_id, "owner")["request"].get("leader")
-        self._queues[addr].put_nowait((0 if leader else 1, next(self._arrivals), task_id))
+        task = self.hub.ledger.task(task_id, "owner")
+        self._queues[addr].put_nowait((0 if task["request"].get("leader") else 1, task["created_at"],
+                                       next(self._arrivals), task_id))
 
     async def _runner(self, agent: AgentConfig, addr: str) -> None:
         queue = self._queues[addr]

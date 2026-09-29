@@ -66,3 +66,34 @@ async def test_ask_and_send_carry_the_leader_mark(monkeypatch, tmp_path):
     await cli.cmd_send(parser.parse_args(["send", "B:desk", "--type", "REQUEST", "--file", str(request),
                                           "--as", "A:me"]), None)
     assert sent == [True, False, True]
+
+
+async def test_a_restart_queues_tasks_in_the_order_they_came(tmp_path):
+    """recover() walks the tasks newest first; the queue must still run them oldest first (Codex light review,
+    T-20260929120342-51a1d985 ①)."""
+    _, _, ledger, _, daemon = auto_worker_node(tmp_path)
+    try:
+        for n, (task_id, leader) in enumerate((("T-old", False), ("T-L", True), ("T-mid", False), ("T-new", False))):
+            _request(ledger, task_id, leader)
+            ledger.update_task(task_id, "owner", status="ACCEPTED")
+            ledger.db.execute("UPDATE tasks SET created_at=? WHERE task_id=?", (f"2026-09-29T10:00:0{n}.000+00:00",
+                                                                                task_id))
+        await daemon.recover()
+        queue = daemon._queues["B:desk"]
+        assert [queue.get_nowait()[-1] for _ in range(queue.qsize())] == ["T-L", "T-old", "T-mid", "T-new"]
+    finally:
+        ledger.close()
+
+
+async def test_the_leaders_mail_leads_a_backlog_longer_than_one_page(tmp_path):
+    """The inbox reads one page (50); the leader's mail must be on it however far back it came (Codex light
+    review ②). The rest keep arrival order."""
+    _, _, ledger, hub, _ = auto_worker_node(tmp_path)
+    try:
+        for n in range(55):
+            _request(ledger, f"T-{n:02d}")
+        _request(ledger, "T-L", leader=True)
+        read = await tools.inbox(hub, "B:desk")
+        assert [r["task_id"] for r in read] == ["T-L"] + [f"T-{n:02d}" for n in range(49)]
+    finally:
+        ledger.close()

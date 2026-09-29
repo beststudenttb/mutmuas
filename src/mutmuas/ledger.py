@@ -252,8 +252,11 @@ class Ledger:
 
     def unseen(self, local_agent: str, limit: int = 50, mark: bool = True,
                types: tuple[str, ...] | None = None, since: str | None = None,
-               next_to: str | None = None, show: bool = True, own_results: bool = False) -> list[Envelope]:
+               next_to: str | None = None, show: bool = True, own_results: bool = False,
+               leader_first: bool = False) -> list[Envelope]:
         """Inbound messages an interactive agent has not looked at yet.
+        leader_first: the leader's mail (body.leader, D-049) before the rest, each in arrival order; ordered
+        before the limit, so it is on the page however long the backlog is.
 
         Only messages the dispatcher has fully handled: a REQUEST shows up once its task exists
         (so accept_task always works), and requests rejected by policy never show up.
@@ -264,8 +267,9 @@ class Ledger:
             by_row = since is not None and str(since).isdigit()
             since_sql = (" AND rowid > ?" if by_row else " AND created_at > ?") if since else ""
             since_arg = ((int(since) if by_row else since),) if since else ()
+            order = "json_extract(envelope, '$.body.leader') IS NOT 1, rowid" if leader_first else "rowid"
             rows = db.execute("SELECT message_id, envelope FROM messages WHERE direction='in' AND seen=0"
-                              f" AND state='handled' AND local_agent=?{type_sql}{since_sql} ORDER BY rowid LIMIT ?",
+                              f" AND state='handled' AND local_agent=?{type_sql}{since_sql} ORDER BY {order} LIMIT ?",
                               (local_agent, *type_args, *since_arg, limit)).fetchall()
             # show: a foreground listing for the session (peek too) = shown, so clear_inbox may clear it later;
             # a notifier's read (watch, push) is not (Codex review of 8c018ee). mark: read.
