@@ -176,7 +176,7 @@ async def test_restart_stops_the_whole_process_group_before_the_retry(tmp_path, 
         ledger.set_runner_pid("T-b", leader.pid, proc_start(leader.pid))
         await daemon.recover()
         leader.wait(5)
-        assert not node_mod.group_members(leader.pid), "a process of the old worker's group still runs"
+        assert node_mod.group_state(leader.pid)[0] == "empty", "a process of the old worker's group still runs"
         assert not same_process(child, proc_start(child) or "gone")
         assert "T-b" in daemon._queued["B:desk"]
     finally:

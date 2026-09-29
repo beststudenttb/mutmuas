@@ -173,10 +173,6 @@ def group_state(pgid: int) -> tuple[str, list[int]]:
     return ("members", members) if members else ("empty", [])
 
 
-def group_members(pgid: int) -> list[int]:
-    return group_state(pgid)[1]
-
-
 def live_worker_runs(ledger, agent: str) -> dict[int, str]:
     """pid -> task id of the daemon-started worker processes of `agent` that are still running."""
     return {pid: task_id for pid, start, task_id in ledger.worker_runs(agent) if same_process(pid, start)}
