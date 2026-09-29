@@ -85,54 +85,36 @@ def session_present(ledger, agent: str) -> str | None:
 _PS = next((p for p in ("/bin/ps", "/usr/bin/ps") if os.path.exists(p)), None)
 
 
-def _ppid(pid: int) -> int | None:
+def _proc_field(pid: int, index: int, ps_column: str) -> str | None:
+    """One field of a process: /proc/<pid>/stat (index counted after the command name, which may contain ")") or
+    an absolute-path ps; None when it cannot be read (never a guess)."""
     stat = Path(f"/proc/{pid}/stat")
     if stat.exists():
         try:
-            return int(stat.read_text().rsplit(")", 1)[1].split()[1])   # field 4; the name may contain ")"
-        except (OSError, IndexError, ValueError):
-            return None
-    if _PS is None:
-        return None
-    import subprocess
-    out = subprocess.run([_PS, "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True,
-                         env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
-    try:
-        return int(out.stdout.strip())
-    except ValueError:
-        return None
-
-
-def proc_start(pid: int) -> str | None:
-    """When a process started (identifies it across pid reuse), from /proc or an absolute-path ps."""
-    stat = Path(f"/proc/{pid}/stat")
-    if stat.exists():
-        try:
-            return stat.read_text().rsplit(")", 1)[1].split()[19]            # field 22: starttime
+            return stat.read_text().rsplit(")", 1)[1].split()[index]
         except (OSError, IndexError):
             return None
     if _PS is None:
         return None
     import subprocess
-    out = subprocess.run([_PS, "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+    out = subprocess.run([_PS, "-o", f"{ps_column}=", "-p", str(pid)], capture_output=True, text=True,
                          env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
     return out.stdout.strip() or None
 
 
+def _ppid(pid: int) -> int | None:
+    value = _proc_field(pid, 1, "ppid")                                # stat field 4
+    return int(value) if value and value.isdigit() else None
+
+
+def proc_start(pid: int) -> str | None:
+    """When a process started (identifies it across pid reuse)."""
+    return _proc_field(pid, 19, "lstart")                              # stat field 22: starttime
+
+
 def _zombie(pid: int) -> bool:
     """An exited process not yet reaped by its parent: it runs nothing any more."""
-    stat = Path(f"/proc/{pid}/stat")
-    if stat.exists():
-        try:
-            return stat.read_text().rsplit(")", 1)[1].split()[0] == "Z"
-        except (OSError, IndexError):
-            return False
-    if _PS is None:
-        return False
-    import subprocess
-    out = subprocess.run([_PS, "-o", "stat=", "-p", str(pid)], capture_output=True, text=True,
-                         env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
-    return out.stdout.strip().startswith("Z")
+    return (_proc_field(pid, 0, "stat") or "").startswith("Z")         # stat field 3: state
 
 
 def same_process(pid: int | None, start: str | None) -> bool:
