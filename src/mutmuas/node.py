@@ -21,7 +21,6 @@ import contextlib
 import json
 import logging
 import os
-import re
 import signal
 import platform
 import socket
@@ -129,41 +128,26 @@ def same_process(pid: int | None, start: str | None) -> bool:
             and not _zombie(pid))
 
 
-# A ps STAT value: one state letter (Linux and macOS), then optional flag characters.
-_STAT = re.compile(r"[DIRSTUWXZtL][<NLsl+WPuxEJKV]*")
-
-
-def group_state(pgid: int) -> tuple[str, list[int]]:
-    """Which processes of a process group still run (zombies excluded): ("members", pids), ("empty", []), or
-    ("unknown", []) when the process list cannot be trusted: no ps, ps failed, empty or malformed output, or a
-    list that does not even contain this process. A worker leads its own group (start_new_session), so its
-    children are listed too. "unknown" never counts as empty (Codex review of 0a9f031)."""
+def group_state(pgid: int) -> str:
+    """Does a process group still have members? Asked of the kernel, not read from a ps listing (after four review
+    rounds of ps-parsing edge cases): "members", "empty" or "unknown". A worker leads its own group
+    (start_new_session), so its children are in it. "unknown" never counts as empty.
+    - kill(-pgid, 0) fails with ESRCH: no process is in the group -> "empty";
+    - it succeeds, or fails with EPERM (another user's process, or on macOS a group left with only zombies)
+      -> "members": conservative, a zombie not yet reaped keeps the task from running again; after a daemon
+      crash its orphaned workers are reaped by init/launchd, so that does not last;
+    - anything else -> "unknown"."""
     if not pgid:
-        return "empty", []
-    if _PS is None:
-        return "unknown", []
-    import subprocess
+        return "empty"
     try:
-        out = subprocess.run([_PS, "-A", "-o", "pid=,pgid=,stat="], capture_output=True, text=True, timeout=10,
-                             env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
-    except (OSError, subprocess.SubprocessError):
-        return "unknown", []
-    if out.returncode != 0:
-        return "unknown", []
-    rows = []
-    for line in out.stdout.splitlines():
-        if not line.strip():
-            continue
-        parts = line.split()
-        # exactly "pid pgid stat", with a real process state code; anything else is not evidence (Codex review
-        # of b8ec89b: an extra field let a malformed listing prove a group empty)
-        if len(parts) != 3 or not parts[0].isdigit() or not parts[1].isdigit() or not _STAT.fullmatch(parts[2]):
-            return "unknown", []
-        rows.append((int(parts[0]), int(parts[1]), parts[2]))
-    if (os.getpid(), os.getpgrp()) not in {(pid, group) for pid, group, _ in rows}:
-        return "unknown", []                         # a listing that gets this very process wrong proves nothing
-    members = [pid for pid, group, stat in rows if group == pgid and not stat.startswith("Z")]
-    return ("members", members) if members else ("empty", [])
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return "empty"
+    except PermissionError:
+        return "members"
+    except OSError:
+        return "unknown"
+    return "members"
 
 
 def worker_tasks_of(ledger, agent: str, chain: set[int]) -> set[str]:
@@ -918,7 +902,7 @@ class NodeDaemon:
                                        "not be checked afterwards")
                 return
         elif pid:
-            state, _ = group_state(pid)
+            state = group_state(pid)
             alive = _pid_alive(pid) and not _zombie(pid)
             if state == "unknown":
                 await self._quarantine(task_id, pid, "the process group of the worker from before the restart "
@@ -954,8 +938,7 @@ class NodeDaemon:
         def gone() -> str:
             if same_process(pid, start):
                 return "running"
-            state, _ = group_state(pid)
-            return {"empty": "stopped", "members": "running"}.get(state, "unknown")
+            return {"empty": "stopped", "members": "running"}.get(group_state(pid), "unknown")
 
         for sig, wait_s in ((signal.SIGTERM, STOP_GRACE_S), (signal.SIGKILL, 2.0)):
             try:

@@ -1,8 +1,4 @@
-"""Review regression for b8ec89b: malformed ps output must not prove an old group empty.
-
-Round 5 (kernel query, no ps parsing): ps is not consulted any more, so the bogus listing is irrelevant and the
-old group is found by kill(-pgid, 0): "members", not "unknown". Same outcome for the task (quarantined, not
-run again). The original is kept in tests/reviews/codex_review_staff_v4b_r3_original.py."""
+"""Review regression for b8ec89b: malformed ps output must not prove an old group empty."""
 
 import asyncio
 import contextlib
@@ -59,11 +55,11 @@ async def test_malformed_ps_output_does_not_retry_while_old_child_runs(tmp_path,
         bogus = f"{os.getpid()} {os.getpgrp()} S EXTRA\n"
         monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs:
                             subprocess.CompletedProcess(args[0], 0, bogus, ""))
-        state = node_mod.group_state(leader.pid)
+        state = node_mod.group_state(leader.pid)[0]
         await daemon.recover()
         task = ledger.task(request.task_id, "owner")
         assert (state, task["status"], request.task_id in daemon._queued["B:desk"]) == (
-            "members", "FAILED", False)
+            "unknown", "FAILED", False)
     finally:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(leader.pid, 9)
