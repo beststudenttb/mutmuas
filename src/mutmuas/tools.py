@@ -445,9 +445,8 @@ def _check_actor(hub: Hub, task: dict[str, Any]) -> None:
     - A worker acts on its own task only.
     - A task held by the worker is changed only by that worker's processes.
     - A task held by the session is not changed by a worker."""
-    from .node import _ancestors, live_worker_runs
-    chain = {os.getpid(), *_ancestors(os.getpid())}
-    proven = {t for pid, t in live_worker_runs(hub.ledger, task["owner"]).items() if pid in chain}
+    from .node import _ancestors, worker_tasks_of
+    proven = worker_tasks_of(hub.ledger, task["owner"], {os.getpid(), *_ancestors(os.getpid())})
     worker_of = next(iter(proven), None) or _current_task()
     if worker_of and task["task_id"] != worker_of:
         raise PermissionError(f"a worker process (task {worker_of}) acts only on its own task, not on "

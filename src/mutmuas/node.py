@@ -155,6 +155,12 @@ def group_state(pgid: int) -> tuple[str, list[int]]:
     return ("members", members) if members else ("empty", [])
 
 
+def worker_tasks_of(ledger, agent: str, chain: set[int]) -> set[str]:
+    """The tasks of `agent` whose recorded, still running worker process is in `chain` (a process and its
+    ancestors): who the caller is as a worker, for the lease and for the owner-side actor check alike."""
+    return {task_id for pid, task_id in live_worker_runs(ledger, agent).items() if pid in chain}
+
+
 def live_worker_runs(ledger, agent: str) -> dict[int, str]:
     """pid -> task id of the daemon-started worker processes of `agent` that are still running."""
     return {pid: task_id for pid, start, task_id in ledger.worker_runs(agent) if same_process(pid, start)}
@@ -184,11 +190,10 @@ def lease_refusal(ledger, agent: str) -> str | None:
     # session_pid is missing when the holder's MCP process runs older code (e2fb5d1) than this CLI, as during
     # an upgrade: then the MCP process's own parent is the session.
     session = row.get("session_pid") or next(iter(_ancestors(row["pid"])[:1]), None)
-    allowed = {row["pid"], session} - {None, 0}
+    chain = {os.getpid(), *_ancestors(os.getpid())}
     # auto_worker: a task the daemon started before the session came is finished, not interrupted (D-032a);
     # its processes descend from the pid the daemon recorded when it spawned them.
-    allowed |= set(live_worker_runs(ledger, agent))
-    if allowed & {os.getpid(), *_ancestors(os.getpid())}:
+    if ({row["pid"], session} - {None, 0}) & chain or worker_tasks_of(ledger, agent, chain):
         return None
     return (f"{agent} is held by another session (process {row['pid']}, directory {row.get('cwd')}); this process "
             "does not hold its session, so it may not read or answer its mail. One agent, one session.")
