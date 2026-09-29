@@ -406,7 +406,7 @@ async def cmd_history(args, hub: Hub):
 
 def cmd_mcp(args):
     from .mcp_server import run
-    run(_cfg(args), _me(args), channel=args.channel)
+    run(_cfg(args), _me(args), channel=args.channel, worker_task=args.worker_task)
 
 
 # --------------------------------------------------------------------------- agent-node commands
@@ -810,6 +810,7 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--channel", action="store_true",
                    help="push new mail into the Claude Code session (claude/channel); start the session with "
                         "--dangerously-load-development-channels server:mutmuas")
+    p.add_argument("--worker-task", dest="worker_task", help=argparse.SUPPRESS)   # set by the daemon for its runs
     p.set_defaults(fn=None, sync=cmd_mcp)
     return parser
 

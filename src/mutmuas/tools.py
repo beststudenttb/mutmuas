@@ -14,8 +14,9 @@ from pathlib import Path
 from typing import Any
 
 from .hub import Hub
-from .visibility import acl, artifact_visible, is_participant, message_visible
-from .protocol import TERMINAL_STATES, ArtifactRef, Envelope, request_body, result_body
+from .ids import parse_iso
+from .visibility import acl, artifact_visible, is_participant, message_visible, short
+from .protocol import OPEN_STATES, TERMINAL_STATES, ArtifactRef, Envelope, request_body, result_body
 
 
 def _current_task() -> str | None:
@@ -220,14 +221,18 @@ async def _read_receipts(hub: Hub, me: str, envs: list[Envelope], read: bool = T
 
 
 async def accept_task(hub: Hub, me: str, task_id: str) -> dict[str, Any]:
-    _owned(hub, me, task_id)
+    _check_actor(hub, _owned(hub, me, task_id))
+    refused = hub.ledger.claim_task(task_id, "session", OPEN_STATES)
+    if refused and "worker" in refused:
+        raise PermissionError(f"{task_id} is being done by the worker the daemon started before this session; "
+                              "it is not interrupted (D-032a): wait for its result (whoami: worker_running)")
     ok = await hub.owner_transition(task_id, "RUNNING", f"accepted by {me}", msg_type="ACK",
                                     body={"state": "RUNNING", "message": f"accepted by {me}"})
     return {"task_id": task_id, "accepted": ok}
 
 
 async def reject_task(hub: Hub, me: str, task_id: str, reason: str) -> dict[str, Any]:
-    _owned(hub, me, task_id)
+    _check_actor(hub, _owned(hub, me, task_id))
     ok = await hub.owner_transition(task_id, "FAILED", reason, msg_type="REJECT", body={"reason": reason})
     return {"task_id": task_id, "rejected": ok}
 
@@ -238,6 +243,7 @@ async def report_progress(hub: Hub, me: str, message: str, task_id: str | None =
     if not task_id:
         raise ValueError("task_id is required outside of a delegated task")
     task = _owned(hub, me, task_id)
+    _check_actor(hub, task)
     new_state = state or task["status"]
     if new_state not in ("RUNNING", "WAITING", "BLOCKED"):
         new_state = "RUNNING"
@@ -258,6 +264,7 @@ async def submit_result(hub: Hub, me: str, status: str, summary: str, *, task_id
     task = _owned(hub, me, task_id)
     if task["status"] in TERMINAL_STATES:
         return {"task_id": task_id, "error": f"task already {task['status']}; result not changed"}
+    _check_actor(hub, task)
     body = result_body(status, summary, outputs=outputs, evidence=evidence, limitations=limitations,
                        follow_up=follow_up)
     if next:
@@ -375,7 +382,7 @@ async def whoami(hub: Hub, me: str | None = None) -> dict[str, Any]:
     from .node import session_fields
     addr, agent = hub.local_agent(me)
     open_tasks = hub.ledger.tasks(role="owner", local_agent=str(addr),
-                                  statuses=("PENDING", "ACCEPTED", "RUNNING", "WAITING", "BLOCKED"))
+                                  statuses=OPEN_STATES)
     out = {"address": str(addr), "project": hub.cfg.project, "role": agent.role, "mode": agent.mode,
            "workdir": str(agent.workdir_path), "permissions": agent.permissions,
            "capabilities": agent.capabilities, "open_tasks": [t["task_id"] for t in open_tasks],
@@ -383,7 +390,20 @@ async def whoami(hub: Hub, me: str | None = None) -> dict[str, Any]:
            "coordinator": str(addr) in (hub.cfg.coordinators or [])}
     if agent.mode == "interactive":
         out.update(session_fields(hub.ledger.session_of(str(addr)), agent.workdir_path))
+    if agent.auto_worker:
+        out["auto_worker"] = True
+        out["worker_running"] = [_worker_run(hub, t, agent) for t in hub.ledger.tasks(
+            role="owner", local_agent=str(addr), statuses=("ACCEPTED", "RUNNING")) if t.get("runner") == "worker"]
     return out
+
+
+def _worker_run(hub: Hub, task: dict[str, Any], agent) -> dict[str, Any]:
+    """What the session sees of a task the worker is doing: which, since when, and when it ends at the latest."""
+    timeout = float((task.get("request") or {}).get("timeout_s") or agent.task_timeout_s)
+    since = parse_iso(task["updated_at"])
+    return {"task_id": task["task_id"], "status": task["status"], "requester": task["requester"],
+            "objective": short((task.get("request") or {}).get("objective")), "since": task["updated_at"],
+            "latest_end": (since + timedelta(seconds=timeout)).isoformat(timespec="seconds")}
 
 
 async def list_artifacts(hub: Hub, me: str | None = None) -> list[dict[str, Any]]:
@@ -414,6 +434,29 @@ async def fetch_artifact(hub: Hub, uri: str, dest_dir: str | None = None, sha256
     ref = ArtifactRef(uri=uri, sha256=sha256)
     path = await hub.artifacts.fetch(ref, dest)
     return {"uri": uri, "path": str(path), "size": path.stat().st_size if path.is_file() else None}
+
+
+def _check_actor(hub: Hub, task: dict[str, Any]) -> None:
+    """Every owner-side change (accept, reject, progress, result) is made by whoever holds the task, so a task is
+    never done twice and a running worker is not interrupted (D-032, D-032a; Codex reviews of 6116466, ba28e70).
+    Who the caller is comes from the process tree: a process descending from a worker the daemon started (pid
+    and start time recorded) is that worker, whatever its environment says. MUTMUAS_TASK_ID can only add a
+    restriction (a process that claims to be a worker is treated as one), never prove anything.
+    - A worker acts on its own task only.
+    - A task held by the worker is changed only by that worker's processes.
+    - A task held by the session is not changed by a worker."""
+    from .node import _ancestors, live_worker_runs
+    chain = {os.getpid(), *_ancestors(os.getpid())}
+    proven = {t for pid, t in live_worker_runs(hub.ledger, task["owner"]).items() if pid in chain}
+    worker_of = next(iter(proven), None) or _current_task()
+    if worker_of and task["task_id"] != worker_of:
+        raise PermissionError(f"a worker process (task {worker_of}) acts only on its own task, not on "
+                              f"{task['task_id']}, which belongs to the session or to another run")
+    if task.get("runner") == "worker" and task["task_id"] not in proven:
+        raise PermissionError(f"{task['task_id']} is being done by the worker the daemon started; it is not "
+                              "interrupted (D-032a): wait for its result (whoami: worker_running)")
+    if task.get("runner") == "session" and worker_of == task["task_id"]:
+        raise PermissionError(f"{task['task_id']} was taken by the session; a worker may not act on it")
 
 
 def _owned(hub: Hub, me: str, task_id: str) -> dict[str, Any]:

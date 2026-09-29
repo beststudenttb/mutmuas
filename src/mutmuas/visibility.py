@@ -24,8 +24,8 @@ from .ledger import Ledger
 OBJECTIVE_CHARS = 80
 STATUS_KEYS = ("task_id", "requester", "owner", "status", "updated_at")
 # The public registry card: who someone is and whether they can take work now, nothing about the work.
-CARD_KEYS = ("address", "node", "agent_id", "display", "role", "capabilities", "provider", "mode", "accepts_kinds",
-             "state", "availability", "session", "session_seen", "heartbeat_s", "last_heartbeat")
+CARD_KEYS = ("address", "node", "agent_id", "display", "role", "capabilities", "provider", "mode", "auto_worker",
+             "accepts_kinds", "state", "availability", "session", "session_seen", "heartbeat_s", "last_heartbeat")
 
 
 def short(text: str | None, n: int = OBJECTIVE_CHARS) -> str:

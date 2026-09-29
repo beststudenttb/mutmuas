@@ -132,6 +132,11 @@ class Ledger:
         self._add_column("sessions", "session_pid", "INTEGER")    # ledgers created by exp/wake e2fb5d1
         # 1 once an inbox listing has shown the message to the session: clear_inbox may only mark those read
         self._add_column("messages", "shown", "INTEGER NOT NULL DEFAULT 0")
+        # Who is doing an owner task of an auto_worker agent: 'worker' (runner_pid: its process) or 'session'.
+        # Claimed in one transaction, so a task is never done twice (D-032).
+        self._add_column("tasks", "runner", "TEXT")
+        self._add_column("tasks", "runner_pid", "INTEGER")
+        self._add_column("tasks", "runner_start", "TEXT")          # the process's start time: pids get reused
 
     def _add_column(self, table: str, column: str, decl: str) -> None:
         if column not in [r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")]:
@@ -314,6 +319,43 @@ class Ledger:
             db.execute("DELETE FROM session_contenders WHERE local_agent=? AND pid=?", (local_agent, pid))
             db.execute(self._BEAT_SQL, (local_agent, pid, session_pid, cwd, now, now))
         return pid
+
+    def claim_task(self, task_id: str, runner: str, statuses: tuple[str, ...],
+                   refuse_if=None) -> str | None:
+        """Make `runner` ('worker' | 'session') the one doing an owner task, or say why not. The check and the
+        write are one transaction (BEGIN IMMEDIATE). refuse_if(): a further reason to refuse, e.g. that a
+        session is there, evaluated inside the same transaction."""
+        with self.tx() as db:
+            row = db.execute("SELECT status, runner FROM tasks WHERE task_id=? AND role='owner'",
+                             (task_id,)).fetchone()
+            if row is None:
+                return "unknown task"
+            if row["runner"] not in (None, runner):
+                return f"held by the {row['runner']}"
+            if row["status"] not in statuses:
+                return f"status {row['status']}"
+            reason = refuse_if() if refuse_if else None
+            if reason:
+                return reason
+            db.execute("UPDATE tasks SET runner=? WHERE task_id=? AND role='owner'", (runner, task_id))
+        return None
+
+    def release_task(self, task_id: str, runner: str) -> None:
+        self.db.execute("UPDATE tasks SET runner=NULL, runner_pid=NULL WHERE task_id=? AND role='owner'"
+                        " AND runner=?", (task_id, runner))
+
+    def set_runner_pid(self, task_id: str, pid: int | None, start: str | None = None) -> None:
+        self.db.execute("UPDATE tasks SET runner_pid=?, runner_start=? WHERE task_id=? AND role='owner'"
+                        " AND runner='worker'", (pid, start, task_id))
+
+    def worker_runs(self, local_agent: str) -> list[tuple[int, str | None, str]]:
+        """(pid, start time, task id) of the processes the daemon started for this agent's unfinished tasks."""
+        rows = self.db.execute(
+            "SELECT runner_pid, runner_start, task_id FROM tasks WHERE role='owner' AND local_agent=?"
+            " AND runner='worker' AND runner_pid IS NOT NULL"
+            f" AND status NOT IN ({','.join('?' * len(TERMINAL_STATES))})",
+            (local_agent, *TERMINAL_STATES)).fetchall()
+        return [(r[0], r[1], r[2]) for r in rows]
 
     def session_contenders(self, local_agent: str) -> list[dict[str, Any]]:
         return [dict(r) for r in self.db.execute("SELECT * FROM session_contenders WHERE local_agent=?",

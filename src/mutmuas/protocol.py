@@ -44,6 +44,7 @@ RESULT_STATUSES = ("complete", "partial", "failed")
 # Task lifecycle. Terminal states never transition again.
 TASK_STATES = ("PENDING", "ACCEPTED", "RUNNING", "WAITING", "BLOCKED", "COMPLETED", "FAILED", "CANCELLED")
 TERMINAL_STATES = frozenset({"COMPLETED", "FAILED", "CANCELLED"})
+OPEN_STATES = ("PENDING", "ACCEPTED", "RUNNING", "WAITING", "BLOCKED")
 
 # What kind of work a REQUEST asks for; each maps to the permission the owner must hold.
 REQUEST_KINDS = {

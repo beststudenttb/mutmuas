@@ -176,8 +176,11 @@ daemon (`launchctl kickstart -k …` / `systemctl --user restart mutmuas-agent-n
   mode: worker
   runtime: claude-code          # claude-code | codex | script
   model: opus                   # optional; empty = CLI default
-  workdir: ~/work/visual_rl
+  workdir: ~/mutmuas/work/representation/visual-rl   # function x project directory (v4), not in a repo
   repo: ~/work/visual_rl        # optional: kind=code tasks get their own git worktree
+  code_mode: copy               # copy (default): kind=code works on a private worktree of repo;
+                                # direct: edit code_dirs in place and commit (project-level work, D-031)
+  code_dirs: []                 # direct mode: the project code, reached with --add-dir
   capabilities: [isaac_lab, gpu_training]
   permissions: [READ, RUN_EXPERIMENT, PUBLISH_ARTIFACT, REQUEST_TASK]
   accept_from: ["A:*", "B:*"]
@@ -187,6 +190,17 @@ daemon (`launchctl kickstart -k …` / `systemctl --user restart mutmuas-agent-n
 Runtime notes:
 - `claude-code` runs `claude -p` with only the mutmuas MCP server (`--strict-mcp-config`) and the tools
   allowed by the agent's permissions (ARCHITECTURE_V1 §5). `extra_args` are appended to the command line.
+  Tools come from node.yaml only (D-032): `--tools` limits the built-in tools that exist (`--allowedTools` only
+  pre-approves); setting source `project` only, not `user` (its allow rules, plugin hooks) nor `local` (a
+  session's "don't ask again" approvals); a `.claude/settings.json` from the project directory up (including
+  `~/.claude/settings.json`) that grants tools stops the run.
+  HANDOFF.md: the worker's file tools (Edit/Write) may not touch `<workdir>/HANDOFF.md`, and its prompt says
+  so. That is a **convention, not a boundary**, for a worker with Bash (RUN_EXPERIMENT, or git via
+  WRITE_WORKTREE): any program it runs can still write the file (Codex review of 6c2a60a).
+- Staff system v4 (D-029..D-031): workdir is the function x project directory, e.g.
+  `~/mutmuas/work/paper/visualrl/` (not inside any git repo). LLM workers start there, so the function's
+  `CLAUDE.md` one level up and the project's auto memory load; a code task's worktree (copy) or `code_dirs`
+  (direct) are added with `--add-dir`. A workdir inside `repo` keeps the old behaviour (start in the worktree).
 - `codex` runs `codex exec` with `--ignore-user-config` (your `~/.codex/config.toml` model and MCP servers
   are not loaded; set `inherit_user_config: true` to change that), sandbox `read-only`/`workspace-write`,
   and the mutmuas tools pre-approved.
@@ -218,6 +232,27 @@ args = ["mcp", "--config", "/Users/<you>/.mutmuas/node.yaml", "--as", "A:lead"]
 Then just say it in the session: *"Ask B for last week's representation experiment data."* The agent
 calls `find_agent`, `send_request`, `wait_for_result` and `fetch_artifact` by itself. Use one
 interactive agent id per concurrently open session, because sessions that share an id share an inbox.
+
+**One address, two ways of working** (`auto_worker`, staff system v4, D-030/D-032a): an interactive agent
+with `auto_worker: true` and a worker `runtime` is run by the daemon as a worker while no session holds it.
+
+```yaml
+- id: paper-visualrl
+  mode: interactive
+  auto_worker: true
+  runtime: claude-code
+  workdir: ~/mutmuas/work/paper/visualrl
+```
+
+- No session (and none for `AUTO_WORKER_GRACE_S`, 120 s, so a restarted terminal does not count as gone):
+  a REQUEST is accepted and run as a worker task.
+- The leader's session is there: requests are listed in its inbox and not run; the leader decides.
+  A task queued for the worker but not started yet goes back to PENDING for the session.
+- A worker already running when the session comes is not interrupted. The session sees it in
+  `whoami` (`worker_running`: task, since, latest end) and may neither accept it nor deliver its result;
+  the worker's own processes keep acting as the agent (the lease admits the pid the daemon recorded).
+- Who does a task is claimed in the ledger (`tasks.runner`: worker | session) in one transaction with the
+  session check, so a task is never done twice.
 
 ## 6. Test A → B
 
@@ -265,7 +300,8 @@ ls ~/.mutmuas/visual_rl/B/runs/  # per-task agent output (<task>.attemptN.log)
 |---|---|
 | NATS server stops | Nodes keep running. New messages queue in each node's outbox (`agentctl status` shows `outbox=N` once the server is back). Restart the server: `systemctl restart nats-server`. Everything flushes automatically and nothing needs replaying. |
 | Server machine lost | Messages and artifacts live in `store_dir`, so back up `/var/lib/nats/jetstream`. Without a backup: start a fresh server with the same `nats-server.conf`. Nodes re-register on their next heartbeat, and each node's `ledger.sqlite3` still holds its own tasks and messages. Messages in flight and object-store artifacts are lost. |
-| Node daemon crashes / machine reboots | The service manager restarts it. On start it re-queues unfinished tasks (attempt+1, requester notified "restarted"). After `max_attempts` a task fails with an explanation. |
+| Node daemon crashes / machine reboots | The service manager restarts it. On start it re-queues unfinished tasks (attempt+1, requester notified "restarted"). After `max_attempts` a task fails with an explanation. **auto_worker exception** (v4): a worker from before the restart that still runs (pid and start time both match) is stopped first (TERM, KILL after 5 s; if it cannot be stopped the task fails with the reason and is not run again). If the worker had submitted its result, that result is delivered instead of running the task again. A session's task is left to the session. **Quarantine:** when nothing proves what still runs (the recorded leader is gone or has no start time but its process group, or the pid, still has members; or the kernel's answer about the group is neither "exists" nor "no such group"), the task fails with the reason and the process group to check; it is not run again and nothing is signalled. A recorded start time that differs proves the pid belongs to another process now; the task is run again, unless a process group with the old id still has members (for example the reused pid leads its own group): then it is quarantined, conservatively. Whether the group still has members is asked of the kernel (`kill(-pgid, 0)`: "no such group" means empty; success or "not permitted" means members), not read from a `ps` listing. A zombie not yet reaped counts as a member, so the task is quarantined rather than run again; the orphaned workers of a crashed daemon are reaped by init/launchd, so this is short-lived. **Residual risks:** (1) an unrelated process group that reuses the old group id is quarantined needlessly (a false alarm); (2) between confirming the worker (pid and start time) and sending TERM/KILL to its group there is a short window (TOCTOU): if the worker exits and its pid and group id are reused in that window, the signal can reach an unrelated process group; (3) a descendant that left the group (`setsid`, double fork) is neither seen nor stopped. auto_worker guards against mistakes, not against a worker that hides on purpose (same OS user). |
+| Rolling back from v4 | Back up `data/ledger.sqlite3` before deploying v4. The ledger keeps working with the old code (it ignores the new `tasks.runner*` columns). Remove the v4 fields from `node.yaml` first (`auto_worker`, `code_mode`, `code_dirs`): the old code rejects unknown keys and would not start. |
 | A task is stuck | `agentctl cancel <id>` from the requester. On the owner, `agentctl task <id>` and the run log show why. |
 | Wrong credentials | The daemon logs `Authorization Violation` and retries. Check `nats.credentials_file` and that the server config includes the node. |
 | Reset one node completely | Stop its daemon and delete its `data_dir`. Its durable mailbox on the server still holds unacknowledged messages, which are delivered again. |

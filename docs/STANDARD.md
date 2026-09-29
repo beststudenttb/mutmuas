@@ -13,11 +13,11 @@
 | 4 | 代码版本 | 所有节点的守护进程跑 **claude 分支的同一个提交**,即 `agentctl status` 里每个节点的 code 一致。main 只存原始源码,不部署 | `agentctl status` |
 | 5 | Python | mutmuas 自身跑在 conda 环境 `mutmuas`(Python 3.12),`.venv` 由它建立。任务自己要用的 Python 另算 | `readlink -f ~/mutmuas/claude/.venv/bin/python` |
 | 6 | 服务 | 守护进程随机器开机自启,掉线自动重启。Linux:`systemd --user` 下的 `mutmuas-agent-node`,并开 linger;macOS:launchd 的 `dev.mutmuas.mutmuas.<NODE>`。启动参数统一为 `agent-node start --config ~/mutmuas/node/node.yaml` | `systemctl --user cat mutmuas-agent-node` / `launchctl print gui/$(id -u)/dev.mutmuas.mutmuas.<N>` |
-| 7 | worker 工作目录 | `~/mutmuas/work/<agent-id>`(node.yaml 里写 `../work/<agent-id>`),不和交互会话共用,也不放在代码 checkout 或 node/ 里。做 code 任务的 worker 另用 `repo:` 指向对应的 checkout | 同第 3 项 |
+| 7 | worker 工作目录 | `~/mutmuas/work/<agent-id>`(node.yaml 里写 `../work/<agent-id>`),不和交互会话共用,也不放在代码 checkout 或 node/ 里。做 code 任务的 worker 另用 `repo:` 指向对应的 checkout。**例外(员工体系 v4,D-029–D-032)**:职能×项目地址的 workdir 是 `~/mutmuas/work/<职能>/<项目>`(不在任何 git 仓库里),auto_worker 让交互会话与后台 worker 共用它;项目代码用 `code_dirs` / `repo` 指过去 | 同第 3 项 |
 | 8 | 唤醒 | 每个交互 agent **必须能被自动唤醒,且实测过**:由另一节点发一个 query,确认会话被叫醒。标已读之前必须先看到内容,不许盲标 | 实测 |
 | 9 | 记忆与工作日志 | 两样都**必须存在**(手册 R7):记忆放长期事实,工作日志按日期写"完成 / 进行中 / 下一步 / leader 原话" | 自报路径 |
 | 10 | 命名 | `<厂商>` = 本机主交互会话;`<厂商>-worker` = worker;同厂商其他会话用 `<厂商>-<岗位>`。worker 的 notify 指向同机主会话 | `agentctl agents` |
-| 11 | 重启恢复 | 守护进程随机器自动恢复(第 6 项);**交互会话和唤醒器由 leader 手动恢复**。a) 会话的**启动目录 = node.yaml 里该 agent 的 workdir**。Claude Code 按启动目录分项目记忆,换了目录记忆就"丢"了。b) 每个节点在工作日志里维护一份**重启后恢复清单**:开哪些会话、从哪个目录、resume 哪个会话。c) 会话恢复后的第一件事依次是:读工作日志 → 重挂唤醒器 → 处理积压的信 | 清单自报;`grep workdir node.yaml` 与实际启动目录对照 |
+| 11 | 重启恢复 | 守护进程随机器自动恢复(第 6 项);**交互会话和唤醒器由 leader 手动恢复**。a) 会话的**启动目录 = node.yaml 里该 agent 的 workdir**(v4 起允许是它下面的子目录,守护进程不再报警;但子目录另有一份自动记忆,所以仍应在 workdir 本身启动)。Claude Code 按启动目录分项目记忆,换了目录记忆就"丢"了。b) 每个节点在工作日志里维护一份**重启后恢复清单**:开哪些会话、从哪个目录、resume 哪个会话。c) 会话恢复后的第一件事依次是:读工作日志 → 重挂唤醒器 → 处理积压的信 | 清单自报;`grep workdir node.yaml` 与实际启动目录对照 |
 
 ## 个人特化(允许不同)
 

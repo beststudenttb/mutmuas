@@ -18,6 +18,7 @@ from .ids import Address, InvalidAddress, check_token
 PERMISSIONS = ("READ", "WRITE_WORKTREE", "RUN_EXPERIMENT", "PUBLISH_ARTIFACT", "REQUEST_TASK", "MERGE", "ADMIN")
 RUNTIMES = ("claude-code", "codex", "script")
 MODES = ("worker", "interactive")
+CODE_MODES = ("copy", "direct")
 
 DEFAULT_HOME = Path(os.environ.get("MUTMUAS_HOME", "~/.mutmuas")).expanduser()
 
@@ -39,6 +40,11 @@ class AgentConfig:
     description: str = ""
     workdir: str = "."
     repo: str = ""                       # git repo for kind=code tasks (each task gets its own worktree)
+    auto_worker: bool = False            # interactive only: while no session holds the agent, the daemon runs its
+                                         # tasks as a worker (runtime); the leader's session always comes first
+    code_mode: str = "copy"              # copy: kind=code works on a private worktree of `repo` (the mutmuas kernel);
+                                         # direct: the worker edits code_dirs in place and commits (D-031)
+    code_dirs: list[str] = field(default_factory=list)            # project code a worker reaches via --add-dir
     capabilities: list[str] = field(default_factory=list)
     permissions: list[str] = field(default_factory=lambda: ["READ", "REQUEST_TASK"])
     accept_from: list[str] = field(default_factory=lambda: ["*"])   # glob patterns over "NODE:agent"
@@ -62,11 +68,17 @@ class AgentConfig:
         check_token(self.id, "agent id")
         if self.mode not in MODES:
             raise ConfigError(f"agent {self.id}: mode must be one of {MODES}")
-        if self.mode == "worker":
+        if self.auto_worker and self.mode != "interactive":
+            raise ConfigError(f"agent {self.id}: auto_worker is for interactive agents (a worker always runs its tasks)")
+        if self.mode == "worker" or self.auto_worker:
             if self.runtime not in RUNTIMES:
                 raise ConfigError(f"agent {self.id}: worker agents need runtime in {RUNTIMES}")
             if self.runtime == "script" and not self.command:
                 raise ConfigError(f"agent {self.id}: script runtime needs 'command'")
+        if self.code_mode not in CODE_MODES:
+            raise ConfigError(f"agent {self.id}: code_mode must be one of {CODE_MODES}")
+        if self.code_mode == "direct" and not self.code_dirs:
+            raise ConfigError(f"agent {self.id}: code_mode direct needs code_dirs (the project code to edit)")
         bad = [p for p in self.permissions if p not in PERMISSIONS]
         if bad:
             raise ConfigError(f"agent {self.id}: unknown permission(s) {bad}; known: {PERMISSIONS}")
@@ -80,6 +92,15 @@ class AgentConfig:
     @property
     def workdir_path(self) -> Path:
         return Path(os.path.expandvars(self.workdir)).expanduser().resolve()
+
+    @property
+    def copies_code(self) -> bool:
+        """kind=code works on a private worktree of `repo` (not in place)."""
+        return self.code_mode == "copy" and bool(self.repo)
+
+    @property
+    def code_paths(self) -> list[Path]:
+        return [Path(os.path.expandvars(d)).expanduser().resolve() for d in self.code_dirs]
 
 
 @dataclass
@@ -191,6 +212,8 @@ def load_config(path: str | Path) -> NodeConfig:
             a["workdir"] = rel(a.get("workdir", "."))
             if a.get("repo"):
                 a["repo"] = rel(a["repo"])
+            if isinstance(a.get("code_dirs"), list):          # Codex review of 6c2a60a
+                a["code_dirs"] = [rel(d) for d in a["code_dirs"]]
     raw_nats = raw.pop("nats", {}) or {}
     for key in ("credentials_file", "tls_ca", "tls_cert", "tls_key"):
         if isinstance(raw_nats, dict) and raw_nats.get(key):

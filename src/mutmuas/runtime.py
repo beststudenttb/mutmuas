@@ -40,6 +40,7 @@ class TaskContext:
     attempt: int = 1
     workdir: Path | None = None          # isolated git worktree for code tasks
     git_branch: str | None = None
+    on_spawn: Any = None                 # called with the process id once the agent process exists
 
     @property
     def cwd(self) -> Path:
@@ -63,7 +64,10 @@ class TaskContext:
         env = dict(os.environ)
         env.update(self.agent.env)
         env.update(MUTMUAS_CONFIG=str(self.node.path or ""), MUTMUAS_AGENT=self.address,
-                   MUTMUAS_TASK_ID=self.task_id, MUTMUAS_PROJECT=self.node.project)
+                   MUTMUAS_TASK_ID=self.task_id, MUTMUAS_PROJECT=self.node.project,
+                   CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD="1")   # the project code's own CLAUDE.md
+        # (the documented files are CLAUDE.md, .claude/CLAUDE.md, .claude/rules/*.md, CLAUDE.local.md; an
+        # AGENTS.md is read only if one of them imports it)
         return env
 
     def payload(self) -> dict[str, Any]:
@@ -91,6 +95,9 @@ class SubprocessRuntime:
     def command(self, ctx: TaskContext) -> tuple[list[str], bytes | None]:
         raise NotImplementedError
 
+    def start_dir(self, ctx: TaskContext) -> Path:
+        return ctx.cwd
+
     def parse(self, ctx: TaskContext, exit_code: int, tail: str) -> RunOutcome:
         return RunOutcome(exit_code, tail, result=_last_json(tail))
 
@@ -99,7 +106,7 @@ class SubprocessRuntime:
         runs = self.node.data_path / "runs"
         runs.mkdir(parents=True, exist_ok=True)
         log_path = runs / f"{ctx.task_id}.attempt{ctx.attempt}.log"
-        workdir = ctx.cwd
+        workdir = self.start_dir(ctx)
         workdir.mkdir(parents=True, exist_ok=True)
         log.info("task %s: starting %s in %s", ctx.task_id, argv[0], workdir)
         with open(log_path, "wb") as logf:
@@ -108,6 +115,8 @@ class SubprocessRuntime:
             proc = await asyncio.create_subprocess_exec(
                 *argv, cwd=str(workdir), env=ctx.env(), stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=logf, start_new_session=True)
+            if ctx.on_spawn:
+                ctx.on_spawn(proc.pid)
             tail = bytearray()
             try:
                 if stdin is not None:
@@ -139,15 +148,39 @@ class ScriptRuntime(SubprocessRuntime):
 
 
 def _mcp_server_spec(ctx: TaskContext) -> dict[str, Any]:
-    return {"command": sys.executable, "args": ["-m", "mutmuas.cli", "mcp"],
+    # --worker-task: this MCP server serves a daemon-run task, not a session (it must not hold the session)
+    return {"command": sys.executable, "args": ["-m", "mutmuas.cli", "mcp", "--worker-task", ctx.task_id],
             "env": {"MUTMUAS_CONFIG": str(ctx.node.path or ""), "MUTMUAS_AGENT": ctx.address,
                     "MUTMUAS_TASK_ID": ctx.task_id}}
 
 
+def llm_start_dir(ctx: TaskContext) -> Path:
+    """An LLM worker starts in its project directory, where the function CLAUDE.md and the project's memory are
+    (D-031), and reaches a code task's worktree through extra_dirs. Legacy: a workdir inside the repo would open
+    the main repo to the task (the b461307 MERGE bypass), so such an agent still starts in the worktree."""
+    if ctx.workdir is not None and ctx.agent.repo:
+        repo = Path(os.path.realpath(Path(os.path.expandvars(ctx.agent.repo)).expanduser()))
+        if Path(os.path.realpath(ctx.agent.workdir_path)).is_relative_to(repo):
+            return ctx.workdir
+    return ctx.agent.workdir_path
+
+
+def extra_dirs(ctx: TaskContext) -> list[Path]:
+    """The code an LLM worker may reach besides its start directory: the task's worktree (copy mode) or the
+    project code it edits in place (direct mode)."""
+    dirs = [ctx.workdir] if ctx.workdir is not None and llm_start_dir(ctx) != ctx.workdir else []
+    return dirs + (ctx.agent.code_paths if ctx.agent.code_mode == "direct" else [])
+
+
 def worker_prompt(ctx: TaskContext) -> str:
     req = ctx.request
-    git_note = (f"\nYou are in an isolated git worktree on branch {ctx.git_branch}. Commit your changes there "
-                "(git add + git commit); only committed work is delivered, as a patch.\n") if ctx.git_branch else ""
+    code = extra_dirs(ctx)
+    git_note = (f"\nThe code for this task is in an isolated git worktree{' at ' + str(ctx.workdir) if code else ''} "
+                f"on branch {ctx.git_branch}. Commit your changes there (git -C <worktree> add + commit); only "
+                "committed work is delivered, as a patch.\n") if ctx.git_branch else ""
+    if ctx.agent.code_mode == "direct" and code:
+        git_note += (f"\nThe project code is in {', '.join(map(str, code))}. Edit it in place and commit promptly "
+                     "with a clear message (git -C <dir>); a mistake is undone with git.\n")
     return f"""You are {ctx.address} (role: {ctx.agent.role or ctx.agent.id}) in the mutmuas multi-agent system,
 project "{ctx.node.project}", running on node {ctx.node.node}. Another agent delegated a task to you.
 
@@ -162,7 +195,9 @@ submit_result, list_agents, find_agent, send_request, wait_for_result, check_tas
 
 {git_note}
 Rules:
-1. Work only inside your working directory ({ctx.cwd}) unless the request says otherwise.
+1. Work only inside your working directory ({llm_start_dir(ctx)}){' and ' + ', '.join(map(str, code)) if code else ''}
+   unless the request says otherwise. HANDOFF.md there belongs to the interactive session: do not edit it;
+   append a short record of what you did to worker-log.md instead.
 2. Never paste large data into text. Put files/datasets/logs into artifacts with publish_artifact
    and pass the returned references to submit_result.
 3. Call report_progress for meaningful milestones of long work.
@@ -173,20 +208,57 @@ Rules:
 """
 
 
+def _refuse_granting_project_settings(workdir: Path) -> None:
+    """A worker loads project settings; from its directory up (where Claude Code may look for them), a
+    .claude/settings.json may restrict tools, never grant them. Fails closed, ~/.claude/settings.json included."""
+    for directory in (workdir, *workdir.parents):
+        path = directory / ".claude" / "settings.json"
+        try:
+            allow = (json.loads(path.read_text()).get("permissions") or {}).get("allow")
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except (OSError, ValueError, AttributeError) as e:
+            raise PermissionError(f"cannot check {path} for tool grants: {e!r}") from e
+        if allow:
+            raise PermissionError(f"{path} grants tools ({', '.join(map(str, allow))}); a worker's tools come "
+                                  "from node.yaml only (D-032): move these rules out of the project directory "
+                                  "and its parents")
+
+
 class ClaudeCodeRuntime(SubprocessRuntime):
     name = "claude-code"
+
+    def start_dir(self, ctx: TaskContext) -> Path:
+        return llm_start_dir(ctx)
 
     def command(self, ctx: TaskContext) -> tuple[list[str], bytes | None]:
         cfg_path = self.node.data_path / "runs" / f"{ctx.task_id}.mcp.json"
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         cfg_path.write_text(json.dumps({"mcpServers": {"mutmuas": _mcp_server_spec(ctx)}}))
-        tools = ["mcp__mutmuas", "Read", "Glob", "Grep"]
+        tools = ["mcp__mutmuas", "Read", "Glob", "Grep"]          # pre-approved (--allowedTools)
+        available = ["Read", "Glob", "Grep"]                       # all that exists (--tools; MCP tools stay)
         if ctx.allows("WRITE_WORKTREE"):
             tools += ["Edit", "Write", "Bash(git:*)"]
+            available += ["Edit", "Write", "Bash"]
         if ctx.allows("RUN_EXPERIMENT"):
             tools += ["Bash"]
+            available += [] if "Bash" in available else ["Bash"]
+        # Tools come from node.yaml alone (D-032; Codex review of 6c2a60a): --tools limits what exists, since
+        # --allowedTools only pre-approves. Setting source "project" only: not "user" (its allow rules and
+        # plugin hooks) nor "local" (a session's "don't ask again" approvals); "project" still loads the
+        # function CLAUDE.md above the project directory and the project's memory. A settings file from the
+        # project directory up that grants tools stops the run.
+        _refuse_granting_project_settings(self.agent.workdir_path)
+        # HANDOFF.md belongs to the session (D-030). This deny covers the file tools only; a worker with Bash can
+        # still write it, so for such a worker it is a convention, not a boundary (Codex review of 6c2a60a).
+        handoff = "/" + os.path.realpath(self.agent.workdir_path / "HANDOFF.md")   # //abs: an absolute rule path
+        settings_path = self.node.data_path / "runs" / f"{ctx.task_id}.settings.json"
+        settings_path.write_text(json.dumps({"permissions": {"deny": [f"Edit({handoff})", f"Write({handoff})"]}}))
         argv = ["claude", "-p", "--output-format", "json", "--mcp-config", str(cfg_path), "--strict-mcp-config",
-                "--allowedTools", ",".join(tools)]
+                "--setting-sources", "project", "--settings", str(settings_path),
+                "--tools", ",".join(available), "--allowedTools", ",".join(tools)]
+        for d in extra_dirs(ctx):
+            argv += ["--add-dir", str(d)]
         if self.agent.model:
             argv += ["--model", self.agent.model]
         return argv + list(self.agent.extra_args), worker_prompt(ctx).encode()
@@ -201,11 +273,15 @@ class ClaudeCodeRuntime(SubprocessRuntime):
 class CodexRuntime(SubprocessRuntime):
     name = "codex"
 
+    def start_dir(self, ctx: TaskContext) -> Path:
+        return llm_start_dir(ctx)
+
     def command(self, ctx: TaskContext) -> tuple[list[str], bytes | None]:
         spec = _mcp_server_spec(ctx)
         env_toml = "{" + ", ".join(f'{k} = {json.dumps(v)}' for k, v in spec["env"].items()) + "}"
         writable = ctx.allows("WRITE_WORKTREE") or ctx.allows("RUN_EXPERIMENT")
-        argv = ["codex", "exec", "--skip-git-repo-check", "-C", str(ctx.cwd),
+        argv = ["codex", "exec", "--skip-git-repo-check", "-C", str(self.start_dir(ctx)),
+                *[a for d in (extra_dirs(ctx) if writable else []) for a in ("--add-dir", str(d))],
                 *([] if self.agent.inherit_user_config else ["--ignore-user-config"]),
                 "--sandbox", "workspace-write" if writable else "read-only",
                 "-c", 'approval_policy="never"',
