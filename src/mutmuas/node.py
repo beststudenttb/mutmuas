@@ -241,6 +241,7 @@ class NodeDaemon:
         self._queues: dict[str, asyncio.Queue[str]] = {}
         self._queued: dict[str, set[str]] = {}               # task ids queued or running, per agent
         self._running: dict[str, asyncio.Task] = {}          # task_id -> runner task
+        self._retry: set[str] = set()                        # failed runs to lay out once more (D-040)
         self._arriving: set[str] = set()                     # REQUESTs _on_request is still deciding about
         self._cancel_requested: set[str] = set()
         self._background: set[asyncio.Task] = set()          # e.g. observer-copy checks against the task KV
@@ -539,7 +540,7 @@ class NodeDaemon:
             self._background_job(send_observer_copies(self.hub, env.to, env.task_id, new))
         return None
 
-    def _failed(self, stage: str, error: BaseException, address: str | None = None, task_id: str | None = None,
+    def _failed(self, stage: str, error: BaseException | str, address: str | None = None, task_id: str | None = None,
                 attempt: int | None = None) -> None:
         """Supervision (D-040): skip, record, carry on; the next round tries again."""
         log.warning("%s failed (%s %s): %r", stage, address or "-", task_id or "-", error)
@@ -689,6 +690,9 @@ class NodeDaemon:
             finally:
                 self._running.pop(task_id, None)
                 self._queued[addr].discard(task_id)
+                if task_id in self._retry:
+                    self._retry.discard(task_id)
+                    self._enqueue(addr, task_id)
 
     async def _execute(self, agent: AgentConfig, task_id: str) -> None:
         hub = self.hub
@@ -734,7 +738,8 @@ class NodeDaemon:
             try:
                 wt = await Worktree.create(Path(agent.repo), self.cfg.node, agent.id, task_id, base_ref)
             except GitError as e:
-                await hub.finish(task_id, result_body("failed", f"could not create worktree: {e}"))
+                await self._run_failed(agent, task_id, attempt,
+                                       result_body("failed", f"could not create worktree: {e}"))
                 return
             ctx.workdir, ctx.git_branch = wt.path, wt.branch
         where = f", branch {wt.branch}" if wt else ""
@@ -742,8 +747,8 @@ class NodeDaemon:
         try:
             outcome = await asyncio.wait_for(make_runtime(agent, self.cfg).run(ctx), timeout)
         except asyncio.TimeoutError:
-            await hub.finish(task_id, result_body("failed", f"timed out after {timeout:.0f}s",
-                                                  limitations=["process was killed at the deadline"]))
+            await self._run_failed(agent, task_id, attempt, result_body(
+                "failed", f"timed out after {timeout:.0f}s", limitations=["process was killed at the deadline"]))
             return
         except asyncio.CancelledError:
             if task_id in self._cancel_requested:
@@ -752,8 +757,7 @@ class NodeDaemon:
                 return
             raise
         except Exception as e:
-            log.exception("runtime failed for %s", task_id)
-            await hub.finish(task_id, result_body("failed", f"runtime error: {e!r}"))
+            await self._run_failed(agent, task_id, attempt, result_body("failed", f"runtime error: {e!r}"))
             return
 
         current = hub.ledger.task(task_id, "owner")
@@ -763,12 +767,28 @@ class NodeDaemon:
             return      # blocked and nothing to deliver: wait for the requester
         # A submitted result always wins over an earlier BLOCKED report.
         body, refs = _result_from(current.get("result_draft"), outcome)
+        if outcome.exit_code != 0 and not _structured(current.get("result_draft") or outcome.result):
+            await self._run_failed(agent, task_id, attempt, body, refs)     # it died without a result
+            return
         if wt:
             await self._attach_git(wt, agent, task_id, body, refs)
         await hub.finish(task_id, body, refs)
         await self._notify(agent, current["owner"], task_id,
                            f"FYI: {current['owner']} finished {task_id} for {current['requester']} "
                            f"({body['status']})")
+
+    async def _run_failed(self, agent: AgentConfig, task_id: str, attempt: int, body: dict[str, Any],
+                          refs: list[ArtifactRef] | None = None) -> None:
+        """Supervision (D-040): a failed run (crash, timeout, runtime error) is recorded and laid out once more;
+        the next failure finishes the task as failed. An agent's own 'failed' verdict is not a failed run."""
+        self._failed("run", body["summary"], address=self.hub.ledger.task(task_id, "owner")["owner"],
+                     task_id=task_id, attempt=attempt)
+        if attempt < agent.max_attempts:
+            await self.hub.owner_transition(task_id, "ACCEPTED", f"attempt {attempt} failed ({body['summary']}); "
+                                                                 "running it once more")
+            self._retry.add(task_id)                 # queued again once the runner has let go of it
+            return
+        await self.hub.finish(task_id, body, refs or [])
 
     async def _notify(self, agent: AgentConfig, sender: str, task_id: str, text: str) -> None:
         """Copy a node's lead (agent.notify) on work its workers take on. Best effort, informational only."""
@@ -1045,10 +1065,14 @@ class NodeDaemon:
         return next((a for a in self.cfg.agents if a.id == addr.agent and addr.node == self.cfg.node), None)
 
 
+def _structured(candidate: dict[str, Any] | None) -> bool:
+    return bool(candidate and candidate.get("status") in ("complete", "partial", "failed") and candidate.get("summary"))
+
+
 def _result_from(draft: dict[str, Any] | None, outcome) -> tuple[dict[str, Any], list[ArtifactRef]]:
     """Pick the agent's structured result. Never upgrade an unstructured finish to 'complete'."""
     candidate = draft or outcome.result
-    if candidate and candidate.get("status") in ("complete", "partial", "failed") and candidate.get("summary"):
+    if _structured(candidate):
         refs = [ArtifactRef.from_dict(a) for a in candidate.get("artifacts", [])]
         body = {k: v for k, v in candidate.items() if k != "artifacts"}
         if outcome.exit_code != 0 and body["status"] == "complete":

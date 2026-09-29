@@ -65,3 +65,52 @@ async def test_a_background_loop_error_is_recorded_and_the_loop_goes_on(tmp_path
         loop.cancel()
         await asyncio.gather(loop, return_exceptions=True)
         ledger.close()
+
+
+async def _lab(make_config, cluster):
+    from conftest import interactive, worker
+    a = make_config("A", [interactive("main")])
+    b = make_config("B", [worker("lab", "lab.py")])
+    await cluster.start(a)
+    daemon_b = await cluster.start(b)
+    return await cluster.client(a), daemon_b
+
+
+async def _ask(hub, inputs):
+    from mutmuas import tools
+    sent = await tools.send_request(hub, "A:main", "B:lab", "run", "supervision test", kind="experiment",
+                                    inputs=inputs)
+    return sent["task_id"]
+
+
+async def test_a_failed_run_is_recorded_and_laid_out_once_more(make_config, cluster, tmp_path):
+    from mutmuas import tools
+    hub, daemon_b = await _lab(make_config, cluster)
+    task_id = await _ask(hub, {"action": "fail_once", "flag": str(tmp_path / "flag"), "marker": str(tmp_path / "m")})
+    result = await tools.wait_for_result(hub, task_id, 30)
+    assert result["result_status"] == "complete" and result["result"]["summary"] == "worked the second time"
+    assert (tmp_path / "m").read_text().count("\n") == 2
+    runs = [r for r in daemon_b.hub.ledger.failures() if r["task_id"] == task_id]
+    assert [(r["stage"], r["attempt"]) for r in runs] == [("run", 1)]
+
+
+async def test_a_second_failure_finishes_the_task_as_failed(make_config, cluster, tmp_path):
+    from mutmuas import tools
+    hub, daemon_b = await _lab(make_config, cluster)
+    task_id = await _ask(hub, {"action": "crash", "marker": str(tmp_path / "m")})
+    result = await tools.wait_for_result(hub, task_id, 30)
+    assert result["status"] == "FAILED" and "exit code 3" in result["result"]["summary"]
+    assert (tmp_path / "m").read_text().count("\n") == 2               # laid out exactly once more
+    runs = [r["attempt"] for r in daemon_b.hub.ledger.failures() if r["task_id"] == task_id]
+    assert sorted(runs) == [1, 2]
+
+
+async def test_a_result_the_agent_itself_marks_failed_is_not_run_again(make_config, cluster, tmp_path):
+    """Retrying is for failed runs (crash, timeout, runtime error); an agent's own verdict stands."""
+    from mutmuas import tools
+    hub, _ = await _lab(make_config, cluster)
+    task_id = await _ask(hub, {"action": "fetch_file", "path": str(tmp_path / "missing"),
+                               "marker": str(tmp_path / "m")})
+    result = await tools.wait_for_result(hub, task_id, 30)
+    assert result["result_status"] == "failed"
+    assert (tmp_path / "m").read_text().count("\n") == 1
