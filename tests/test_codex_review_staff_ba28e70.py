@@ -23,10 +23,6 @@ def _setup(tmp_path):
     return agent, cfg, ledger, hub
 
 
-def _request(ledger, task_id):
-    owned_task(ledger, task_id)
-
-
 def _holder():
     return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(15)"])
 
@@ -36,8 +32,8 @@ async def test_worker_without_task_env_still_cannot_finish_session_task(tmp_path
     """A child of a worker can lose its environment but is still the worker, not the interactive session."""
     agent, _, ledger, hub = _setup(tmp_path)
     worker_task, session_task = "T-worker", "T-session"
-    _request(ledger, worker_task)
-    _request(ledger, session_task)
+    owned_task(ledger, worker_task)
+    owned_task(ledger, session_task)
     ledger.update_task(worker_task, "owner", status="RUNNING")
     assert ledger.claim_task(worker_task, "worker", ("RUNNING",)) is None
     from mutmuas.node import proc_start
@@ -64,7 +60,7 @@ async def test_recovery_does_not_release_a_still_running_worker_to_the_session(t
     Option B: the restart stops it first; only then may the session get the task (no two actors)."""
     agent, cfg, ledger, hub = _setup(tmp_path)
     task_id = "T-worker-survives"
-    _request(ledger, task_id)
+    owned_task(ledger, task_id)
     ledger.update_task(task_id, "owner", status="RUNNING")
     assert ledger.claim_task(task_id, "worker", ("RUNNING",)) is None
     worker, session = _holder(), _holder()
