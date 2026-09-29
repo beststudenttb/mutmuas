@@ -222,8 +222,9 @@ class ClaudeCodeRuntime(SubprocessRuntime):
         cfg_path = self.node.data_path / "runs" / f"{ctx.task_id}.mcp.json"
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         cfg_path.write_text(json.dumps({"mcpServers": {"mutmuas": _mcp_server_spec(ctx)}}))
-        tools = ["mcp__mutmuas", "Read", "Glob", "Grep"]          # pre-approved (--allowedTools)
-        available = ["Read", "Glob", "Grep"]                       # all that exists (--tools; MCP tools stay)
+        # Skill: the project's skills (pilot 2026-09-29: without it in --tools a worker could not use them)
+        tools = ["mcp__mutmuas", "Read", "Glob", "Grep", "Skill"]   # pre-approved (--allowedTools)
+        available = ["Read", "Glob", "Grep", "Skill"]                # all that exists (--tools; MCP tools stay)
         if ctx.allows("WRITE_WORKTREE"):
             tools += ["Edit", "Write", "Bash(git:*)"]
             available += ["Edit", "Write", "Bash"]

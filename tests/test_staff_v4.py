@@ -37,10 +37,10 @@ def test_available_tools_are_exactly_what_node_yaml_grants(tmp_path):
     rule could not run Bash; E9: MCP tools stay available)."""
     runtime, ctx, _ = _claude_ctx(tmp_path)
     argv, _ = runtime.command(ctx)
-    assert argv[argv.index("--tools") + 1] == "Read,Glob,Grep"
+    assert argv[argv.index("--tools") + 1] == "Read,Glob,Grep,Skill"
     runtime, ctx, _ = _claude_ctx(tmp_path, kind="code", permissions=("READ", "WRITE_WORKTREE"))
     argv, _ = runtime.command(ctx)
-    assert argv[argv.index("--tools") + 1] == "Read,Glob,Grep,Edit,Write,Bash"
+    assert argv[argv.index("--tools") + 1] == "Read,Glob,Grep,Skill,Edit,Write,Bash"
     assert "Bash(git:*)" in argv[argv.index("--allowedTools") + 1].split(",")
 
 

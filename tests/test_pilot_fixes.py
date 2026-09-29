@@ -61,3 +61,11 @@ def test_agents_json_shows_auto_worker():
     """The card carries auto_worker (CARD_KEYS); the summary agents and find_agent print dropped it."""
     card = {"address": "B:desk", "mode": "interactive", "auto_worker": True}
     assert tools.card_summary(card)["auto_worker"] is True
+
+
+def test_llm_workers_get_skill(tmp_path):
+    """The pilot showed a worker uses project skills once Skill is in --tools (it was not by default)."""
+    runtime, ctx, _ = _claude_ctx(tmp_path)
+    argv, _ = runtime.command(ctx)
+    assert "Skill" in argv[argv.index("--tools") + 1].split(",")
+    assert "Skill" in argv[argv.index("--allowedTools") + 1].split(",")
