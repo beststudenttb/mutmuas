@@ -102,7 +102,7 @@ RESULT   B:experimenter -> A:main   complete, outputs, artifact://demo/B/experim
 | Agent & node cards | KV `mm_<p>_agents`, `mm_<p>_nodes` | the node itself (enforced) | overwritten by heartbeats |
 | Task records | KV `mm_<p>_tasks`, key `<node>.<agent>.<task>` | owner node only (enforced) | 5 revisions of history |
 | Artifacts | object store `mm_<p>_artifacts`, or where the file lives | publisher | until deleted (no GC yet) |
-| Run logs | `<data_dir>/runs/<task>.attemptN.log` | owner node | permanent |
+| Run logs | `<data_dir>/runs/<task>.<UTC start time>.attempt<N>.log` (one per run) | owner node | permanent |
 
 Why both SQLite and KV: SQLite makes each node crash-safe and able to work offline, with no
 distributed transactions. The KV record is the owner's *published view*, so anyone can run
