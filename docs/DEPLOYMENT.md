@@ -338,7 +338,6 @@ Known risks (protections removed on purpose; one line each):
   Codex T-20260929122530-54280d88).
 - A job registered with only a done-file that never writes it keeps its task waiting forever (cancel the task).
   Cancelling such a task does not stop the job: the node knows no process for it.
-- A crash between recording that a background job ended and waking its post loses that wake-up.
 
 ## 9. Uninstall
 
