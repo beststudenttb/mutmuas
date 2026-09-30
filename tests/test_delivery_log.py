@@ -113,3 +113,12 @@ async def test_agentctl_submit_result_takes_how_and_notes(monkeypatch):
     await cli.cmd_submit(args, None)
     assert calls[0]["how"] == "h" and calls[0]["notes"] == "n"
 
+
+def test_the_worker_prompt_leaves_the_log_to_the_node(tmp_path):
+    from test_staff_v4 import _claude_ctx
+
+    from mutmuas.runtime import worker_prompt
+    _, ctx, _ = _claude_ctx(tmp_path)
+    prompt = worker_prompt(ctx)
+    assert "how" in prompt and "notes" in prompt and "the node writes" in prompt
+    assert "append a short record" not in prompt
