@@ -141,7 +141,8 @@ async def test_finishing_a_task_queues_its_result_atomically(tmp_path):
     from mutmuas.config import AgentConfig, NodeConfig
     from mutmuas.hub import Hub
     from mutmuas.ledger import Ledger
-    cfg = NodeConfig(project="p", node="B", data_dir=str(tmp_path), agents=[AgentConfig(id="lab", mode="interactive")])
+    cfg = NodeConfig(project="p", node="B", data_dir=str(tmp_path),       # workdir: its delivery log goes there
+                     agents=[AgentConfig(id="lab", mode="interactive", workdir=str(tmp_path / "lab"))])
     hub = Hub(cfg, None, Ledger(cfg.db_path))                    # no bus at all: nothing can be published
     for task_id, how in (("T-ok", "finish"), ("T-no", "reject")):
         req = Envelope(type="REQUEST", sender="A:main", to="B:lab", task_id=task_id, body=request_body("x", "y"))

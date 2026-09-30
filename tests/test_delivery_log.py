@@ -122,3 +122,29 @@ def test_the_worker_prompt_leaves_the_log_to_the_node(tmp_path):
     prompt = worker_prompt(ctx)
     assert "how" in prompt and "notes" in prompt and "the node writes" in prompt
     assert "append a short record" not in prompt
+
+
+def test_the_plan_section_ignores_code_blocks_and_similar_task_ids():
+    """Codex light review T-20260930035834-1a21c09a: a '# comment' inside a fenced command is not a heading, and
+    T-d is not T-d2 (whole task ids only); an indented ATX heading (up to 3 spaces) counts."""
+    from mutmuas.hub import drop_plan_section, plan_section
+    board = """# T-d2: a similar id
+- [x] not this one
+
+  ## T-d: the one
+- [>] run it:
+```sh
+# T-d comment that looks like a heading
+make test
+```
+- [ ] check
+
+## T-later
+- [ ] no
+"""
+    section = plan_section(board, "T-d")
+    assert section.startswith("  ## T-d: the one") and "make test" in section and "- [ ] check" in section
+    assert "T-later" not in section and "T-d2" not in section
+    rest = drop_plan_section(board, "T-d")
+    assert "# T-d2: a similar id" in rest and "## T-later" in rest and "make test" not in rest
+    assert plan_section(board, "T-d3") is None and drop_plan_section(board, "T-d3") == board
