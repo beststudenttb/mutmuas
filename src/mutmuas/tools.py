@@ -221,7 +221,7 @@ async def _read_receipts(hub: Hub, me: str, envs: list[Envelope], read: bool = T
         if task and task["owner"] == me and task["status"] not in TERMINAL_STATES:
             summary = (f"read by {me} (no reply requested)" if read
                        else f"cleared by {me} without reading (clear_inbox; no reply requested)")
-            await hub.finish(env.task_id, result_body("complete", summary))
+            await hub.finish(env.task_id, result_body("complete", summary), record=False)   # a notice, not work
 
 
 async def accept_task(hub: Hub, me: str, task_id: str) -> dict[str, Any]:
@@ -285,7 +285,8 @@ async def report_progress(hub: Hub, me: str, message: str, task_id: str | None =
 
 async def submit_result(hub: Hub, me: str, status: str, summary: str, *, task_id: str | None = None,
                         outputs: Any = None, artifacts: list[dict] | None = None, evidence: Any = None,
-                        limitations: Any = None, follow_up: Any = None, next: str | None = None) -> dict[str, Any]:
+                        limitations: Any = None, follow_up: Any = None, next: str | None = None, how: str | None = None,
+                        notes: str | None = None) -> dict[str, Any]:
     task_id = task_id or _current_task()
     if not task_id:
         raise ValueError("task_id is required outside of a delegated task")
@@ -294,7 +295,7 @@ async def submit_result(hub: Hub, me: str, status: str, summary: str, *, task_id
         return {"task_id": task_id, "error": f"task already {task['status']}; result not changed"}
     _check_actor(hub, task)
     body = result_body(status, summary, outputs=outputs, evidence=evidence, limitations=limitations,
-                       follow_up=follow_up)
+                       follow_up=follow_up, how=how, notes=notes)
     if next:
         body["next"] = next
     refs = [ArtifactRef.from_dict(a) for a in artifacts or []]

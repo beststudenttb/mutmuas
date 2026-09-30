@@ -320,12 +320,14 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
     async def submit_result(status: str, summary: str, task_id: str | None = None,
                             outputs: dict[str, Any] | None = None, artifacts: list[dict[str, Any]] | None = None,
                             evidence: list[str] | None = None, limitations: list[str] | None = None,
-                            follow_up: list[str] | None = None, next: str | None = None) -> str:
+                            follow_up: list[str] | None = None, next: str | None = None,
+                            how: str | None = None, notes: str | None = None) -> str:
         """Finish a task you own. status: complete | partial | failed — be honest; never call partial complete.
-        artifacts: references returned by publish_artifact. next: who moves next, if anyone (wakes them)."""
+        artifacts: references returned by publish_artifact. next: who moves next, if anyone (wakes them).
+        how / notes: how you did it and anything worth noting; the node writes them into worker-log.md."""
         return dump(await tools.submit_result(
             hub(), state["me"], status, summary, task_id=task_id, outputs=outputs, artifacts=artifacts,
-            evidence=evidence, limitations=limitations, follow_up=follow_up, next=next))
+            evidence=evidence, limitations=limitations, follow_up=follow_up, next=next, how=how, notes=notes))
 
     @server.tool()
     async def ask_question(task_id: str, question: str, next: str | None = None) -> str:

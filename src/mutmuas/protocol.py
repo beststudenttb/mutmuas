@@ -263,12 +263,15 @@ def request_body(objective: str, reason: str, *, kind: str = "query", inputs: An
 
 
 def result_body(status: str, summary: str, *, outputs: Any = None, evidence: Any = None,
-                limitations: Any = None, follow_up: Any = None) -> dict[str, Any]:
+                limitations: Any = None, follow_up: Any = None, how: str | None = None,
+                notes: str | None = None) -> dict[str, Any]:
+    """how / notes: how it was done and anything worth noting; the owner's node writes them into the post's
+    worker-log.md line (D-052, handbook R7.11)."""
     if status not in RESULT_STATUSES:
         raise ProtocolError(f"RESULT status must be one of {RESULT_STATUSES}")
     body: dict[str, Any] = {"status": status, "summary": summary}
     for key, value in (("outputs", outputs), ("evidence", evidence), ("limitations", limitations),
-                       ("follow_up", follow_up)):
+                       ("follow_up", follow_up), ("how", how), ("notes", notes)):
         if value not in (None, "", [], {}):
             body[key] = value
     return body

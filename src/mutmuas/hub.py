@@ -344,11 +344,22 @@ class Hub:
         log.info("task %s -> %s (%s)", task_id, status, message)
         return True
 
-    async def finish(self, task_id: str, result: dict[str, Any], artifacts: list[ArtifactRef] | None = None) -> bool:
-        """Send the RESULT for an owned task and close it. Refuses to finish a task twice."""
+    async def finish(self, task_id: str, result: dict[str, Any], artifacts: list[ArtifactRef] | None = None,
+                     record: bool = True) -> bool:
+        """Send the RESULT for an owned task and close it. Refuses to finish a task twice.
+        record (D-052): the mechanical part of delivery is done here, not by the model: this task's PLAN.md section
+        goes into outputs.plan (and off the board), and the post's worker-log.md gets its R7.11 line. Off for
+        notices closed by being read."""
         task = self.ledger.task(task_id, "owner")
         if task is None:
             raise KeyError(f"task {task_id} is not owned by this node")
+        workdir = self.local_agent(task["owner"])[1].workdir_path if record else None
+        board = workdir / "PLAN.md" if workdir else None
+        section = plan_section(board.read_text(), task_id) if board and board.is_file() else None
+        if section:
+            outputs = result.get("outputs")
+            outputs = outputs if isinstance(outputs, dict) else {"value": outputs} if outputs else {}
+            result = {**result, "outputs": {**outputs, "plan": section}}
         env = Envelope(type="RESULT", sender=task["owner"], to=task["requester"], body=result, task_id=task_id,
                        conversation_id=task["conversation_id"], artifacts=artifacts or [],
                        reply_to=task.get("last_message"))
@@ -360,7 +371,40 @@ class Hub:
         await self.try_publish(env)
         await self.publish_task_record(task_id)
         log.info("task %s finished: %s", task_id, result["status"])
+        if workdir:
+            if section:
+                board.write_text(board.read_text().replace(section, "", 1))
+            workdir.mkdir(parents=True, exist_ok=True)          # as a run does; a post may not have run yet
+            with open(workdir / "worker-log.md", "a") as f:
+                f.write(log_line(task, result) + "\n")
         return True
+
+
+def plan_section(board: str, task_id: str) -> str | None:
+    """A task's section of a PLAN.md: the first heading that names the task id, down to the next heading of the
+    same or a higher level. Nothing is guessed: no such heading, no section."""
+    lines = board.splitlines(keepends=True)
+    start = next((i for i, line in enumerate(lines) if line.startswith("#") and task_id in line), None)
+    if start is None:
+        return None
+    level = len(lines[start]) - len(lines[start].lstrip("#"))
+    end = next((j for j in range(start + 1, len(lines))
+                if lines[j].startswith("#") and len(lines[j]) - len(lines[j].lstrip("#")) <= level), len(lines))
+    block = "".join(lines[start:end]).rstrip("\n")
+    return block + "\n"
+
+
+def log_line(task: dict[str, Any], result: dict[str, Any]) -> str:
+    """handbook R7.11: time | from | task | output / to whom | how | notes (one line; '|' inside a field -> '/')."""
+    def field(text: Any, n: int = 200) -> str:
+        text = " ".join(str(text or "").replace("|", "/").split())
+        return text[:n] + ("…" if len(text) > n else "")
+    objective = (task.get("request") or {}).get("objective")
+    return " | ".join([
+        datetime.now().astimezone().strftime("%Y-%m-%d %H:%M"), task["requester"],
+        f"{task['task_id']} {field(objective, 60)}".rstrip(),
+        f"{result['status']}: {field(result.get('summary'), 100)} -> {task['requester']}",
+        field(result.get("how")) or "未填", field(result.get("notes")) or "未填"])
 
 
 def is_online(card: dict[str, Any]) -> bool:

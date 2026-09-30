@@ -374,6 +374,7 @@ async def cmd_submit(args, hub: Hub):
         raise SystemExit("--status and --summary (or a --file with them) are required")
     _print(await tools.submit_result(hub, _me(args), status, summary, task_id=args.task, artifacts=artifacts,
                                      next=args.next or data.get("next"),
+                                     how=args.how or data.get("how"), notes=args.notes or data.get("notes"),
                                      **{k: data[k] for k in ("outputs", "evidence", "limitations", "follow_up")
                                         if k in data}), args.json)
 
@@ -811,6 +812,8 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--artifact", action="append", help="artifact URI (repeatable)")
     p.add_argument("--file", help="YAML with status/summary/outputs/artifacts/evidence/limitations/follow_up")
     p.add_argument("--next", metavar="ADDR", help="whose move it is now (wakes them)")
+    p.add_argument("--how", help="how it was done (goes into the post's worker-log.md line)")
+    p.add_argument("--notes", help="anything worth noting (worker-log.md line)")
     p = add("question", cmd_question, "ask the other side of a task", bus=False)
     p.add_argument("task_id")
     p.add_argument("text")
