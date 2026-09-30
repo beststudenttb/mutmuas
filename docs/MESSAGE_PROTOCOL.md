@@ -89,7 +89,8 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
 - **Waiting on child tasks** (D-066): requests an owner sends while working on a task carry `parent_task` (set
   automatically inside a worker run). `add_job(children=True)` makes the task wait on its direct children; so does
   reporting `state: WAITING` while a child is open. The wait ends once every child has a result, was refused or
-  cancelled, or is past its deadline (reported as overdue and left running: the parent decides). The task is then
+  cancelled, or is past its deadline (reported as overdue and left running: the parent decides; each child is
+  reported overdue once, so a wait registered again afterwards lasts until that child really ends). The task is then
   woken once, as for a background job, and the wake-up lists how each child ended. Cancelling a task sends CANCEL
   to its open children (their nodes cascade further down).
 - `next: <address>` on RESULT, UPDATE, QUESTION or ANSWER names whose move it is. That agent is woken exactly

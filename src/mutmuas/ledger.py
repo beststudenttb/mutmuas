@@ -524,6 +524,10 @@ class Ledger:
     def failures(self, limit: int = 50) -> list[dict[str, Any]]:
         return [dict(r) for r in self.db.execute("SELECT * FROM failures ORDER BY rowid DESC LIMIT ?", (limit,))]
 
+    def noticed(self, task_id: str, reason: str) -> bool:
+        return self.db.execute("SELECT 1 FROM notices WHERE task_id=? AND reason=?", (task_id, reason)).fetchone() \
+            is not None
+
     def notice_once(self, task_id: str, reason: str) -> bool:
         """True the first time (task_id, reason) is recorded: send that follow-up now, and never again."""
         cur = self.db.execute("INSERT OR IGNORE INTO notices (task_id, reason, created_at) VALUES (?,?,?)",

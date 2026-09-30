@@ -843,10 +843,14 @@ class NodeDaemon:
 
     def _children_ended(self, task_id: str) -> str | None:
         """D-066: a wait on the direct child tasks ends once each has a result, was refused or cancelled, or is past
-        its deadline (then it is reported overdue and left running: the parent decides). None while one is open."""
+        its deadline (then it is reported overdue and left running: the parent decides). None while one is open.
+        A child is reported overdue once: a parent that waits again afterwards waits for its real end, or every
+        heartbeat would wake it again (secretary's recheck of ad60ea4). There is no way to extend a child's
+        deadline, and a worker cannot be relied on to cancel, so the node keeps this rule itself."""
         now = datetime.now(timezone.utc)
-        lines = []
-        for child in self.hub.ledger.children(task_id):
+        lines, overdue = [], []
+        ledger = self.hub.ledger
+        for child in ledger.children(task_id):
             head = f"{child['task_id']} ({child['owner']})"
             if child["status"] in TERMINAL_STATES:
                 result = child.get("result") or {}
@@ -855,10 +859,14 @@ class NodeDaemon:
                 continue
             deadline = (child.get("request") or {}).get("deadline")
             with contextlib.suppress(TypeError, ValueError):
-                if deadline and parse_iso(deadline) < now:
+                if (deadline and parse_iso(deadline) < now
+                        and not ledger.noticed(child["task_id"], "overdue_wake")):
                     lines.append(f"{head}: overdue (deadline {deadline}, still {child['status']}; not cancelled)")
+                    overdue.append(child["task_id"])
                     continue
             return None
+        for child_id in overdue:
+            ledger.notice_once(child_id, "overdue_wake")
         return "child tasks done: " + "; ".join(lines)
 
     def _stop_jobs(self, task_id: str) -> None:

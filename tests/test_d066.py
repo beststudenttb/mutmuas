@@ -72,6 +72,31 @@ async def test_a_child_past_its_deadline_wakes_the_parent_but_is_not_closed(tmp_
         ledger.close()
 
 
+async def test_an_overdue_child_wakes_the_parent_only_once(tmp_path):
+    """Secretary's recheck of ad60ea4: after the overdue wake-up the parent waits again (rule 8, or WAITING); the
+    same overdue child must not end that wait at once, or a worker is started over and over. It ends when the
+    child really finishes."""
+    _, ledger, daemon = _node(tmp_path)
+    owned_task(ledger, "T-p", "RUNNING", ingest=True)
+    late = await _child(daemon, "T-p", "C:train", deadline=_iso(-60))
+    try:
+        await tools.add_job(daemon.hub, "B:desk", "T-p", children=True)
+        await daemon._check_jobs()
+        assert "T-p" in daemon._queued["B:desk"]                                       # the overdue wake-up
+        daemon._queued["B:desk"].clear()
+        await tools.report_progress(daemon.hub, "B:desk", "training runs late; waiting", task_id="T-p",
+                                    state="WAITING")
+        await daemon._check_jobs()
+        await daemon._check_jobs()
+        assert "T-p" not in daemon._queued["B:desk"] and ledger.jobs("T-p")            # not again
+        await _reply(daemon, late, "C:train", **result_body("complete", "trained"))
+        await daemon._check_jobs()
+        assert "T-p" in daemon._queued["B:desk"]
+        assert "trained" in ledger.jobs("T-p", open_only=False)[-1]["ended"]
+    finally:
+        ledger.close()
+
+
 async def test_reporting_waiting_with_open_children_registers_the_wait(tmp_path):
     _, ledger, daemon = _node(tmp_path)
     owned_task(ledger, "T-p", "RUNNING", ingest=True)
