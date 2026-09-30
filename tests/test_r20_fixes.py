@@ -1,11 +1,15 @@
-"""R20 item 3 (D-051): a wake-up lost to a crash between 'job ended' and 'wake' is made up at restart, exactly once."""
+"""R20 items 3 and 4 (D-051): a wake-up lost to a crash between 'job ended' and 'wake' is made up at restart,
+exactly once; every run keeps its own log file."""
 
 from __future__ import annotations
+
+import sys
 
 from conftest import auto_worker_node, owned_task
 from test_job_wake import _node
 
 from mutmuas import tools
+from mutmuas.runtime import ScriptRuntime, TaskContext
 
 
 def _crashed_after_job_end(ledger, task_id="T-j", claim=None):
@@ -58,3 +62,17 @@ async def test_an_auto_worker_is_woken_not_handed_its_in_progress_draft(tmp_path
     finally:
         ledger.close()
 
+
+async def test_every_run_keeps_its_own_log(tmp_path):
+    """r19 F1: a woken task starts again at attempt 1, and its log overwrote the first run's."""
+    from mutmuas.config import AgentConfig, NodeConfig
+    from mutmuas.protocol import Envelope, request_body
+    agent = AgentConfig(id="desk", mode="worker", runtime="script", workdir=str(tmp_path / "work"),
+                        command=[sys.executable, "-c", "print('run')"])
+    node = NodeConfig(project="p", node="B", data_dir=str(tmp_path / "data"), agents=[agent])
+    req = Envelope(type="REQUEST", sender="A:s", to="B:desk", task_id="T-j", body=request_body("x", "y"))
+    runtime = ScriptRuntime(agent, node)
+    first = await runtime.run(TaskContext("T-j", req, agent, node, 1))
+    second = await runtime.run(TaskContext("T-j", req, agent, node, 1))
+    assert first.log_path != second.log_path
+    assert "run" in open(first.log_path).read() and "run" in open(second.log_path).read()
