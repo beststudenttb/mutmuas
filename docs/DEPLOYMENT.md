@@ -343,6 +343,10 @@ Known risks (protections removed on purpose; one line each):
 - An auto_worker task woken after its jobs: a crash between moving it to ACCEPTED and queueing it lets the next
   recovery deliver the worker's old draft as the result.
 - recover() assumes one daemon per node, running serially; it does not claim tasks against a concurrent daemon.
+- Delivery log (D-052): a crash after the RESULT is stored but before the log line is written or the PLAN.md
+  section is removed leaves the line missing and the section on the board.
+- A session and a still-running auto_worker delivering at the same moment can overwrite each other's PLAN.md edit
+  (plain read-modify-write, no lock).
 
 ## 9. Uninstall
 

@@ -33,7 +33,7 @@ Addresses and ids used in subjects allow `[A-Za-z0-9_-]` only.
 | `QUESTION` | either | `question` | – | requester side: WAITING |
 | `ANSWER` | either | `answer` | – | – |
 | `BLOCKED` | owner → requester | `reason` | `needs` | BLOCKED |
-| `RESULT` | owner → requester | `status`, `summary` | `outputs`, `evidence`, `limitations`, `follow_up` | COMPLETED (complete/partial) · FAILED (failed) |
+| `RESULT` | owner → requester | `status`, `summary` | `outputs`, `evidence`, `limitations`, `follow_up`, `how`, `notes` | COMPLETED (complete/partial) · FAILED (failed) |
 | `REJECT` | owner → requester | `reason` | – | FAILED |
 | `CANCEL` | requester → owner | – | `reason` | CANCELLED (running process is killed; so are its registered background jobs' processes) |
 | `ERROR` | either | `code`, `message` | – | requester side: FAILED |
@@ -74,6 +74,10 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   (`agentctl ask --leader`, `leader` in a `send` file or in the MCP `send_request`); it is not checked (D-035).
   A worker's queue runs such tasks first, the rest in arrival order; a running task is not stopped. The
   session's inbox lists them first; a watcher's `--peek` keeps arrival order (its cursor is the last row).
+- **Delivery log** (D-052): when an owned task gets its RESULT, the owner's node appends the handbook R7.11 line
+  to the post's `worker-log.md` (`time | from | task | output / to whom | how | notes`), taking `how` and `notes`
+  from the RESULT ('未填' when missing). If the post's `PLAN.md` has a heading naming the task id, that section goes
+  into `outputs.plan` and off the board. Notices closed by being read (`reply: none`) are not logged.
 - **Long jobs** (D-050): the owner of a task registers a background job it waits on (`agentctl job add --pid
   <pid> --done-file <path> --log <path> --note <line>`, or the MCP `add_job`). The task becomes WAITING, and a worker
   may end its run without a result: it is neither finished nor retried, and a restart leaves it alone. Each

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -344,11 +345,22 @@ class Hub:
         log.info("task %s -> %s (%s)", task_id, status, message)
         return True
 
-    async def finish(self, task_id: str, result: dict[str, Any], artifacts: list[ArtifactRef] | None = None) -> bool:
-        """Send the RESULT for an owned task and close it. Refuses to finish a task twice."""
+    async def finish(self, task_id: str, result: dict[str, Any], artifacts: list[ArtifactRef] | None = None,
+                     record: bool = True) -> bool:
+        """Send the RESULT for an owned task and close it. Refuses to finish a task twice.
+        record (D-052): the mechanical part of delivery is done here, not by the model: this task's PLAN.md section
+        goes into outputs.plan (and off the board), and the post's worker-log.md gets its R7.11 line. Off for
+        notices closed by being read."""
         task = self.ledger.task(task_id, "owner")
         if task is None:
             raise KeyError(f"task {task_id} is not owned by this node")
+        workdir = self.local_agent(task["owner"])[1].workdir_path if record else None
+        board = workdir / "PLAN.md" if workdir else None
+        section = plan_section(board.read_text(), task_id) if board and board.is_file() else None
+        if section:
+            outputs = result.get("outputs")
+            outputs = outputs if isinstance(outputs, dict) else {"value": outputs} if outputs else {}
+            result = {**result, "outputs": {**outputs, "plan": section}}
         env = Envelope(type="RESULT", sender=task["owner"], to=task["requester"], body=result, task_id=task_id,
                        conversation_id=task["conversation_id"], artifacts=artifacts or [],
                        reply_to=task.get("last_message"))
@@ -360,7 +372,66 @@ class Hub:
         await self.try_publish(env)
         await self.publish_task_record(task_id)
         log.info("task %s finished: %s", task_id, result["status"])
+        if workdir:
+            if section:
+                board.write_text(drop_plan_section(board.read_text(), task_id))
+            workdir.mkdir(parents=True, exist_ok=True)          # as a run does; a post may not have run yet
+            with open(workdir / "worker-log.md", "a") as f:
+                f.write(log_line(task, result) + "\n")
         return True
+
+
+_HEADING = re.compile(r" {0,3}(#{1,6})(?:\s|$)")
+_FENCE = re.compile(r" {0,3}(```|~~~)")
+
+
+def _plan_span(lines: list[str], task_id: str) -> tuple[int, int] | None:
+    """Where a task's section of a PLAN.md is: from the first ATX heading (up to 3 spaces in) that names the
+    whole task id, down to the next heading of the same or a higher level. Lines inside fenced code blocks are
+    never headings (a pasted command's '# comment'). Nothing is guessed: no such heading, no section."""
+    named = re.compile(rf"(?<![\w-]){re.escape(task_id)}(?![\w-])")
+    start, level, fence = None, 0, None
+    for i, line in enumerate(lines):
+        mark = _FENCE.match(line)
+        if fence:
+            fence = None if mark and mark.group(1) == fence else fence
+            continue
+        if mark:
+            fence = mark.group(1)
+            continue
+        heading = _HEADING.match(line)
+        if not heading:
+            continue
+        if start is None and named.search(line):
+            start, level = i, len(heading.group(1))
+        elif start is not None and len(heading.group(1)) <= level:
+            return start, i
+    return (start, len(lines)) if start is not None else None
+
+
+def plan_section(board: str, task_id: str) -> str | None:
+    lines = board.splitlines(keepends=True)
+    span = _plan_span(lines, task_id)
+    return "".join(lines[span[0]:span[1]]).rstrip("\n") + "\n" if span else None
+
+
+def drop_plan_section(board: str, task_id: str) -> str:
+    lines = board.splitlines(keepends=True)
+    span = _plan_span(lines, task_id)
+    return "".join(lines[:span[0]] + lines[span[1]:]) if span else board
+
+
+def log_line(task: dict[str, Any], result: dict[str, Any]) -> str:
+    """handbook R7.11: time | from | task | output / to whom | how | notes (one line; '|' inside a field -> '/')."""
+    def field(text: Any, n: int = 200) -> str:
+        text = " ".join(str(text or "").replace("|", "/").split())
+        return text[:n] + ("…" if len(text) > n else "")
+    objective = (task.get("request") or {}).get("objective")
+    return " | ".join([
+        datetime.now().astimezone().strftime("%Y-%m-%d %H:%M"), task["requester"],
+        f"{task['task_id']} {field(objective, 60)}".rstrip(),
+        f"{result['status']}: {field(result.get('summary'), 100)} -> {task['requester']}",
+        field(result.get("how")) or "未填", field(result.get("notes")) or "未填"])
 
 
 def is_online(card: dict[str, Any]) -> bool:

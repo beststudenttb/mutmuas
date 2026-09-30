@@ -208,12 +208,14 @@ submit_result, list_agents, find_agent, send_request, wait_for_result, check_tas
 {git_note}
 Rules:
 1. Work only inside your working directory ({llm_start_dir(ctx)}){' and ' + ', '.join(map(str, code)) if code else ''}
-   unless the request says otherwise. HANDOFF.md there belongs to the interactive session: do not edit it;
-   append a short record of what you did to worker-log.md instead.
+   unless the request says otherwise. HANDOFF.md there belongs to the interactive session: do not edit it.
+   Do not write worker-log.md either: the node writes the line when the task is delivered.
 2. Never paste large data into text. Put files/datasets/logs into artifacts with publish_artifact
    and pass the returned references to submit_result.
 3. Call report_progress for meaningful milestones of long work.
-4. Finish by calling submit_result exactly once. status must be honest:
+4. Finish by calling submit_result exactly once, as the very last step; put how you did it in `how` and
+   anything worth noting in `notes`. The node writes the worker-log.md line and hands over this task's section
+   of PLAN.md (the heading with the task id), if there is one. status must be honest:
    complete = every acceptance criterion met; partial = some output but not all criteria;
    failed = nothing usable. Never report partial work as complete. List limitations.
 5. If you need something only the requester can provide, say so in follow_up and use status partial or failed.
