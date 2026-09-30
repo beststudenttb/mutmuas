@@ -316,10 +316,18 @@ class NodeDaemon:
         # every open task, not just the newest page (A:codex: a backlog > 200 left old tasks stuck)
         for task in hub.ledger.tasks(role="owner", statuses=OPEN_STATES, limit=None):
             agent = self._agent_cfg(task["owner"])
-            if agent is None or (agent.mode != "worker" and not agent.auto_worker):
+            if agent is None:
                 continue
             if hub.ledger.jobs(task["task_id"]):
                 continue        # waits on a background job: the heartbeat wakes it when the job ends
+            if task["status"] == "WAITING" and (ended := hub.ledger.jobs(task["task_id"], open_only=False)):
+                # Its last job ended but the wake-up was lost (a crash between end_job and _wake_for_job): make
+                # it up. _wake_for_job moves the task out of WAITING first, so this happens once.
+                last = max(ended, key=lambda j: j["ended_at"])
+                await self._wake_for_job(task, last, last["ended"])
+                continue
+            if agent.mode != "worker" and not agent.auto_worker:
+                continue
             if agent.auto_worker:
                 await self._recover_auto(task)
                 continue
@@ -843,11 +851,12 @@ class NodeDaemon:
             await hub.owner_transition(task_id, "ACCEPTED", text)
             self._enqueue(owner, task_id)
             return
-        # A session: a note in its own inbox that hands it the baton (next), which wakes it like a REQUEST.
+        # A session: a note in its own inbox that hands it the baton (next), which wakes it like a REQUEST. The task
+        # leaves WAITING first, so recover() cannot wake it a second time.
+        await hub.owner_transition(task_id, "RUNNING", text)
         wake = Envelope(type="UPDATE", sender=owner, to=owner, task_id=task_id, body={"message": text, "next": owner})
         hub.ledger.ingest(wake)
         hub.ledger.mark_handled(wake.message_id)
-        await hub.owner_transition(task_id, "RUNNING", text)
 
     async def _follow_ups(self) -> None:
         """Chase replies this node is owed (like an email client's follow-up flag), each once:

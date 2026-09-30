@@ -20,6 +20,7 @@ import os
 import signal
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -106,7 +107,9 @@ class SubprocessRuntime:
         argv, stdin = self.command(ctx)
         runs = self.node.data_path / "runs"
         runs.mkdir(parents=True, exist_ok=True)
-        log_path = runs / f"{ctx.task_id}.attempt{ctx.attempt}.log"
+        # a new name for every run: a task woken after a background job starts again at attempt 1 (r19 F1)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        log_path = runs / f"{ctx.task_id}.{stamp}.attempt{ctx.attempt}.log"
         workdir = self.start_dir(ctx)
         workdir.mkdir(parents=True, exist_ok=True)
         log.info("task %s: starting %s in %s", ctx.task_id, argv[0], workdir)

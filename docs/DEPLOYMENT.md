@@ -288,7 +288,7 @@ agentctl task <id>               # full message history: who asked what, why, an
 agentctl history --task <id>     # raw audit trail from the stream
 agentctl inbox --as A:lead       # messages for an interactive agent
 tail -f ~/.mutmuas/visual_rl/B/node.log
-ls ~/.mutmuas/visual_rl/B/runs/  # per-task agent output (<task>.attemptN.log)
+ls ~/.mutmuas/visual_rl/B/runs/  # per-task agent output (<task>.<UTC start time>.attempt<N>.log, one per run)
 ```
 
 ## 8. Recovery
@@ -338,7 +338,11 @@ Known risks (protections removed on purpose; one line each):
   Codex T-20260929122530-54280d88).
 - A job registered with only a done-file that never writes it keeps its task waiting forever (cancel the task).
   Cancelling such a task does not stop the job: the node knows no process for it.
-- A crash between recording that a background job ended and waking its post loses that wake-up.
+- A session's job wake-up moves the task to RUNNING and then writes the session's note; a crash between the two
+  loses that wake-up (the task is no longer WAITING, so recovery does not make it up).
+- An auto_worker task woken after its jobs: a crash between moving it to ACCEPTED and queueing it lets the next
+  recovery deliver the worker's old draft as the result.
+- recover() assumes one daemon per node, running serially; it does not claim tasks against a concurrent daemon.
 
 ## 9. Uninstall
 
