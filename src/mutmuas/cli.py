@@ -362,7 +362,7 @@ async def cmd_update(args, hub: Hub):
 
 async def cmd_job(args, hub: Hub):
     _print(await tools.add_job(hub, _me(args), args.task, pid=args.pid, done_file=args.done_file, log=args.log,
-                               note=args.note), args.json)
+                               note=args.note, children=args.children), args.json)
 
 
 async def cmd_submit(args, hub: Hub):
@@ -805,6 +805,8 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--done-file", help="ends when this file appears (write the exit code into it)")
     p.add_argument("--log")
     p.add_argument("--note", help="one line: what runs, and what to do when it ends")
+    p.add_argument("--children", action="store_true",
+                   help="wait on this task's child tasks instead (ends when each is done, refused or overdue)")
     p = add("submit-result", cmd_submit, "finish a task I own", bus=False)
     p.add_argument("--task")
     p.add_argument("--status", choices=["complete", "partial", "failed"])

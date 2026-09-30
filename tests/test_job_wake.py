@@ -143,7 +143,10 @@ async def test_agentctl_job_add(monkeypatch):
     args = cli.agentctl_parser().parse_args(["job", "add", "--task", "T-j", "--pid", "42", "--log", "l",
                                              "--note", "n", "--as", "B:desk"])
     await cli.cmd_job(args, None)
-    assert calls == [("T-j", {"pid": 42, "done_file": None, "log": "l", "note": "n"})]
+    assert calls == [("T-j", {"pid": 42, "done_file": None, "log": "l", "note": "n", "children": False})]
+    args = cli.agentctl_parser().parse_args(["job", "add", "--task", "T-j", "--children", "--as", "B:desk"])
+    await cli.cmd_job(args, None)
+    assert calls[1] == ("T-j", {"pid": None, "done_file": None, "log": None, "note": None, "children": True})
 
 
 async def test_a_woken_task_keeps_the_leader_first_order(tmp_path):

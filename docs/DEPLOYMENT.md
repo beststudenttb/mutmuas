@@ -185,7 +185,14 @@ daemon (`launchctl kickstart -k …` / `systemctl --user restart mutmuas-agent-n
   permissions: [READ, RUN_EXPERIMENT, PUBLISH_ARTIFACT, REQUEST_TASK]
   accept_from: ["A:*", "B:*"]
   task_timeout_s: 14400
+  max_turns: 150                # optional (D-066): a claude-code run stops after this many turns ...
+  max_cost_usd: 15              # ... or this spend; defaults: the node's worker_max_turns / worker_max_cost_usd
 ```
+
+Node-wide worker limits (D-066), top level of node.yaml: `worker_max_turns` and `worker_max_cost_usd` (default:
+none). They map to `claude -p --max-turns` / `--max-budget-usd`; Codex has no equivalent flag, so a codex worker is
+bounded by `task_timeout_s` only. A run stopped at a limit without a result counts as a failed run (recorded,
+laid out once more, then failed).
 
 Runtime notes:
 - `claude-code` runs `claude -p` with only the mutmuas MCP server (`--strict-mcp-config`) and the tools
@@ -329,7 +336,6 @@ Known risks (protections removed on purpose; one line each):
 - In a rare interleaving the heartbeat accepts a task `_on_request` is still handling: a second ACK (never a
   second run).
 - The recipient of a request refused for its kind does not see it; only the requester gets the REJECT.
-- A worker with write tools can edit HANDOFF.md by mistake (the prompt asks it not to).
 - An unparsable incoming message gets no ERROR back; it is only in the receiving node's failure log.
 - A result printed only inside a Markdown fence, mid-output or over several lines is not parsed (use
   submit_result).
@@ -337,6 +343,9 @@ Known risks (protections removed on purpose; one line each):
 - Tasks created in the same millisecond may run in either order after a restart (the queue orders by created_at;
   Codex T-20260929122530-54280d88).
 - A job registered with only a done-file that never writes it keeps its task waiting forever (cancel the task).
+- A task waiting on child tasks whose owners never answer and that have no deadline waits forever (sends normally
+  get the node's default reply deadline, so this needs `reply: none` or a removed deadline).
+- A limit-stopped run that is laid out again usually stops at the same limit: the retry costs one more run.
   Cancelling such a task does not stop the job: the node knows no process for it.
 - A session's job wake-up moves the task to RUNNING and then writes the session's note; a crash between the two
   loses that wake-up (the task is no longer WAITING, so recovery does not make it up).
