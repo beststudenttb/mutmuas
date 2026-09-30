@@ -120,7 +120,7 @@ distributed transactions. The KV record is the owner's *published view*, so anyo
 - Agent-level policy on the receiver: `accept_from` globs, plus permissions per request kind
   (`query→READ`, `artifact→PUBLISH_ARTIFACT`, `experiment→RUN_EXPERIMENT`, `code→WRITE_WORKTREE`).
   Sending requires `REQUEST_TASK`, and a process can only act as agents configured on its own node.
-- Runtime sandboxing follows the permissions. Claude workers get `Read/Glob/Grep` plus the mutmuas
+- Runtime sandboxing follows the permissions, whatever the request kind (D-064). Claude workers get `Read/Glob/Grep` plus the mutmuas
   MCP tools, `Edit/Write/Bash(git:*)` with WRITE_WORKTREE, and `Bash` with RUN_EXPERIMENT. Codex
   gets `--sandbox read-only`, or `workspace-write` with WRITE_WORKTREE/RUN_EXPERIMENT. It ignores
   `~/.codex/config.toml` by default and pre-approves only the mutmuas MCP tools.

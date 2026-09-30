@@ -49,14 +49,10 @@ class TaskContext:
         return self.workdir or self.agent.workdir_path
 
     def allows(self, permission: str) -> bool:
-        """Least privilege per task: the agent's permission AND one this kind of request needs.
-
-        A query or artifact request runs read-only even on an agent that could write, so a question
-        can never modify the checkout the agent (or its node daemon) lives in.
-        """
-        kind = self.request.body.get("kind", "query")
-        needed = {"code": {"WRITE_WORKTREE", "RUN_EXPERIMENT"}, "experiment": {"RUN_EXPERIMENT", "WRITE_WORKTREE"}}
-        return permission in needed.get(kind, set()) and self.agent.has(permission)
+        """Tools follow the post's permissions alone, whatever the kind (D-064): a query on a post that may write
+        can keep its log and PLAN.md (r20). The kind only shapes the prompt and whether a code task gets a
+        worktree; a post whose workdir must stay untouched does not get WRITE_WORKTREE/RUN_EXPERIMENT."""
+        return self.agent.has(permission)
 
     @property
     def address(self) -> str:

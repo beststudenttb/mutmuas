@@ -108,17 +108,19 @@ def test_service_units_do_not_clobber_other_nodes(tmp_path, monkeypatch):
     assert str(tmp_path / "A.yaml") in paths["A"].read_text()
 
 
-@pytest.mark.parametrize("kind, sandbox, claude_can_edit", [
-    ("query", "read-only", False), ("artifact", "read-only", False),
-    ("code", "workspace-write", True), ("experiment", "workspace-write", True)])
-def test_runtime_sandbox_follows_request_kind(tmp_path, kind, sandbox, claude_can_edit):
-    """A question never gets a writable sandbox, even on an agent that holds WRITE_WORKTREE."""
+@pytest.mark.parametrize("kind", ["query", "artifact", "code", "experiment"])
+@pytest.mark.parametrize("permissions, sandbox, claude_can_edit", [
+    (["READ", "PUBLISH_ARTIFACT"], "read-only", False),
+    (["READ", "WRITE_WORKTREE", "RUN_EXPERIMENT", "PUBLISH_ARTIFACT"], "workspace-write", True)])
+def test_runtime_sandbox_follows_agent_permissions_not_request_kind(tmp_path, kind, permissions, sandbox,
+                                                                    claude_can_edit):
+    """Tools come from the post's permissions alone (D-064): a query on a post that may write can write, and a
+    code task on a post that may not write stays read-only. The kind only shapes the prompt and the worktree."""
     from mutmuas.config import AgentConfig, NodeConfig
     from mutmuas.protocol import Envelope, request_body
     from mutmuas.runtime import ClaudeCodeRuntime, CodexRuntime, TaskContext
     node = NodeConfig(project="p", node="C", data_dir=str(tmp_path))
-    agent = AgentConfig(id="w", runtime="codex", workdir=str(tmp_path),
-                        permissions=["READ", "WRITE_WORKTREE", "RUN_EXPERIMENT", "PUBLISH_ARTIFACT"])
+    agent = AgentConfig(id="w", runtime="codex", workdir=str(tmp_path), permissions=permissions)
     req = Envelope(type="REQUEST", sender="A:main", to="C:w", task_id="T-1", body=request_body("x", "y", kind=kind))
     ctx = TaskContext("T-1", req, agent, node)
     argv, _ = CodexRuntime(agent, node).command(ctx)

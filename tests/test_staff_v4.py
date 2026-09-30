@@ -44,6 +44,21 @@ def test_available_tools_are_exactly_what_node_yaml_grants(tmp_path):
     assert "Bash(git:*)" in argv[argv.index("--allowedTools") + 1].split(",")
 
 
+
+def test_query_task_gets_the_tools_its_post_is_granted(tmp_path):
+    """D-064: a query or artifact task on a post with WRITE_WORKTREE gets Edit/Write/Bash (r20: query workers had
+    no write tool, so they could not keep their log or PLAN.md); without the permission it still gets none."""
+    for kind in ("query", "artifact"):
+        runtime, ctx, _ = _claude_ctx(tmp_path, kind=kind, permissions=("READ", "WRITE_WORKTREE"))
+        argv, _ = runtime.command(ctx)
+        assert argv[argv.index("--tools") + 1] == "Read,Glob,Grep,Skill,Edit,Write,Bash"
+        runtime, ctx, _ = _claude_ctx(tmp_path, kind=kind, permissions=("READ", "RUN_EXPERIMENT"))
+        argv, _ = runtime.command(ctx)
+        assert argv[argv.index("--tools") + 1] == "Read,Glob,Grep,Skill,Bash"
+        runtime, ctx, _ = _claude_ctx(tmp_path, kind=kind, permissions=("READ", "PUBLISH_ARTIFACT"))
+        argv, _ = runtime.command(ctx)
+        assert argv[argv.index("--tools") + 1] == "Read,Glob,Grep,Skill"
+
 # --------------------------------------------------------------------------- C3: start in the project directory
 
 
