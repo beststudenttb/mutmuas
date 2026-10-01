@@ -25,7 +25,7 @@ import os
 import platform
 import signal
 import socket
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -576,6 +576,8 @@ class NodeDaemon:
             log.warning("ignored CANCEL of %s from %s: not its requester %s", env.task_id, env.sender,
                         task["requester"])
             return "rejected"
+        from .tools import cancel_children
+        await cancel_children(self.hub, env.task_id, env.body.get("reason") or "cancelled by its requester")
         if task["status"] == "PENDING":
             # Withdrawn before anyone picked it up: close it and keep it out of the interactive inbox
             # (both the REQUEST and this CANCEL are noise to someone who never saw the request).
@@ -725,6 +727,12 @@ class NodeDaemon:
             return      # it waits on a background job it registered: the heartbeat wakes it when the job ends
         if current["status"] == "BLOCKED" and not current.get("result_draft"):
             return      # blocked and nothing to deliver: wait for the requester
+        if outcome.limit and not current.get("result_draft"):
+            # Stopped at the worker's turn/cost limit (D-066) without a result: a failed run (R5.4)
+            await self._run_failed(agent, task_id, attempt, result_body(
+                "failed", f"the worker stopped at its limit ({outcome.limit}) without a result",
+                limitations=["raise max_turns / max_cost_usd in node.yaml, or split the task"]))
+            return
         # A submitted result always wins over an earlier BLOCKED report.
         body, refs = _result_from(current.get("result_draft"), outcome)
         if outcome.exit_code != 0 and not _structured(current.get("result_draft") or outcome.result):
@@ -797,6 +805,7 @@ class NodeDaemon:
                 await self._publish_cards()
                 await self._auto_dispatch()
                 await self._check_jobs()
+                await self._fire_reminders()
                 for task_id in list(self._recheck):         # old workers still running at the last look
                     task = self.hub.ledger.task(task_id, "owner")
                     if task and task["status"] not in TERMINAL_STATES:
@@ -817,7 +826,10 @@ class NodeDaemon:
         hub = self.hub
         for job in hub.ledger.jobs():
             done = Path(job["done_file"]) if job["done_file"] else None
-            if done and done.exists():
+            if job["children"]:
+                if (ended := self._children_ended(job["task_id"])) is None:
+                    continue
+            elif done and done.exists():
                 ended = f"done-file {done} appeared: {done.read_text(errors='replace')[:300].strip()!r}"
             elif job["pid"] and not same_process(job["pid"], job["pid_start"]):
                 ended = f"process {job['pid']} ended (exit code unknown: write it to a done-file to pass it on)"
@@ -829,6 +841,34 @@ class NodeDaemon:
                 continue            # closed meanwhile, or still waiting on another job
             await self._wake_for_job(task, job, ended)
 
+    def _children_ended(self, task_id: str) -> str | None:
+        """D-066: a wait on the direct child tasks ends once each has a result, was refused or cancelled, or is past
+        its deadline (then it is reported overdue and left running: the parent decides). None while one is open.
+        A child is reported overdue once: a parent that waits again afterwards waits for its real end, or every
+        heartbeat would wake it again (secretary's recheck of ad60ea4). There is no way to extend a child's
+        deadline, and a worker cannot be relied on to cancel, so the node keeps this rule itself."""
+        now = datetime.now(timezone.utc)
+        lines, overdue = [], []
+        ledger = self.hub.ledger
+        for child in ledger.children(task_id):
+            head = f"{child['task_id']} ({child['owner']})"
+            if child["status"] in TERMINAL_STATES:
+                result = child.get("result") or {}
+                lines.append(f"{head}: {child['status']} {result.get('status') or ''} - "
+                             f"{short(result.get('summary') or '', 200)}")
+                continue
+            deadline = (child.get("request") or {}).get("deadline")
+            with contextlib.suppress(TypeError, ValueError):
+                if (deadline and parse_iso(deadline) < now
+                        and not ledger.noticed(child["task_id"], "overdue_wake")):
+                    lines.append(f"{head}: overdue (deadline {deadline}, still {child['status']}; not cancelled)")
+                    overdue.append(child["task_id"])
+                    continue
+            return None
+        for child_id in overdue:
+            ledger.notice_once(child_id, "overdue_wake")
+        return "child tasks done: " + "; ".join(lines)
+
     def _stop_jobs(self, task_id: str) -> None:
         """A cancelled task's background jobs: a job whose process still runs gets SIGTERM (that pid only, R4.1);
         a done-file-only job has no process the node knows and is not stopped. Either way it is closed, so it
@@ -838,6 +878,8 @@ class NodeDaemon:
             if job["pid"] and same_process(job["pid"], job["pid_start"]):
                 os.kill(job["pid"], signal.SIGTERM)
                 ended += f"; SIGTERM sent to pid {job['pid']}"
+            elif job["children"]:
+                ended += "; its open child tasks are cancelled"
             elif not job["pid"]:
                 ended += "; a done-file-only job is not stopped (the node knows no process for it)"
             self.hub.ledger.end_job(job["job_id"], ended)
@@ -857,6 +899,26 @@ class NodeDaemon:
         wake = Envelope(type="UPDATE", sender=owner, to=owner, task_id=task_id, body={"message": text, "next": owner})
         hub.ledger.ingest(wake)
         hub.ledger.mark_handled(wake.message_id)
+
+    async def _fire_reminders(self) -> None:
+        """Due reminders (D-066) become a note in the agent's own inbox that hands it the baton: it wakes a session
+        like a REQUEST does and waits there while none runs. No session lease involved. A repeating one comes back
+        one interval after now (a node that was down does not fire the missed ones in a burst)."""
+        now = datetime.now(timezone.utc)
+        for r in self.hub.ledger.due_reminders(now.isoformat(timespec="milliseconds")):
+            if self._agent_cfg(r["local_agent"]) is None:
+                continue                                    # not an agent of this node any more
+            again = (now + timedelta(seconds=r["every_s"])).isoformat(timespec="milliseconds") if r["every_s"] \
+                else None
+            if not self.hub.ledger.fire_reminder(r, again):
+                continue
+            text = f"reminder {r['id']} (set {r['created_at']}): {r['text']}"
+            if again:
+                text += f" [repeats every {r['every_s']:.0f} s; next {again}; cancel_reminder({r['id']}) stops it]"
+            note = Envelope(type="UPDATE", sender=r["local_agent"], to=r["local_agent"],
+                            task_id=f"reminder-{r['id']}", body={"message": text, "next": r["local_agent"]})
+            self.hub.ledger.ingest(note)
+            self.hub.ledger.mark_handled(note.message_id)
 
     async def _follow_ups(self) -> None:
         """Chase replies this node is owed (like an email client's follow-up flag), each once:

@@ -25,7 +25,6 @@ from mcp_types import JSONRPCNotification
 from . import tools
 from .config import NodeConfig
 from .hub import Hub
-from .ids import now_iso
 from .node import _code_version, lease_refusal, session_alive
 
 INSTRUCTIONS = """You are connected to the mutmuas multi-agent network. Other agents live on other machines
@@ -92,11 +91,6 @@ def duplicate_notice(addr: str, holder: int) -> dict[str, Any]:
             "meta": {"session": "duplicate", "holder_pid": str(holder)}}
 
 
-def reminder_notice(r: dict[str, Any]) -> dict[str, Any]:
-    return {"content": f"mutmuas reminder (set {r['created_at']}): {r['text']}",
-            "meta": {"reminder": str(r["id"]), "due": r["due"]}}
-
-
 def holds_session(agent, worker_task: str | None) -> bool:
     """Does this MCP server beat as the agent's session (and so hold its lease)? A session of an interactive
     agent does; a worker's task does not (decided by the config and by how the daemon started it, not by an
@@ -150,9 +144,6 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
                 cursor = max(cursor, m["seq"] or cursor)
                 if not state.get("duplicate_of"):          # only the session holding the agent is woken
                     await send(channel_notice(m))
-            for r in ([] if state.get("duplicate_of") else hub.ledger.due_reminders(addr, now_iso())):
-                if hub.ledger.fire_reminder(r["id"]):   # only the holder takes the agent's reminders, once
-                    await send(reminder_notice(r))
             await asyncio.sleep(PUSH_POLL_S)
 
     @asynccontextmanager
@@ -278,10 +269,16 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         return dump(await tools.clear_inbox(hub(), state["me"], before_seq))
 
     @server.tool()
-    async def remind_me(at: str, text: str) -> str:
-        """Come back to something later: at (ISO time with timezone, or +10m / +2h) the text is pushed into this
-        session like new mail. Use it instead of promising to "check again in a while"."""
-        return dump(await tools.remind_me(hub(), state["me"], at, text))
+    async def remind_me(at: str, text: str, every: str | None = None) -> str:
+        """Come back to something later: at (ISO time with timezone, or +10m / +2h) the node puts the text into
+        your inbox, which wakes you like new mail (and waits there if no session runs). every (e.g. "5h") repeats
+        it until cancel_reminder. Use it instead of promising to "check again in a while"."""
+        return dump(await tools.remind_me(hub(), state["me"], at, text, every=every))
+
+    @server.tool()
+    async def cancel_reminder(reminder: int) -> str:
+        """Stop a reminder (e.g. a repeating one) by the id remind_me returned."""
+        return dump(await tools.cancel_reminder(hub(), state["me"], reminder))
 
     @server.tool()
     async def wait_for_message(timeout_s: float = 600, peek: bool = False, actionable_only: bool = True) -> str:
@@ -309,12 +306,14 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
 
     @server.tool()
     async def add_job(pid: int | None = None, done_file: str | None = None, log: str | None = None,
-                      note: str | None = None, task_id: str | None = None) -> str:
+                      note: str | None = None, task_id: str | None = None, children: bool = False) -> str:
         """Register a background job (e.g. training, started detached) your task waits on. The task becomes
         WAITING; you may then end without a result. The node wakes you when the job ends: pid gone, or done_file
-        appears (write the exit code into it). note: one line on what runs and what to do next."""
+        appears (write the exit code into it). note: one line on what runs and what to do next.
+        children=True: wait on the child tasks you sent for this task (parent_task) instead; you are woken once
+        each has a result, was refused or cancelled, or is past its deadline, with how each ended."""
         return dump(await tools.add_job(hub(), state["me"], task_id, pid=pid, done_file=done_file, log=log,
-                                        note=note))
+                                        note=note, children=children))
 
     @server.tool()
     async def submit_result(status: str, summary: str, task_id: str | None = None,

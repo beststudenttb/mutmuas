@@ -86,6 +86,13 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   queued again as a fresh run (attempts reset; the prompt says how each job ended). A session instead gets a note
   in its own inbox with `next` set to itself, which wakes it. There is no time limit; `whoami` lists
   `jobs_waiting`.
+- **Waiting on child tasks** (D-066): requests an owner sends while working on a task carry `parent_task` (set
+  automatically inside a worker run). `add_job(children=True)` makes the task wait on its direct children; so does
+  reporting `state: WAITING` while a child is open. The wait ends once every child has a result, was refused or
+  cancelled, or is past its deadline (reported as overdue and left running: the parent decides; each child is
+  reported overdue once, so a wait registered again afterwards lasts until that child really ends). The task is then
+  woken once, as for a background job, and the wake-up lists how each child ended. Cancelling a task sends CANCEL
+  to its open children (their nodes cascade further down).
 - `next: <address>` on RESULT, UPDATE, QUESTION or ANSWER names whose move it is. That agent is woken exactly
   as by a REQUEST, even by an UPDATE. Put it on the last message of every thread whose next step belongs to
   someone.
@@ -114,8 +121,7 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
     per start directory, so a wrong start directory means an empty memory.
 - **One agent, one session.** The first session's MCP process holds the agent (a lease in the node
   ledger). The check and the write are one transaction, so two sessions starting together cannot both win.
-  - A second session acting as the same agent is told at once and receives no mail pushes and no
-    reminders.
+  - A second session acting as the same agent is told at once and receives no mail pushes.
   - Its MCP tools (all but `whoami`) refuse to act.
   - `agentctl` commands for that agent are refused too, unless they run inside the holding session: a
     descendant of the session process, such as its shell. The ancestry comes from `/proc` or `ps` by absolute
@@ -144,9 +150,11 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   missing permission, is still refused: the requester gets REJECT and the task is FAILED. But if the sender
   is in the agent's `accept_from`, the request also shows in the agent's inbox with
   `note: "rejected: …"`, and it wakes the agent. Requests from senders outside `accept_from` stay invisible.
-- **Later.** `remind_me(at, text)` in MCP stores a reminder in the node ledger. The session's MCP process
-  pushes it into the session when it is due, or at the next session start if no session was running. Use
-  it instead of promising to come back.
+- **Later.** `remind_me(at, text, every=None)` in MCP stores a reminder in the node ledger. When it is due the
+  node daemon puts it into the agent's inbox as a note with `next` set to the agent (task id `reminder-<id>`), so
+  it wakes a session like new mail and waits there while none runs; no session lease is involved (D-066).
+  `every="5h"` repeats it one interval after each delivery until `cancel_reminder(id)`. Use it instead of
+  promising to come back, and instead of scripts that act as the agent on a timer.
 
 ### Visibility (step 1: minimal exposure by default)
 

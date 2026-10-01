@@ -50,6 +50,9 @@ class AgentConfig:
     accept_from: list[str] = field(default_factory=lambda: ["*"])   # glob patterns over "NODE:agent"
     max_concurrent: int = 1
     task_timeout_s: float = 3600
+    max_turns: int | None = None         # a worker run stops after this many turns (claude -p --max-turns); None:
+                                         # the node's worker_max_turns. Codex has no such flag: task_timeout_s
+    max_cost_usd: float | None = None    # ... or once it has spent this much (claude --max-budget-usd); None: node's
     max_attempts: int = 2                # how often a task is (re)started after crashes before FAILED
     command: list[str] = field(default_factory=list)                # script runtime
     extra_args: list[str] = field(default_factory=list)             # appended to the runtime CLI call
@@ -145,6 +148,10 @@ class NodeConfig:
     # A request that needs a reply but names no deadline gets this one (seconds from sending), so the overdue
     # follow-up can chase it (no-stall design, G3). 0 = no default.
     default_reply_deadline_s: float = 4 * 3600
+    # Defaults for every worker run of this node (an agent's max_turns / max_cost_usd overrides them; D-066).
+    # None = no limit. A run stopped at a limit without a result is a failed run (R5.4: run once more).
+    worker_max_turns: int | None = None
+    worker_max_cost_usd: float | None = None
     agents: list[AgentConfig] = field(default_factory=list)
     path: Path | None = None              # where this config was loaded from
 

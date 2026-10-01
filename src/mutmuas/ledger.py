@@ -78,7 +78,6 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_seen       TEXT NOT NULL
 );
 
--- "Remind me at …": the session's MCP process pushes the text into the session when it is due.
 -- Artifacts an agent of this node published itself: with inbound mail, the only source of artifact access
 -- (not the URI's path, which the publisher chooses; not outgoing mail, which anyone can fill with any URI).
 CREATE TABLE IF NOT EXISTS artifact_publishers (
@@ -88,6 +87,8 @@ CREATE TABLE IF NOT EXISTS artifact_publishers (
     PRIMARY KEY (uri, local_agent)
 );
 
+-- "Remind me at …" (D-066): the node delivers the text into the agent's inbox when it is due; a repeating one
+-- (every_s) is then set to come back after its interval.
 CREATE TABLE IF NOT EXISTS reminders (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     local_agent     TEXT NOT NULL,
@@ -153,6 +154,10 @@ class Ledger:
         self._add_column("tasks", "runner", "TEXT")
         self._add_column("tasks", "runner_pid", "INTEGER")
         self._add_column("tasks", "runner_start", "TEXT")          # the process's start time: pids get reused
+        # D-066: a job that waits on the task's direct child tasks (parent_task) instead of a process or file
+        self._add_column("jobs", "children", "INTEGER NOT NULL DEFAULT 0")
+        self._add_column("reminders", "every_s", "REAL")             # repeat after this many seconds
+        self._add_column("reminders", "cancelled_at", "TEXT")
 
     def _add_column(self, table: str, column: str, decl: str) -> None:
         if column not in [r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")]:
@@ -425,20 +430,30 @@ class Ledger:
         self.db.execute("INSERT OR IGNORE INTO artifact_publishers (uri, local_agent, published_at) VALUES (?,?,?)",
                         (uri, local_agent, now_iso()))
 
-    def add_reminder(self, local_agent: str, due: str, text: str) -> int:
-        cur = self.db.execute("INSERT INTO reminders (local_agent, due, text, created_at) VALUES (?,?,?,?)",
-                              (local_agent, due, text, now_iso()))
+    def add_reminder(self, local_agent: str, due: str, text: str, every_s: float | None = None) -> int:
+        cur = self.db.execute("INSERT INTO reminders (local_agent, due, text, created_at, every_s) VALUES (?,?,?,?,?)",
+                              (local_agent, due, text, now_iso(), every_s))
         return cur.lastrowid
 
-    def due_reminders(self, local_agent: str, now: str) -> list[dict[str, Any]]:
+    def due_reminders(self, now: str) -> list[dict[str, Any]]:
         return [dict(r) for r in self.db.execute(
-            "SELECT * FROM reminders WHERE local_agent=? AND fired_at IS NULL AND due <= ? ORDER BY due",
-            (local_agent, now))]
+            "SELECT * FROM reminders WHERE fired_at IS NULL AND cancelled_at IS NULL AND due <= ? ORDER BY due",
+            (now,))]
 
-    def fire_reminder(self, reminder_id: int) -> bool:
-        """Take a due reminder: True for exactly one caller, so it is pushed once."""
-        cur = self.db.execute("UPDATE reminders SET fired_at=? WHERE id=? AND fired_at IS NULL",
-                              (now_iso(), reminder_id))
+    def fire_reminder(self, reminder: dict[str, Any], next_due: str | None) -> bool:
+        """Take a due reminder: True for exactly one caller, so it is delivered once. A repeating one moves on to
+        next_due instead of being closed."""
+        if next_due:
+            cur = self.db.execute("UPDATE reminders SET due=? WHERE id=? AND due=? AND fired_at IS NULL",
+                                  (next_due, reminder["id"], reminder["due"]))
+        else:
+            cur = self.db.execute("UPDATE reminders SET fired_at=? WHERE id=? AND fired_at IS NULL",
+                                  (now_iso(), reminder["id"]))
+        return cur.rowcount == 1
+
+    def cancel_reminder(self, local_agent: str, reminder_id: int) -> bool:
+        cur = self.db.execute("UPDATE reminders SET cancelled_at=? WHERE id=? AND local_agent=? AND cancelled_at IS NULL",
+                              (now_iso(), reminder_id, local_agent))
         return cur.rowcount == 1
 
     def record_observed(self, task_id: str, observer: str, requester: str, owner: str,
@@ -479,11 +494,16 @@ class Ledger:
                         (now_iso(), stage, address, task_id, attempt, text))
 
     def add_job(self, task_id: str, owner: str, pid: int | None, pid_start: str | None, done_file: str | None,
-                log: str | None, note: str | None) -> int:
-        cur = self.db.execute("INSERT INTO jobs (task_id, owner, pid, pid_start, done_file, log, note, created_at)"
-                              " VALUES (?,?,?,?,?,?,?,?)", (task_id, owner, pid, pid_start, done_file, log, note,
-                                                            now_iso()))
+                log: str | None, note: str | None, children: bool = False) -> int:
+        cur = self.db.execute("INSERT INTO jobs (task_id, owner, pid, pid_start, done_file, log, note, created_at,"
+                              " children) VALUES (?,?,?,?,?,?,?,?,?)",
+                              (task_id, owner, pid, pid_start, done_file, log, note, now_iso(), int(children)))
         return cur.lastrowid
+
+    def children(self, task_id: str) -> list[dict[str, Any]]:
+        """The tasks this node requested on behalf of task_id (their parent_task), oldest first."""
+        return [_task_row(r) for r in self.db.execute(
+            "SELECT * FROM tasks WHERE role='requester' AND parent_task=? ORDER BY created_at, rowid", (task_id,))]
 
     def jobs(self, task_id: str | None = None, owner: str | None = None,
              open_only: bool = True) -> list[dict[str, Any]]:
@@ -503,6 +523,10 @@ class Ledger:
 
     def failures(self, limit: int = 50) -> list[dict[str, Any]]:
         return [dict(r) for r in self.db.execute("SELECT * FROM failures ORDER BY rowid DESC LIMIT ?", (limit,))]
+
+    def noticed(self, task_id: str, reason: str) -> bool:
+        return self.db.execute("SELECT 1 FROM notices WHERE task_id=? AND reason=?", (task_id, reason)).fetchone() \
+            is not None
 
     def notice_once(self, task_id: str, reason: str) -> bool:
         """True the first time (task_id, reason) is recorded: send that follow-up now, and never again."""

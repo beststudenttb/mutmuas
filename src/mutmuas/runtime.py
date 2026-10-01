@@ -81,6 +81,7 @@ class RunOutcome:
     artifacts: list[dict[str, Any]] = field(default_factory=list)
     session_id: str | None = None
     log_path: str | None = None
+    limit: str | None = None                   # the run was stopped at a worker limit (e.g. "error_max_turns")
 
 
 class SubprocessRuntime:
@@ -204,8 +205,8 @@ submit_result, list_agents, find_agent, send_request, wait_for_result, check_tas
 {git_note}
 Rules:
 1. Work only inside your working directory ({llm_start_dir(ctx)}){' and ' + ', '.join(map(str, code)) if code else ''}
-   unless the request says otherwise. HANDOFF.md there belongs to the interactive session: do not edit it.
-   Do not write worker-log.md either: the node writes the line when the task is delivered.
+   unless the request says otherwise. Keep PLAN.md and HANDOFF.md there up to date as a session would
+   (R7.11, D-066). Do not write worker-log.md: the node writes the line when the task is delivered.
 2. Never paste large data into text. Put files/datasets/logs into artifacts with publish_artifact
    and pass the returned references to submit_result.
 3. Call report_progress for meaningful milestones of long work.
@@ -219,6 +220,9 @@ Rules:
 7. Work that runs long (e.g. training): start it detached, `nohup <command> > <log> 2>&1 < /dev/null &`
    (then `echo $!` is its pid), register it with add_job (pid and/or done_file, log, a one-line note), note in
    PLAN.md what you wait for, and end this run without submit_result. You are started again when the job ends.
+8. Parts you delegate with send_request are this task's child tasks (parent_task is set for you). To wait for
+   them, call add_job(children=True) and end this run without submit_result: you are started again once
+   each has a result, was refused or cancelled, or is past its deadline, and told how each ended.
 """
 
 
@@ -252,13 +256,22 @@ class ClaudeCodeRuntime(SubprocessRuntime):
             argv += ["--add-dir", str(d)]
         if self.agent.model:
             argv += ["--model", self.agent.model]
+        # Worker limits (D-066): the agent's own, else the node's default; --max-turns is accepted by claude -p
+        # although its --help does not list it (checked in the 2.1.285 binary)
+        turns = self.agent.max_turns if self.agent.max_turns is not None else ctx.node.worker_max_turns
+        cost = self.agent.max_cost_usd if self.agent.max_cost_usd is not None else ctx.node.worker_max_cost_usd
+        if turns is not None:
+            argv += ["--max-turns", str(turns)]
+        if cost is not None:
+            argv += ["--max-budget-usd", f"{cost:g}"]
         return argv + list(self.agent.extra_args), worker_prompt(ctx).encode()
 
     def parse(self, ctx: TaskContext, exit_code: int, tail: str) -> RunOutcome:
         data = _last_json(tail) or {}
         text = data.get("result") if isinstance(data.get("result"), str) else tail
+        limit = data.get("subtype") if data.get("subtype") in ("error_max_turns", "error_max_budget_usd") else None
         return RunOutcome(exit_code, text[-4000:], result=_last_json(text) if text else None,
-                          session_id=data.get("session_id"))
+                          session_id=data.get("session_id"), limit=limit)
 
 
 class CodexRuntime(SubprocessRuntime):

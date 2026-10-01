@@ -186,17 +186,27 @@ async def clear_inbox(hub: Hub, me: str, before_seq: int) -> dict[str, Any]:
     return out
 
 
-async def remind_me(hub: Hub, me: str, at: str, text: str) -> dict[str, Any]:
-    """Have the session's mutmuas MCP process push `text` into the session at `at` (ISO time with timezone, or
-    +30s/+10m/+2h). Needs a session running with the channel; a reminder due while no session runs fires at the next
-    session start."""
-    from datetime import datetime, timedelta, timezone
+def _interval_s(text: str) -> float | None:
+    """'30s' / '10m' / '5h' / '1d' (a leading + is allowed) in seconds; None if it is not one."""
+    text = text.lstrip("+")
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if text and text[-1] in units and text[:-1].replace(".", "", 1).isdigit():
+        return float(text[:-1]) * units[text[-1]]
+    return None
 
-    from .ids import parse_iso
+
+async def remind_me(hub: Hub, me: str, at: str, text: str, every: str | None = None) -> dict[str, Any]:
+    """The node puts `text` into the agent's inbox at `at` (ISO time with timezone, or +30s/+10m/+2h) as a message
+    that hands the agent the baton, so it wakes a session (channel push, Codex watch) and waits in the inbox while
+    none runs (D-066). every='5h' repeats it at that interval until cancel_reminder."""
     addr, _ = hub.local_agent(me)
-    units = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
-    if at.startswith("+") and at[-1] in units and at[1:-1].replace(".", "", 1).isdigit():
-        due = datetime.now(timezone.utc) + timedelta(**{units[at[-1]]: float(at[1:-1])})
+    every_s = None
+    if every is not None:
+        every_s = _interval_s(every)
+        if not every_s:
+            raise ValueError(f"every={every!r}: use an interval like 30m, 5h or 1d")
+    if (delay := _interval_s(at)) is not None and at.startswith("+"):
+        due = datetime.now(timezone.utc) + timedelta(seconds=delay)
     else:
         hint = f"at={at!r}: use an ISO time with timezone (e.g. 2026-09-25T18:00:00+09:00) or +30s / +10m / +2h"
         try:
@@ -206,7 +216,13 @@ async def remind_me(hub: Hub, me: str, at: str, text: str) -> dict[str, Any]:
         if due.tzinfo is None:
             raise ValueError(hint)
     due_iso = due.astimezone(timezone.utc).isoformat(timespec="milliseconds")
-    return {"reminder": hub.ledger.add_reminder(str(addr), due_iso, text), "due": due_iso}
+    return {"reminder": hub.ledger.add_reminder(str(addr), due_iso, text, every_s), "due": due_iso,
+            "every_s": every_s}
+
+
+async def cancel_reminder(hub: Hub, me: str, reminder: int) -> dict[str, Any]:
+    addr, _ = hub.local_agent(me)
+    return {"reminder": reminder, "cancelled": hub.ledger.cancel_reminder(str(addr), int(reminder))}
 
 
 async def _read_receipts(hub: Hub, me: str, envs: list[Envelope], read: bool = True) -> None:
@@ -238,22 +254,26 @@ async def accept_task(hub: Hub, me: str, task_id: str) -> dict[str, Any]:
 
 
 async def add_job(hub: Hub, me: str, task_id: str | None = None, pid: int | None = None,
-                  done_file: str | None = None, log: str | None = None, note: str | None = None) -> dict[str, Any]:
+                  done_file: str | None = None, log: str | None = None, note: str | None = None,
+                  children: bool = False) -> dict[str, Any]:
     """Register a background job (e.g. training) the task waits on (D-050). The task becomes WAITING; a worker may
     then exit without a result, and is not treated as failed. The node's heartbeat notices when the job ends
     (process pid gone, or done_file appears) and wakes the post: a worker's task is queued again, a session gets
-    a wake-up. No time limit."""
+    a wake-up. No time limit. children=True (D-066): wait on the task's direct child tasks instead (sent with
+    parent_task); it ends when each has a result, was refused or cancelled, or is past its deadline."""
     from .node import proc_start
     task_id = task_id or _current_task()
     if not task_id:
         raise ValueError("task_id is required outside of a delegated task")
-    if pid is None and not done_file:
+    if pid is None and not done_file and not children:
         raise ValueError("give pid or done_file: how the node tells that the job has ended")
     task = _owned(hub, me, task_id)
     _check_actor(hub, task)
+    if children and not hub.ledger.children(task_id):
+        raise ValueError(f"{task_id} has no child task to wait on: send them with parent_task={task_id} first")
     job_id = hub.ledger.add_job(task_id, task["owner"], pid, proc_start(pid) if pid else None, done_file, log,
-                                note)
-    what = note or (f"pid {pid}" if pid else f"until {done_file}")
+                                note, children=children)
+    what = note or ("its child tasks" if children else f"pid {pid}" if pid else f"until {done_file}")
     await hub.owner_transition(task_id, "WAITING", f"waiting on a background job ({what}); resumes when it ends",
                                body={"state": "WAITING", "message": f"waiting on a background job ({what})"})
     return {"task_id": task_id, "job_id": job_id, "state": "WAITING"}
@@ -280,6 +300,10 @@ async def report_progress(hub: Hub, me: str, message: str, task_id: str | None =
     if next:
         body["next"] = next
     ok = await hub.owner_transition(task_id, new_state, message, msg_type=msg_type, body=body)
+    if (new_state == "WAITING" and not any(j["children"] for j in hub.ledger.jobs(task_id))
+            and any(c["status"] not in TERMINAL_STATES for c in hub.ledger.children(task_id))):
+        # Waiting with open child tasks is waiting on them: the node wakes this task when they are done (D-066)
+        hub.ledger.add_job(task_id, task["owner"], None, None, None, None, "child tasks", children=True)
     return {"task_id": task_id, "state": new_state, "sent": ok}
 
 
@@ -316,6 +340,16 @@ async def ask_question(hub: Hub, me: str, task_id: str, question: str, next: str
 async def answer(hub: Hub, me: str, task_id: str, text: str, next: str | None = None) -> dict[str, Any]:
     delivery = await hub.reply(me, task_id, "ANSWER", {"answer": text, **({"next": next} if next else {})})
     return {"task_id": task_id, "delivery": delivery}
+
+
+async def cancel_children(hub: Hub, task_id: str, reason: str) -> list[str]:
+    """A cancelled task's open child tasks are withdrawn too (D-066); their own nodes cascade further down."""
+    cancelled = []
+    for child in hub.ledger.children(task_id):
+        if child["status"] not in TERMINAL_STATES:
+            await cancel_task(hub, child["local_agent"], child["task_id"], f"parent {task_id} cancelled: {reason}")
+            cancelled.append(child["task_id"])
+    return cancelled
 
 
 async def cancel_task(hub: Hub, me: str, task_id: str, reason: str = "") -> dict[str, Any]:

@@ -96,8 +96,9 @@ async def test_channel_push_and_session_presence(make_config, cluster, tmp_path)
         assert listed["B:desk"]["session"] == "online"                          # visible in `agents`, not only raw
 
         await tools.remind_me(hub_b, "B:desk", "+0m", "check C's reply to T3")
+        # the node delivers it into the inbox (D-066), and the session is woken like by any mail that needs it
         reminder = await read_until(lambda m: m.get("method") == "notifications/claude/channel"
-                                    and "reminder" in m["params"]["meta"])
+                                    and m["params"]["meta"].get("task_id", "").startswith("reminder-"))
         assert "check C's reply to T3" in reminder["params"]["content"]
     finally:
         proc.stdin.close()
