@@ -481,3 +481,17 @@ async def test_a_post_with_a_group_a_stop_could_not_end_is_not_retired(node):
         assert path.read_text() == CONFIG and post.is_dir()
     finally:
         group.kill()
+
+
+async def test_a_closed_task_whose_group_still_runs_blocks_retirement(node):
+    """Codex fourth review: a requester's CANCEL closes the task, its stuck group runs on; the task's state says
+    nothing about its processes, so the post is still not retired."""
+    path, cfg, ledger, post = node
+    group = Orphan("import time; time.sleep(60)")
+    try:
+        ledger.update_task("T-open", "owner", status="CANCELLED", force=True, stuck_pgid=group.pid)
+        with pytest.raises(PermissionError, match="process group"):
+            await retire(path, "vision")
+        assert path.read_text() == CONFIG and post.is_dir()
+    finally:
+        group.kill()

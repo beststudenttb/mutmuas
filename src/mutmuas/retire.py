@@ -158,7 +158,9 @@ async def _retire(path, cfg, agent, hand_over, dry_run, keep_mailbox) -> dict[st
         if live_worker_runs(ledger, addr):
             raise PermissionError(f"{addr}: its worker is running a task; wait for it or cancel it first")
         open_owned = ledger.tasks(role="owner", local_agent=addr, statuses=OPEN_STATES, limit=None)
-        if stuck := [t["task_id"] for t in open_owned if t.get("stuck_pgid") and group_alive(t["stuck_pgid"])]:
+        # every task, closed ones too: a task's state says nothing about its processes (Codex fourth review)
+        if stuck := [t["task_id"] for t in ledger.tasks(role="owner", local_agent=addr, limit=None)
+                     if t.get("stuck_pgid") and group_alive(t["stuck_pgid"])]:
             raise PermissionError(f"{addr}: a process group a stop could not end still runs for {', '.join(stuck)}; "
                                   "it must end first")
         owned = [t["task_id"] for t in open_owned]
