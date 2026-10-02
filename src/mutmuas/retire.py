@@ -145,6 +145,7 @@ async def retire(config: Path | str, agent_id: str, hand_over: str | None = None
 
 async def _retire(path, cfg, agent, hand_over, dry_run, keep_mailbox) -> dict[str, Any]:
     from .node import live_worker_runs, session_present
+    from .runtime import group_alive
     from .tools import cancel_task
     agent_id = agent.id
     addr = str(Address(cfg.node, agent_id))
@@ -156,7 +157,11 @@ async def _retire(path, cfg, agent, hand_over, dry_run, keep_mailbox) -> dict[st
             raise PermissionError(f"{addr}: {why}; close its session first")
         if live_worker_runs(ledger, addr):
             raise PermissionError(f"{addr}: its worker is running a task; wait for it or cancel it first")
-        owned = [t["task_id"] for t in ledger.tasks(role="owner", local_agent=addr, statuses=OPEN_STATES, limit=None)]
+        open_owned = ledger.tasks(role="owner", local_agent=addr, statuses=OPEN_STATES, limit=None)
+        if stuck := [t["task_id"] for t in open_owned if t.get("stuck_pgid") and group_alive(t["stuck_pgid"])]:
+            raise PermissionError(f"{addr}: a process group a stop could not end still runs for {', '.join(stuck)}; "
+                                  "it must end first")
+        owned = [t["task_id"] for t in open_owned]
         asked = [t["task_id"] for t in ledger.tasks(role="requester", local_agent=addr, statuses=OPEN_STATES,
                                                    limit=None)]
         text = path.read_text()

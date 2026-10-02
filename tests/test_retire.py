@@ -467,3 +467,17 @@ async def test_a_stop_cancelled_while_going_offline_still_lets_go_of_the_lock(tm
     await asyncio.gather(stopping, return_exceptions=True)
     with daemon_lock(cfg):
         pass
+
+
+async def test_a_post_with_a_group_a_stop_could_not_end_is_not_retired(node):
+    """After the merge with the interrupt branch: a run whose stop failed leaves its process group on the task
+    (stuck_pgid); it still runs, so the post is not retired."""
+    path, cfg, ledger, post = node
+    group = Orphan("import time; time.sleep(60)")             # its own session: group id = its pid
+    try:
+        ledger.update_task("T-open", "owner", status="ACCEPTED", stuck_pgid=group.pid)
+        with pytest.raises(PermissionError, match="process group"):
+            await retire(path, "vision")
+        assert path.read_text() == CONFIG and post.is_dir()
+    finally:
+        group.kill()
