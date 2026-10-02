@@ -138,10 +138,13 @@ class SubprocessRuntime:
                 ctx.on_spawn(proc.pid)
             tail = bytearray()
             try:
-                if stdin is not None:
-                    proc.stdin.write(stdin)
-                    await proc.stdin.drain()
-                proc.stdin.close()
+                # a command that does not read its input may close it first: not an error, its exit code says how
+                # it went (C's Linux runs: `true` made a run fail with ConnectionResetError now and then)
+                with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                    if stdin is not None:
+                        proc.stdin.write(stdin)
+                        await proc.stdin.drain()
+                    proc.stdin.close()
                 while chunk := await proc.stdout.read(65536):
                     logf.write(chunk)
                     logf.flush()

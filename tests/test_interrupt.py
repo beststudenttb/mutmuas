@@ -726,3 +726,18 @@ def test_a_ps_output_that_says_nothing_clear_is_not_a_stopped_group(monkeypatch,
     monkeypatch.setattr(runtime.subprocess, "run",
                         lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=stdout, stderr=""))
     assert runtime._group_gone(4242, 0) is False
+
+
+async def test_a_command_that_exits_without_reading_its_stdin_is_not_a_runtime_error(tmp_path):
+    """C's Linux runs: a script that does not read the task JSON (`true`) closed its stdin before the node had
+    written it; the write raised ConnectionResetError and the run counted as failed. Made certain here with an
+    input larger than a pipe holds."""
+    from mutmuas.config import AgentConfig, NodeConfig
+    from mutmuas.runtime import TaskContext, make_runtime
+    agent = AgentConfig(id="desk", mode="worker", runtime="script", command=["sh", "-c", "exit 0"],
+                        workdir=str(tmp_path / "work"))
+    cfg = NodeConfig(project="p", node="B", data_dir=str(tmp_path / "data"))
+    request = Envelope(type="REQUEST", sender="A:x", to="B:desk", task_id="T-1",
+                       body=request_body("x" * 2_000_000, "a big task"))
+    outcome = await make_runtime(agent, cfg).run(TaskContext("T-1", request, agent, cfg))
+    assert outcome.exit_code == 0
