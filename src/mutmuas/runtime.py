@@ -44,6 +44,8 @@ class TaskContext:
     on_spawn: Any = None                 # called with the process id once the agent process exists
     jobs: list[dict[str, Any]] = field(default_factory=list)   # background jobs of this task that have ended
     resume: str | None = None            # a brain batch's conversation to continue (D-073)
+    interrupts: list[str] = field(default_factory=list)   # what interrupted the previous run (D-089)
+    session_id: str | None = None        # a new brain conversation's id, chosen by the node before the run
 
     @property
     def internal(self) -> bool:
@@ -212,7 +214,20 @@ Rules:
 """
 
 
+def interrupt_note(ctx: TaskContext) -> str:
+    """The messages that interrupted (or paused and resumed) this task's previous run (D-089): first thing to read."""
+    if not ctx.interrupts:
+        return ""
+    lines = "".join(f"\n- {text}" for text in ctx.interrupts)
+    return (f"\nYour previous run of this task was interrupted (D-089) by the message(s) below. Act on them first: "
+            f"they may stop or change what you were doing.{lines}\n")
+
+
 def worker_prompt(ctx: TaskContext) -> str:
+    return interrupt_note(ctx) + _worker_prompt(ctx)
+
+
+def _worker_prompt(ctx: TaskContext) -> str:
     if ctx.internal:
         return sub_prompt(ctx)
     req = ctx.request
@@ -306,6 +321,8 @@ class ClaudeCodeRuntime(SubprocessRuntime):
             argv += ["--model", model]
         if ctx.resume:
             argv += ["--resume", ctx.resume]
+        elif ctx.session_id:
+            argv += ["--session-id", ctx.session_id]       # named up front: a stopped run can still be resumed
         # Worker limits (D-066): the agent's own, else the node's default; --max-turns is accepted by claude -p
         # although its --help does not list it (checked in the 2.1.285 binary)
         turns = self.agent.max_turns if self.agent.max_turns is not None else ctx.node.worker_max_turns

@@ -149,7 +149,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 """
 
-TASK_JSON_FIELDS = ("request", "result", "result_draft", "input_refs", "output_refs")
+TASK_JSON_FIELDS = ("request", "result", "result_draft", "input_refs", "output_refs", "interrupts")
 
 
 class Ledger:
@@ -182,6 +182,9 @@ class Ledger:
         self._add_column("tasks", "eta", "TEXT")
         self._add_column("tasks", "nudged_at", "TEXT")
         self._add_column("sessions", "accepting", "INTEGER NOT NULL DEFAULT 1")
+        # D-089: messages that interrupted a worker's run, for its next run; a task paused until resumed
+        self._add_column("tasks", "interrupts", "TEXT")
+        self._add_column("tasks", "paused", "INTEGER NOT NULL DEFAULT 0")
 
     def _add_column(self, table: str, column: str, decl: str) -> None:
         if column not in [r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")]:

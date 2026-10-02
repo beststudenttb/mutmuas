@@ -352,6 +352,10 @@ Known risks (protections removed on purpose; one line each):
   between can be lost (D-073).
 - An internal subtask's worker is kept from mail by its tools, not by the operating system: it runs as the same
   user with the post's Read/Bash, so it could read the node's ledger file directly (D-073).
+- `leader: true` is what the sender says (D-035, not checked): anyone who can send to a post can interrupt its
+  worker with it, as with leader-first ordering (D-089).
+- An interrupted run is killed midway: work it had not saved, and side effects it had started (a training
+  process it launched without add_job), are not undone; the next run is told it was interrupted (D-089).
 - The 收件 section is rewritten by the node under the PLAN lock; an agent editing PLAN.md at the same moment
   without the lock can lose its edit or the node's line (D-073 batch 2).
 - An eta lives on the requester's node only (not on the public card): another node's coordinator sees it only

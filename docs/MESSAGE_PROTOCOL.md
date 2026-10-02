@@ -100,6 +100,19 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   takes all of them, as before. Which project a session is in is found by file identity, so a case variant of
   the directory or a link into it counts as that project. An agent without `auto_worker` has nobody to hand
   the rest to, so its session takes and sees all work wherever it was started.
+- **Interrupt, pause, resume** (D-089: "my instruction can interrupt directly"):
+  - A message marked by the leader (`leader: true`) or `priority: high` interrupts a worker in the middle of a
+    run when it is an UPDATE or ANSWER about the task that worker runs, or carries `interrupt: true` (then it
+    stops whatever the post's worker runs). The owner's node stops the run (the whole process group), keeps the
+    message on the task (`tasks.interrupts`) and lays the task out again; the next run's prompt starts with
+    it, and a brain resumes the same conversation. The node names a new brain conversation itself
+    (`claude -p --session-id`) before the run, so a run stopped midway can still be resumed. The requester is
+    told ("interrupted"). The attempt is not counted as a failed one.
+  - `pause: true` (from the leader, priority high, or the task's requester) stops a running worker and keeps
+    the task WAITING and `paused` until `resume: true`; nothing restarts a paused task (heartbeat, recover).
+    A session's task is marked the same way and the session reads the message.
+  - Pause and resume travel down `parent_task` to the open child tasks on whatever node they run, and from
+    there further down; CANCEL already did (D-066).
 - **Follow-up and receipts** (D-073 batch 2, D-076):
   - *Arriving work goes on the plan*: the owner's node adds `- [ ] <task> from <sender>: <first line>` to the
     `## 收件` section of the project's PLAN.md, and the receipt (the PENDING UPDATE, or a worker's ACK) says its
