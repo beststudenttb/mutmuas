@@ -39,7 +39,7 @@ from .hub import Hub
 from .ids import Address, InvalidAddress, check_token, now_iso, parse_iso
 from .protocol import (OPEN_STATES, REQUEST_KINDS, TERMINAL_STATES, ArtifactRef, Envelope, ProtocolError,
                        reply_required, result_body, task_state_for_result)
-from .runtime import TaskContext, make_runtime, stop_group
+from .runtime import TaskContext, group_alive, make_runtime, stop_group
 from .visibility import CARD_KEYS, accepts_kinds, acl, artifact_visible, is_participant, short
 from .worktree import GitError, Worktree
 
@@ -738,8 +738,11 @@ class NodeDaemon:
         task = hub.ledger.task(task_id, "owner")
         if task is None or task["status"] in TERMINAL_STATES or task.get("paused"):
             return                                       # done, or paused until resumed (D-089)
-        if agent.auto_worker and same_process(task.get("runner_pid"), task.get("runner_start")):
-            log.info("task %s: a worker from before a restart still runs; not started again", task_id)
+        if self._worker_alive(task):
+            # a worker from before a restart, or a run whose stop failed: nothing runs beside it; the heartbeat
+            # lays the task out once it has gone
+            log.info("task %s: an earlier run of it still runs; not started again", task_id)
+            self._recheck.add(task_id)
             return
         if agent.auto_worker:
             # Claim it for the worker in one transaction with the session check: never done twice, and while
@@ -782,8 +785,12 @@ class NodeDaemon:
             # (D-089 interrupt) prints no JSON, and the next run must still resume it (sandbox finding).
             ctx.session_id = str(uuid.uuid4())
             hub.ledger.set_brain_session(task["owner"], project, ctx.session_id)
-        if agent.auto_worker:
-            ctx.on_spawn = lambda pid: self._record_worker(task_id, pid)
+        spawned: list[int] = []                 # this run's process (every mode: a failed stop is watched)
+
+        def on_spawn(pid: int) -> None:
+            spawned.append(pid)
+            self._record_worker(task_id, pid)
+        ctx.on_spawn = on_spawn
         wt = None
         if request.body.get("kind") == "code" and agent.copies_code:
             inputs = request.body.get("inputs")
@@ -800,10 +807,12 @@ class NodeDaemon:
         try:
             outcome = await asyncio.wait_for(make_runtime(agent, self.cfg).run(ctx), timeout)
         except asyncio.TimeoutError:
+            self._mark_unstopped(task_id, spawned)
             await self._run_failed(agent, task_id, attempt, result_body(
                 "failed", f"timed out after {timeout:.0f}s", limitations=["process was killed at the deadline"]))
             return
         except asyncio.CancelledError:
+            self._mark_unstopped(task_id, spawned)
             if (why := self._interrupted.pop(task_id, None)) is not None:
                 await self._settle_stopped(task_id, why)
                 return
@@ -940,10 +949,26 @@ class NodeDaemon:
                                                             "out again with the new message")
             self._retry.add(task_id)
 
+    def _worker_alive(self, task: dict[str, Any]) -> bool:
+        """An earlier run of this task still runs: its leader (pid and start time), or its process group when a
+        stop of it failed (the group may outlive its leader; Codex third review of the interrupt)."""
+        if same_process(task.get("runner_pid"), task.get("runner_start")):
+            return True
+        return bool(task.get("stuck_pgid")) and group_alive(task["stuck_pgid"])
+
     def _old_worker(self, task: dict[str, Any] | None) -> bool:
-        """A worker from before a restart still runs this task: a verified process, not one of our runs."""
-        return bool(task) and task["task_id"] not in self._running and same_process(task.get("runner_pid"),
-                                                                                    task.get("runner_start"))
+        """A worker from before a restart (or left by a failed stop) still runs this task, not one of our runs."""
+        return bool(task) and task["task_id"] not in self._running and self._worker_alive(task)
+
+    def _mark_unstopped(self, task_id: str, spawned: list[int]) -> None:
+        """A run of ours was stopped: if its process group still lives (the stop failed), remember the group, so
+        nothing runs beside it and the heartbeat watches it."""
+        if spawned and group_alive(spawned[-1]):
+            self.hub.ledger.update_task(task_id, "owner", stuck_pgid=spawned[-1])
+            self._recheck.add(task_id)
+            if self.hub.ledger.notice_once(task_id, f"stop-failed:{spawned[-1]}"):
+                self._failed("interrupt", f"could not stop the run's process group {spawned[-1]}; nothing runs "
+                                          "beside it, checked again each heartbeat", task_id=task_id)
 
     async def _stop_old_worker(self, task: dict[str, Any]) -> str | None:
         """Stop the process group of a worker from before a restart (not one of ours, so it cannot be cancelled):
@@ -951,10 +976,13 @@ class NodeDaemon:
         next to it (Codex reviews of 9f39ff0 and cb77a33)."""
         if not self._old_worker(task):
             return None
-        task_id, pid = task["task_id"], task["runner_pid"]
-        if await stop_group(pid):                      # started in its own session: group id = pid
+        task_id = task["task_id"]
+        pid = task.get("stuck_pgid") or task["runner_pid"]     # started in its own session: group id = pid
+        if await stop_group(pid):
+            self.hub.ledger.update_task(task_id, "owner", stuck_pgid=None)
             self._recheck.discard(task_id)
             return "stopped"
+        self.hub.ledger.update_task(task_id, "owner", stuck_pgid=pid)   # watched as a group, beyond its leader
         self._recheck.add(task_id)
         if self.hub.ledger.notice_once(task_id, f"stop-failed:{pid}"):
             self._failed("interrupt", f"could not stop the old worker's process group {pid}; checked again each "
@@ -1320,22 +1348,27 @@ class NodeDaemon:
             return
         if task.get("paused"):
             # paused: its old worker is stopped (again, while it runs); then it waits for resume
-            if await self._stop_old_worker(task) != "failed":
+            if await self._stop_old_worker(task) == "failed":
+                return
+            task = hub.ledger.task(task_id, "owner")    # as it is now: a resume may have come while it stopped
+            if task.get("paused"):
                 self._recheck.discard(task_id)
                 if task["status"] != "WAITING":
                     await hub.owner_transition(task_id, "WAITING", "paused: its old worker has stopped")
-            return
+                return
         if task["status"] == "PENDING":
             if task.get("runner") == "worker":
                 hub.ledger.release_task(task_id, "worker")
             return
-        if same_process(task.get("runner_pid"), task.get("runner_start")):
+        if self._worker_alive(task):
             if hub.ledger.notice_once(task_id, "old-worker-running"):
                 self._failed("recover", "a worker from before the restart still runs; checked again each heartbeat",
                              address=task["owner"], task_id=task_id)
             self._recheck.add(task_id)
             return
         self._recheck.discard(task_id)
+        if task.get("stuck_pgid"):
+            hub.ledger.update_task(task_id, "owner", stuck_pgid=None)          # its group has gone
         if await self._deliver_draft(task_id):
             return
         hub.ledger.set_runner_pid(task_id, None)

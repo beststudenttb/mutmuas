@@ -599,3 +599,130 @@ def test_group_states_reads_this_systems_ps():
     finally:
         child.kill()
         child.wait()
+
+
+# --------------------------------------------------------------------------- Codex third review (7a109df)
+
+
+async def test_a_group_left_by_a_failed_stop_is_watched_after_its_leader_ends(tmp_path, monkeypatch):
+    live = {"leader": True, "group": True}
+
+    async def failed_stop(pgid, grace_s=5.0):
+        return False
+    monkeypatch.setattr(node_module, "same_process", lambda pid, start: bool(pid) and live["leader"])
+    monkeypatch.setattr(node_module, "group_alive", lambda pgid: live["group"])
+    monkeypatch.setattr(node_module, "stop_group", failed_stop)
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-r", "RUNNING", claim="worker", ingest=True)
+    ledger.set_runner_pid("T-r", 12345, "synthetic-start")
+    try:
+        await _deliver(daemon, agent, _update("T-r", sender="B:secretary", interrupt=True))
+        assert "T-r" in daemon._recheck and ledger.task("T-r", "owner")["stuck_pgid"] == 12345
+        live["leader"] = False                                   # the leader ends, a child in its group lives on
+        await daemon._recover_auto(ledger.task("T-r", "owner"))
+        assert "T-r" in daemon._recheck and "T-r" not in daemon._queued["B:desk"]
+        live["group"] = False                                    # now the whole group is gone
+        await daemon._recover_auto(ledger.task("T-r", "owner"))
+        assert "T-r" not in daemon._recheck and "T-r" in daemon._queued["B:desk"]
+        assert not ledger.task("T-r", "owner")["stuck_pgid"]
+    finally:
+        ledger.close()
+
+
+async def test_a_resume_while_the_heartbeat_stops_a_paused_old_worker_lays_it_out(tmp_path, monkeypatch):
+    live = {"leader": True}
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_stop(pgid, grace_s=5.0):
+        entered.set()
+        await release.wait()
+        live["leader"] = False
+        return True
+    monkeypatch.setattr(node_module, "same_process", lambda pid, start: bool(pid) and live["leader"])
+    monkeypatch.setattr(node_module, "stop_group", slow_stop)
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-r", "RUNNING", claim="worker", ingest=True)
+    ledger.set_runner_pid("T-r", 12345, "synthetic-start")
+    ledger.update_task("T-r", "owner", paused=1)
+    daemon._recheck.add("T-r")
+    runs = []
+
+    class Record:
+        def __init__(self, *_):
+            pass
+
+        async def run(self, ctx):
+            runs.append(ctx)
+            await asyncio.Event().wait()
+    monkeypatch.setattr(node_module, "make_runtime", Record)
+    runner = asyncio.create_task(daemon._runner(agent, "B:desk", daemon._queues["B:desk"]))
+    heartbeat = asyncio.create_task(daemon._recover_auto(ledger.task("T-r", "owner")))
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        await _deliver(daemon, agent, _update("T-r", resume=True))
+        await asyncio.sleep(0.1)          # the runner takes it and skips it: the old worker still runs
+        release.set()
+        await heartbeat
+        await _settle(lambda: len(runs) == 1)                     # run once the old worker is gone
+        assert not ledger.task("T-r", "owner")["paused"]
+    finally:
+        release.set()
+        heartbeat.cancel()
+        runner.cancel()
+        await asyncio.gather(heartbeat, runner, return_exceptions=True)
+        ledger.close()
+
+
+async def test_a_running_task_whose_stop_fails_is_not_run_again_beside_it(tmp_path, monkeypatch):
+    import sys
+    from mutmuas import runtime
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-r", "ACCEPTED", ingest=True)
+    started, runs, procs = asyncio.Event(), [], []
+
+    async def could_not_stop(pgid, grace_s=5.0):
+        return False
+
+    class Live:
+        def __init__(self, *_):
+            pass
+
+        async def run(self, ctx):
+            runs.append(ctx)
+            proc = await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(60)",
+                                                        start_new_session=True)
+            procs.append(proc)
+            ctx.on_spawn(proc.pid)
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await runtime._kill_group(proc, grace_s=0.01)      # the real path, its stop failing
+                raise
+    monkeypatch.setattr(runtime, "stop_group", could_not_stop)
+    monkeypatch.setattr(node_module, "make_runtime", Live)
+    daemon._enqueue("B:desk", "T-r")
+    runner = asyncio.create_task(daemon._runner(agent, "B:desk", daemon._queues["B:desk"]))
+    try:
+        await asyncio.wait_for(started.wait(), 3)
+        await _deliver(daemon, agent, _update("T-r", sender="B:secretary"))
+        await asyncio.sleep(0.5)
+        assert len(runs) == 1 and "T-r" in daemon._recheck                      # not run beside the live group
+        assert ledger.task("T-r", "owner")["stuck_pgid"] == procs[0].pid
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        for p in procs:
+            p.kill()
+            await p.wait()
+        ledger.close()
+
+
+@pytest.mark.parametrize("stdout", ["", "4242\n", "4242 Z extra\n", "4242 Z\nnonsense\n"])
+def test_a_ps_output_that_says_nothing_clear_is_not_a_stopped_group(monkeypatch, stdout):
+    import subprocess
+    from mutmuas import runtime
+    monkeypatch.setattr(runtime.os, "killpg", lambda pgid, sig: None)          # the group answers
+    monkeypatch.setattr(runtime.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=stdout, stderr=""))
+    assert runtime._group_gone(4242, 0) is False

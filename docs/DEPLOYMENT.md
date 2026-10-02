@@ -361,8 +361,10 @@ Known risks (protections removed on purpose; one line each):
 - Pause and interrupt stop the worker's process group only. A process that left the group (its own setsid), a
   job on another machine, or a training started elsewhere keeps running: a task shown paused does not mean its
   GPU training stopped or its GPU locks were released. A group that cannot be shown stopped (still alive after
-  SIGKILL, or EPERM from a member that is not a zombie) is recorded, rechecked each heartbeat, and nothing is run
-  next to it.
+  SIGKILL, EPERM from a member that is not a zombie, or a ps answer that cannot be read) is recorded on the task
+  (`stuck_pgid`) and watched as a group, also after its leader has ended; nothing runs for the task while it
+  lives, and the heartbeat lays the task out once it has gone. The node knows a run's process only from the
+  runtime's spawn report, and a group id is checked by its live members (a reused id is not told apart).
 - Pause is not reliable for every open child task: a held child (depends_on) is paused where it waits, and a
   child its owner node has already recorded is paused there, but a pause that reaches the owner node before the
   child's REQUEST was handled is dropped (no persistent order or tombstone for unknown tasks).

@@ -406,6 +406,11 @@ async def stop_group(pgid: int, grace_s: float = 5.0) -> bool:
     return False
 
 
+def group_alive(pgid: int) -> bool:
+    """Something of this process group still runs (zombies do not count; an unreadable state counts as alive)."""
+    return not _group_gone(pgid, 0)
+
+
 def _group_gone(pgid: int, sig: int) -> bool:
     """Whether the group is gone after sending it sig. Members that are zombies (dead, not yet reaped by their
     parent) count as gone: Linux lets kill() reach a zombie, macOS answers EPERM for a group of zombies only
@@ -415,8 +420,13 @@ def _group_gone(pgid: int, sig: int) -> bool:
     except ProcessLookupError:
         return True
     except PermissionError:
-        return all(state.startswith("Z") for state in _group_states(pgid))
-    return sig == 0 and all(state.startswith("Z") for state in _group_states(pgid))
+        return _all_zombies(_group_states(pgid))
+    return sig == 0 and _all_zombies(_group_states(pgid))
+
+
+def _all_zombies(states: list[str]) -> bool:
+    # the group answered a signal, so ps must show members: none shown says nothing (Codex third review)
+    return bool(states) and all(state.startswith("Z") for state in states)
 
 
 def _group_states(pgid: int) -> list[str]:
@@ -429,9 +439,14 @@ def _group_states(pgid: int) -> list[str]:
         return ["?"]
     if done.returncode != 0:
         return ["?"]
-    out = done.stdout
-    return [stat for line in out.splitlines() if len(parts := line.split()) == 2 and parts[0] == str(pgid)
-            for stat in [parts[1]]]
+    states = []
+    for line in done.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 2 or not parts[0].isdigit():
+            return ["?"]                                # a line we cannot read: unknown, never "gone"
+        if parts[0] == str(pgid):
+            states.append(parts[1])
+    return states
 
 
 async def _kill_group(proc: asyncio.subprocess.Process, grace_s: float = 5.0) -> None:

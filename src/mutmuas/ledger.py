@@ -171,6 +171,8 @@ class Ledger:
         self._add_column("tasks", "runner", "TEXT")
         self._add_column("tasks", "runner_pid", "INTEGER")
         self._add_column("tasks", "runner_start", "TEXT")          # the process's start time: pids get reused
+        # D-089: the process group of a run whose stop failed; nothing runs for the task while it lives
+        self._add_column("tasks", "stuck_pgid", "INTEGER")
         # D-066: a job that waits on the task's direct child tasks (parent_task) instead of a process or file
         self._add_column("jobs", "children", "INTEGER NOT NULL DEFAULT 0")
         self._add_column("reminders", "every_s", "REAL")             # repeat after this many seconds
