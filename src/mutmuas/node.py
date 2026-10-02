@@ -40,7 +40,7 @@ from .ids import Address, InvalidAddress, check_token, now_iso, parse_iso
 from .protocol import (OPEN_STATES, REQUEST_KINDS, TERMINAL_STATES, ArtifactRef, Envelope, ProtocolError,
                        reply_required, result_body, task_state_for_result)
 from .runtime import TaskContext, make_runtime
-from .visibility import CARD_KEYS, accepts_kinds, acl, short
+from .visibility import CARD_KEYS, accepts_kinds, acl, artifact_visible, is_participant, short
 from .worktree import GitError, Worktree
 
 log = logging.getLogger(__name__)
@@ -1137,13 +1137,24 @@ class NodeDaemon:
                 continue
             if not all(t and t["status"] == "COMPLETED" for t in deps.values()):
                 continue
+            # what travels with it is checked again for its sender now (Codex review of b442f2c): only tasks it
+            # takes part in, only artifacts it may see itself
+            sender = env.sender
+            deps = {d: t for d, t in deps.items() if is_participant(hub.ledger, sender, d)}
             env.body["dependencies"] = [{"task_id": d, "owner": t["owner"], "status": t.get("result_status"),
                                          "summary": short((t.get("result") or {}).get("summary") or "", 300)}
                                         for d, t in deps.items()]
             env.artifacts = [*env.artifacts, *(ArtifactRef.from_dict(a) for t in deps.values()
-                                               for a in t.get("output_refs") or [])]
-            hub.ledger.release_held(env)
+                                               for a in t.get("output_refs") or []
+                                               if artifact_visible(hub.ledger, sender, a.get("uri", "")))]
+            if not env.body.get("deadline") and env.body.get("reply") != "none":
+                from .tools import default_reply_deadline     # its reply clock starts now that it is sent
+                if (due := default_reply_deadline(hub, env.body.get("timeout_s"))):
+                    env.body.update(deadline=due, deadline_default=True)
+            if not hub.ledger.release_held(env):
+                continue                                      # withdrawn meanwhile: never sent
             await hub.try_publish(env)
+            await hub.copy_to_observers(sender, env, env.body.get("observers") or [])
 
     async def _expire_brains(self) -> None:
         """End a brain batch (D-073) after brain_batch_idle_s without a brain run, unless one of the post's subs
@@ -1193,7 +1204,10 @@ class NodeDaemon:
         Nothing is chased while the owner's node itself is offline (a closed laptop): the clock waits."""
         hub = self.hub
         now = datetime.now(timezone.utc)
+        held = hub.ledger.held_ids()            # not sent yet: nobody owes us a reply (Codex review of b442f2c)
         for t in hub.ledger.tasks(role="requester", statuses=OPEN_STATES, limit=None):
+            if t["task_id"] in held:
+                continue
             request = t.get("request") or {}
             if not reply_required(request):
                 continue

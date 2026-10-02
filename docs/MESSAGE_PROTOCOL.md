@@ -130,13 +130,16 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
     gone with no worker behind it is reported instead of chased.
   - *depends_on*: `send_request(depends_on=[…])` names tasks this node knows. The request is held on the
     sender's node (`delivery: held`) and sent once they are all done, with their summaries in
-    `body.dependencies` and their artifacts attached. If one failed, was refused or withdrawn, it is not sent:
-    it fails and its sender is told.
+    `body.dependencies` and their artifacts attached. Only tasks the sender takes part in can be named, and
+    only artifacts it may see travel with it (checked again when it is sent). If one failed, was refused or
+    withdrawn, it is not sent: it fails and its sender is told. Withdrawing a held request drops it (no CANCEL
+    goes out). While held it is not chased, and its default reply deadline starts when it is sent.
   - *nudge*: `nudge(task_id, note)` reminds the owner of a task we requested: it is woken (`next`) and must
     answer what it does, where it is stuck and a new eta. At most once in three hours per task. The owner's
     node lays out again a worker's task that is neither running nor queued.
   - *off*: `agentctl session off` (the launcher's `mutmuas <post> off`) keeps the session online but gives
     it no work: the worker takes new requests and the session's inbox leaves them out; `session on` undoes it.
+    A post without a worker (auto_worker) cannot switch off: nobody else would take the work.
 - **Brain and subs** (D-073): a post's worker runs are its *brain*. With claude-code, its runs for one project
   share one conversation (`claude -p --resume`) while work keeps coming; after `brain_batch_idle_s` (node.yaml,
   default 1800) with no brain run, no sub running and no job waited on, the node forgets the conversation and the
@@ -176,8 +179,9 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   `{task_id, msg_type, sender, summary}`.
   - Start the session with `claude --dangerously-load-development-channels server:mutmuas` until the
     channel is approved.
-  - The push never marks anything read. Mail that arrived before the session started is not pushed, so
-    handle the backlog with `inbox`.
+  - The push never marks anything read. When the MCP server starts (a new session, /mcp reconnect) it pushes
+    every unread message that needs the session once more, oldest first (D-073 batch 2); after that each new
+    one once.
   - Codex keeps `agentctl watch` → `codex queue`.
 - **Presence.** The session's own mutmuas MCP process writes a heartbeat to the node ledger every 15 s. The
   registry card of an interactive agent then shows one of:

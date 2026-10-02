@@ -6,6 +6,7 @@ a session that takes no work."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -262,5 +263,150 @@ async def test_a_session_switched_off_leaves_the_work_to_the_worker(tmp_path, se
         ledger.set_session_accepting("B:desk", True)
         await _arrive(daemon, agent, _request("T-on"))
         assert ledger.task("T-on", "owner")["status"] == "PENDING"
+    finally:
+        ledger.close()
+
+
+# --------------------------------------------------------------------------- Codex full review of b442f2c
+
+
+async def test_finish_does_not_overwrite_a_line_the_node_adds_meanwhile(tmp_path, monkeypatch):
+    """Another node writer (a new 收件 line) arrives while finish rewrites PLAN.md: it must not be lost."""
+    import threading
+    from pathlib import Path
+    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    board = agent.workdir_path / "PLAN.md"
+    owned_task(ledger, "T-done", ingest=True)
+    owned_task(ledger, "T-new", ingest=True)
+    board.parent.mkdir(parents=True, exist_ok=True)
+    board.write_text("# PLAN\n## [>] T-done test\n- [x] done\n\n## 收件\n")
+    other = []
+
+    def meanwhile():                                   # the moment finish writes the board back
+        if not other:
+            other.append(threading.Thread(target=hub.add_inbox_line, args=(ledger.task("T-new", "owner"),)))
+            other[0].start()
+            other[0].join(0.5)
+    write_text, replace = Path.write_text, Path.replace
+
+    def patched_write(path, *a, **k):
+        if path == board:
+            meanwhile()
+        return write_text(path, *a, **k)
+
+    def patched_replace(path, target):
+        if target == board:
+            meanwhile()
+        return replace(path, target)
+    monkeypatch.setattr(Path, "write_text", patched_write)
+    monkeypatch.setattr(Path, "replace", patched_replace)
+    try:
+        await hub.finish("T-done", result_body("complete", "done"))
+        other[0].join(5)
+        text = board.read_text()
+        assert "T-new" in text and "T-done test" not in text
+        assert "- [x] done" in ledger.task("T-done", "owner")["result"]["outputs"]["plan"]
+    finally:
+        ledger.close()
+
+
+async def test_the_start_push_covers_every_unread_message_oldest_first(tmp_path):
+    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    _wake_mail(ledger, 75)
+    try:
+        first, cursor = await tools.push_due(hub, "B:desk", None)
+        assert len(first) == 75 and [m["seq"] for m in first] == sorted(m["seq"] for m in first)
+        assert (await tools.push_due(hub, "B:desk", cursor))[0] == []
+        assert ledger.db.execute("SELECT count(*) FROM messages WHERE direction='in' AND pushed=0").fetchone()[0] == 0
+    finally:
+        ledger.close()
+
+
+async def test_depends_on_needs_a_task_the_sender_takes_part_in(tmp_path):
+    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    private = Envelope(type="REQUEST", sender="B:other", to="C:private", task_id="T-private",
+                       body=request_body("synthetic private task", "test"))
+    ledger.queue_outgoing(private)
+    ledger.update_task("T-private", "requester", status="COMPLETED", result_status="complete",
+                       result=result_body("complete", "NOT-FOR-B:desk"))
+    try:
+        with pytest.raises(PermissionError, match="T-private"):
+            await tools.send_request(hub, "B:desk", "C:far", "evaluate", "test", depends_on=["T-private"])
+    finally:
+        ledger.close()
+
+
+async def test_a_withdrawn_held_request_is_never_sent(tmp_path):
+    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    _requested(ledger, "T-dep")
+    try:
+        held = await tools.send_request(hub, "B:desk", "C:far", "evaluate", "test", depends_on=["T-dep"])
+        await tools.cancel_task(hub, "B:desk", held["task_id"], "obsolete")
+        await daemon._on_reply(Envelope(type="RESULT", sender="C:far", to="B:desk", task_id="T-dep",
+                                        body=result_body("complete", "done")))
+        await daemon._release_held()
+        assert ledger.task(held["task_id"], "requester")["status"] == "CANCELLED"
+        assert not _out(ledger, "REQUEST", held["task_id"]) and ledger.held() == []
+    finally:
+        ledger.close()
+
+
+async def test_a_held_request_is_not_chased_and_gets_its_deadline_on_release(tmp_path, monkeypatch):
+    agent, cfg, ledger, hub, daemon = auto_worker_node(tmp_path)
+    cfg.escalate_to = ["B:secretary"]
+
+    async def card(_):
+        return {"online": True, "mode": "worker"}
+    monkeypatch.setattr(hub, "card_or_none", card)
+    _requested(ledger, "T-dep")
+    try:
+        held = await tools.send_request(hub, "B:desk", "C:far", "evaluate", "test", depends_on=["T-dep"],
+                                        deadline="2000-01-01T00:00:00+00:00")
+        quiet = await tools.send_request(hub, "B:desk", "C:far", "evaluate", "test", depends_on=["T-dep"])
+        await daemon._follow_ups()
+        await daemon._chase_etas()
+        assert not [e for e in ledger.outbox() if e.task_id == held["task_id"]]
+        assert "deadline" not in ledger.task(quiet["task_id"], "requester")["request"]     # starts on release
+        await daemon._on_reply(Envelope(type="RESULT", sender="C:far", to="B:desk", task_id="T-dep",
+                                        body=result_body("complete", "done")))
+        await daemon._release_held()
+        [req] = _out(ledger, "REQUEST", quiet["task_id"])
+        assert req.body.get("deadline") and req.body.get("deadline_default")
+    finally:
+        ledger.close()
+
+
+async def test_off_is_refused_without_a_worker_to_take_the_work(tmp_path, session):
+    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    ledger.session_beat("B:desk", session.pid, str(agent.workdir_path), session_pid=session.pid)
+    try:
+        agent.auto_worker = False
+        with pytest.raises(PermissionError, match="worker"):
+            await tools.set_session_taking_work(hub, "B:desk", False)
+        agent.auto_worker = True
+        assert (await tools.set_session_taking_work(hub, "B:desk", False))["session_takes_work"] is False
+    finally:
+        ledger.close()
+
+
+async def test_two_nudges_at_once_send_one(tmp_path, monkeypatch):
+    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    _requested(ledger, "T-nudge")
+    original, entered, both = hub.send, [], asyncio.Event()
+
+    async def yielded_send(env):
+        entered.append(env)
+        if len(entered) == 2:
+            both.set()
+        if len(entered) < 2:                           # give the second nudge every chance to get in too
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(both.wait(), 0.5)
+        return await original(env)
+    monkeypatch.setattr(hub, "send", yielded_send)
+    try:
+        results = await asyncio.gather(tools.nudge(hub, "B:desk", "T-nudge"), tools.nudge(hub, "B:desk", "T-nudge"),
+                                       return_exceptions=True)
+        assert sum(not isinstance(r, Exception) for r in results) == 1
+        assert len([e for e in ledger.outbox() if e.task_id == "T-nudge" and e.body.get("nudge")]) == 1
     finally:
         ledger.close()
