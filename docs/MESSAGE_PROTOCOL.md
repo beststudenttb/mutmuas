@@ -74,6 +74,10 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   (`agentctl ask --leader`, `leader` in a `send` file or in the MCP `send_request`); it is not checked (D-035).
   A worker's queue runs such tasks first, the rest in arrival order; a running task is not stopped. The
   session's inbox lists them first; a watcher's `--peek` keeps arrival order (its cursor is the last row).
+- **A long backlog** (D-074): a session's inbox page holds 50 messages: the leader's first, then the newest. The
+  MCP `inbox` (and `agentctl inbox`) says how many unread there are, how many it listed and how many older ones
+  it left out, with the `before_seq` that pages back to them (`agentctl inbox --before-seq <seq>`). Reading marks
+  only what was listed; a notifier's `since` cursor is unchanged (oldest first).
 - **Delivery log** (D-052): when an owned task gets its RESULT, the owner's node appends the handbook R7.11 line
   to the post's `worker-log.md` (`time | from | task | output / to whom | how | notes`), taking `how` and `notes`
   from the RESULT ('未填' when missing). If the post's `PLAN.md` has a heading naming the task id, that section goes

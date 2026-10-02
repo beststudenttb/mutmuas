@@ -150,25 +150,71 @@ ACTIONABLE = ("REQUEST", "QUESTION", "ANSWER", "RESULT", "BLOCKED", "REJECT", "C
 WAKE = ("REQUEST", "QUESTION", "ANSWER", "BLOCKED", "REJECT", "CANCEL", "ERROR")
 
 
+def _project_view(hub: Hub, me: str) -> tuple[str, str] | None:
+    """A project's session sees only its project's requests (D-072): (its project, the post's default project);
+    the rest go to the worker, so only when there is one. None: the session sees all."""
+    from .node import session_alive
+    addr, agent = hub.local_agent(me)
+    session = hub.ledger.session_of(str(addr))
+    mine = agent.session_project(session["cwd"]) if session and session_alive(session) else None
+    return (mine, agent.default_project) if mine and agent.auto_worker else None
+
+
+def _wake_view(hub: Hub, me: str, types: tuple[str, ...] | None) -> tuple[str | None, bool]:
+    """For the wake/actionable views: the address a baton-passing message names (body.next), and whether the
+    agent is also woken by the results of its own requests."""
+    addr, agent = hub.local_agent(me)
+    next_to = str(addr) if types in (WAKE, ACTIONABLE) else None
+    return next_to, bool(next_to) and agent.wake_on_own_results
+
+
+async def inbox_page(hub: Hub, me: str, peek: bool = False, types: tuple[str, ...] | None = None,
+                     before_seq: int | None = None, leader_before_seq: int | None = None,
+                     limit: int = 50) -> dict[str, Any]:
+    """inbox() for a session looking at its mail, plus what the page left out (D-074): how many unread the cursor
+    covers, how many it lists, how many older ones it did not, and `next`, the cursor for the following page.
+    Paging has two stages (Codex review of 374be94): the leader's mail first (leader_before_seq), then the other
+    mail (before_seq), each newest to oldest, so every message is listed exactly once."""
+    addr, _ = hub.local_agent(me)
+    next_to, own_results = _wake_view(hub, me, types)
+    count = functools.partial(hub.ledger.unseen_count, str(addr), types, next_to=next_to, own_results=own_results,
+                              project=_project_view(hub, me))        # the same view the listing has (D-072)
+    total = count(before_seq=before_seq, leader_before_seq=leader_before_seq)
+    rows = await inbox(hub, me, limit=limit, peek=peek, types=types, before_seq=before_seq,
+                       leader_before_seq=leader_before_seq)
+    page: dict[str, Any] = {"messages": rows, "unread": total, "listed": len(rows),
+                            "older_unlisted": max(0, total - len(rows))}
+    if page["older_unlisted"]:
+        others = [r["seq"] for r in rows if not (r["body"] or {}).get("leader")]
+        leaders = [r["seq"] for r in rows if (r["body"] or {}).get("leader")]
+        if others:
+            page["next"] = {"before_seq": min(others)}
+        elif leaders and count(leader_before_seq=min(leaders), leader_only=True):
+            page["next"] = {"leader_before_seq": min(leaders)}               # more of the leader's mail first
+        else:
+            page["next"] = {"before_seq": hub.ledger.last_rowid() + 1}     # the leader's done: the rest from the top
+        page.update(page["next"])
+        key, value = next(iter(page["next"].items()))
+        page["more"] = (f"{page['older_unlisted']} older unread not listed: inbox({key}={value})"
+                        f" / agentctl inbox --{key.replace('_', '-')} {value}")
+    return page
+
+
 async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, peek: bool = False,
                 wait_s: float | None = None, types: tuple[str, ...] | None = None,
-                since: str | None = None, show: bool = True) -> list[dict[str, Any]]:
+                since: str | None = None, show: bool = True, before_seq: int | None = None,
+                leader_before_seq: int | None = None) -> list[dict[str, Any]]:
     """Unread messages for ``me``. peek: do not mark them read. wait_s: block until one arrives (or timeout).
     types: only these message types (e.g. ACTIONABLE), for both waiting and listing.
     since: only messages that reached this node's ledger after this ISO timestamp (a notifier's cursor,
     so --peek does not report the same unread message again and again).
     show=False: a notifier's read (watch, push), which does not count as showing the mail to the session."""
-    addr, agent = hub.local_agent(me)
-    from .node import session_alive
-    session = hub.ledger.session_of(str(addr))
-    mine = agent.session_project(session["cwd"]) if session and session_alive(session) else None
-    # a project's session: only its requests (D-072); the rest go to the worker, so only when there is one
-    project = (mine, agent.default_project) if mine and agent.auto_worker else None
+    addr, _ = hub.local_agent(me)
+    project = _project_view(hub, me)
     # A message that hands me the baton (body.next == me) needs me as much as a REQUEST does.
     # (a notifier's ACTIONABLE view too: Codex's watch, which then sees a background job's wake-up)
-    next_to = str(addr) if types in (WAKE, ACTIONABLE) else None
-    own_results = bool(next_to) and hub.local_agent(me)[1].wake_on_own_results   # no-stall G2, per agent, off
-                                                                                 # unless the leader turns it on
+    # Results of my own requests too only with wake_on_own_results (no-stall G2, per agent, off by default).
+    next_to, own_results = _wake_view(hub, me, types)
     if wait_s and not include_seen:
         # Messages reach this node's ledger through the daemon, so waiting on the ledger is enough
         # (a second JetStream consumer on the same mailbox would split the messages).
@@ -180,9 +226,11 @@ async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, 
     if include_seen:
         envs = hub.ledger.list_recent_inbound(str(addr), limit, show=show)
     else:
-        # The leader's mail first (D-049). A watcher's peek keeps arrival order: its cursor is the last row.
+        # The leader's mail first (D-049), then the newest (D-074); a page further back (before_seq) is plain
+        # newest-first. A watcher's cursor (since) keeps arrival order: its cursor is the last row.
         envs = hub.ledger.unseen(str(addr), limit, mark=not peek, types=types, since=since, next_to=next_to,
-                                 show=show, own_results=own_results, leader_first=not peek, project=project)
+                                 show=show, own_results=own_results, leader_first=before_seq is None,
+                                 project=project, before_seq=before_seq, leader_before_seq=leader_before_seq)
         if not peek:
             await _read_receipts(hub, str(addr), envs)
     meta = {r[0]: (r[1], r[2], r[3]) for r in hub.ledger.db.execute(
