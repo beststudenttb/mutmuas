@@ -598,16 +598,32 @@ class Ledger:
         return [{"task_id": r["task_id"], "envelope": Envelope.from_json(r["envelope"]),
                  "depends_on": json.loads(r["depends_on"])} for r in self.db.execute("SELECT * FROM held")]
 
-    def release_held(self, env: Envelope) -> None:
-        """Queue the held REQUEST (its task already exists) and forget the hold, in one transaction."""
+    def release_held(self, env: Envelope) -> bool:
+        """Queue the held REQUEST (its task already exists) and forget the hold, in one transaction; not if the
+        hold is gone (withdrawn meanwhile) or its task is closed."""
         with self.tx() as db:
+            row = db.execute("SELECT t.status FROM held h JOIN tasks t ON t.task_id=h.task_id AND t.role='requester'"
+                             " WHERE h.task_id=?", (env.task_id,)).fetchone()
+            if row is None or row["status"] in TERMINAL_STATES:
+                db.execute("DELETE FROM held WHERE task_id=?", (env.task_id,))
+                return False
             self._queue(db, env)                              # its task exists already: only the message is new
             db.execute("UPDATE tasks SET request=?, updated_at=? WHERE task_id=? AND role='requester'",
                        (json.dumps(env.body, ensure_ascii=False), now_iso(), env.task_id))
             db.execute("DELETE FROM held WHERE task_id=?", (env.task_id,))
+        return True
 
-    def drop_held(self, task_id: str) -> None:
-        self.db.execute("DELETE FROM held WHERE task_id=?", (task_id,))
+    def drop_held(self, task_id: str) -> bool:
+        return self.db.execute("DELETE FROM held WHERE task_id=?", (task_id,)).rowcount == 1
+
+    def held_ids(self) -> set[str]:
+        return {r[0] for r in self.db.execute("SELECT task_id FROM held")}
+
+    def claim_nudge(self, task_id: str, now: str, cutoff: str) -> bool:
+        """Take the nudge window of a requested task: True for one caller only (no nudge since `cutoff`)."""
+        cur = self.db.execute("UPDATE tasks SET nudged_at=? WHERE task_id=? AND role='requester'"
+                              " AND (nudged_at IS NULL OR nudged_at < ?)", (now, task_id, cutoff))
+        return cur.rowcount == 1
 
     def brain_session(self, local_agent: str, project: str | None) -> str | None:
         row = self.db.execute("SELECT session_id FROM brains WHERE local_agent=? AND project=?",

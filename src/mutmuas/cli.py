@@ -384,10 +384,7 @@ async def cmd_nudge(args, hub: Hub):
 
 async def cmd_session(args, hub: Hub):
     """`mutmuas <post> off|on` (D-073 batch 2): the session stays online but takes no work (the worker does)."""
-    addr = str(hub.local_agent(_me(args))[0])
-    if not hub.ledger.set_session_accepting(addr, args.action == "on"):
-        raise SystemExit(f"error: {addr} has no session on this node")
-    _print({"address": addr, "session_takes_work": args.action == "on"}, args.json)
+    _print(await tools.set_session_taking_work(hub, _me(args), args.action == "on"), args.json)
 
 
 async def cmd_job(args, hub: Hub):

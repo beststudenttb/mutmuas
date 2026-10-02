@@ -55,19 +55,32 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                        leader: bool = False, project: str | None = None, internal: bool = False,
                        model: str | None = None, depends_on: list[str] | None = None) -> dict[str, Any]:
     default_deadline = None
-    if not deadline and reply != "none" and hub.cfg.default_reply_deadline_s > 0:
+    if not deadline and reply != "none" and not depends_on:      # a held request gets it when it is sent
+        default_deadline = default_reply_deadline(hub, timeout_s)
+    body = request_body(objective, reason, kind=kind, inputs=inputs, expected_outputs=expected_outputs,
+                        constraints=constraints, acceptance_criteria=acceptance_criteria,
+                        deadline=deadline or default_deadline, timeout_s=timeout_s, reply=reply, observers=observers,
+                        deadline_default=bool(default_deadline),  # the owner can tell it from a chosen one
+                        leader=leader)
+    return await _send_request(hub, me, to, body, artifacts=artifacts, parent_task=parent_task, priority=priority,
+                               project=project, internal=internal, model=model, depends_on=depends_on)
+
+
+def default_reply_deadline(hub: Hub, timeout_s: float | None) -> str | None:
+    if hub.cfg.default_reply_deadline_s > 0:
         # Without a deadline nothing ever chases a missing reply (no-stall design, G3): take the node's default,
         # but never before the task's own run limit plus a margin, or a long task would be chased while it
         # still runs normally (C's review of 6a5e2f1).
         wait_s = hub.cfg.default_reply_deadline_s
         if timeout_s:
             wait_s = max(wait_s, timeout_s + DEADLINE_MARGIN_S)
-        default_deadline = (datetime.now(timezone.utc) + timedelta(seconds=wait_s)).isoformat(timespec="seconds")
-    body = request_body(objective, reason, kind=kind, inputs=inputs, expected_outputs=expected_outputs,
-                        constraints=constraints, acceptance_criteria=acceptance_criteria,
-                        deadline=deadline or default_deadline, timeout_s=timeout_s, reply=reply, observers=observers,
-                        deadline_default=bool(default_deadline),  # the owner can tell it from a chosen one
-                        leader=leader)
+        return (datetime.now(timezone.utc) + timedelta(seconds=wait_s)).isoformat(timespec="seconds")
+    return None
+
+
+async def _send_request(hub: Hub, me: str, to: str, body: dict[str, Any], *, artifacts, parent_task, priority,
+                        project, internal, model, depends_on) -> dict[str, Any]:
+    default_deadline = body.get("deadline") if body.get("deadline_default") else None
     if internal:
         # D-073: a brain's own long work, run by its worker (never the session); sent to itself, in its project
         if await hub.resolve(to) != str(hub.local_agent(me)[0]):
@@ -91,6 +104,10 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
         unknown = [d for d in depends_on if hub.ledger.task(d) is None]
         if unknown:
             raise ValueError(f"depends_on names tasks this node does not know: {', '.join(unknown)}")
+        sender = str(hub.local_agent(me)[0])
+        foreign = [d for d in depends_on if not is_participant(hub.ledger, sender, d)]
+        if foreign:                                  # their results travel with it: only one's own tasks (Codex)
+            raise PermissionError(f"depends_on may name only tasks {sender} takes part in, not {', '.join(foreign)}")
         body["depends_on"] = list(depends_on)       # held here until they are done (D-073 batch 2)
     sender = str(hub.local_agent(me)[0])
     for ref in artifacts or []:
@@ -458,15 +475,27 @@ async def nudge(hub: Hub, me: str, task_id: str, note: str = "") -> dict[str, An
         raise KeyError(f"{task_id} was not requested by {me} from this node")
     if task["status"] in TERMINAL_STATES:
         raise ValueError(f"{task_id} is {task['status']}: nothing to nudge")
-    if task.get("nudged_at") and (datetime.now(timezone.utc) - parse_iso(task["nudged_at"])).total_seconds() \
-            < NUDGE_EVERY_S:
-        raise PermissionError(f"{task_id} was nudged at {task['nudged_at']}; at most once in {NUDGE_EVERY_S // 3600} h")
+    now = datetime.now(timezone.utc)
+    if not hub.ledger.claim_nudge(task_id, now.isoformat(), (now - timedelta(seconds=NUDGE_EVERY_S)).isoformat()):
+        # one compare-and-set in the ledger, so two nudges at once (or from two processes) send one (Codex)
+        raise PermissionError(f"{task_id} was nudged at {hub.ledger.task(task_id, 'requester')['nudged_at']}; "
+                              f"at most once in {NUDGE_EVERY_S // 3600} h")
     text = (f"nudge from {me}: {note or 'how is it going?'} Reply with what you are doing, where you are stuck "
             "and a new eta (report_progress eta=…).")
     delivery = await hub.send(Envelope(type="UPDATE", sender=task["local_agent"], to=task["owner"], task_id=task_id,
                                        body={"message": text, "next": task["owner"], "nudge": True}))
-    hub.ledger.update_task(task_id, "requester", nudged_at=datetime.now(timezone.utc).isoformat())
     return {"task_id": task_id, "nudged": task["owner"], "delivery": delivery}
+
+
+async def set_session_taking_work(hub: Hub, me: str, on: bool) -> dict[str, Any]:
+    """`mutmuas <post> off|on`: the session stays online but takes no new work; the worker does. Only a post with
+    a worker can hand its work over (Codex review of b442f2c)."""
+    addr, agent = hub.local_agent(me)
+    if not on and not agent.auto_worker:
+        raise PermissionError(f"{addr} has no worker (auto_worker) to take the work: its session stays on")
+    if not hub.ledger.set_session_accepting(str(addr), on):
+        raise KeyError(f"{addr} has no session on this node")
+    return {"address": str(addr), "session_takes_work": on}
 
 
 async def push_due(hub: Hub, me: str, cursor: int | None) -> tuple[list[dict[str, Any]], int]:
@@ -475,9 +504,14 @@ async def push_due(hub: Hub, me: str, cursor: int | None) -> tuple[list[dict[str
     between: a busy session is not interrupted (§5.4); the Stop hook has it look before it ends a turn.
     Records each push (count, time). Returns (messages, next cursor)."""
     if cursor is None:
-        page = await inbox(hub, me, peek=True, types=WAKE, show=False)       # the newest page (D-074) ...
-        rows = sorted(page, key=lambda r: r["seq"] or 0)                     # ... pushed in arrival order
-        cursor = hub.ledger.last_rowid()
+        # every unread one up to now, oldest first, page by page (not just the newest page: Codex review of
+        # b442f2c); the live cursor starts at the boundary only once all before it are covered
+        boundary, rows, since = hub.ledger.last_rowid(), [], 0
+        while page := [r for r in await inbox(hub, me, peek=True, types=WAKE, since=str(since), limit=200,
+                                              show=False) if (r["seq"] or 0) <= boundary]:
+            rows += page
+            since = page[-1]["seq"]
+        cursor = boundary
     else:
         rows = await inbox(hub, me, peek=True, types=WAKE, since=str(cursor), limit=20, show=False)
         cursor = max([cursor, *(r["seq"] or cursor for r in rows)])
@@ -499,6 +533,10 @@ async def cancel_task(hub: Hub, me: str, task_id: str, reason: str = "") -> dict
     task = hub.ledger.task(task_id, "requester")
     if task is None:
         raise KeyError(f"{task_id} was not requested from this node")
+    if hub.ledger.drop_held(task_id):
+        # never sent (it waited for its dependencies): nobody else knows it, so no CANCEL goes out
+        hub.ledger.update_task(task_id, "requester", status="CANCELLED")
+        return {"task_id": task_id, "delivery": "withdrawn before it was sent"}
     delivery = await hub.reply(me, task_id, "CANCEL", {"reason": reason} if reason else {})
     # The requester has withdrawn; don't keep waiting on an owner that may never answer
     # (offline for good, or never received the REQUEST).

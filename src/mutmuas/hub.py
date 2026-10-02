@@ -398,10 +398,24 @@ class Hub:
         task = self.ledger.task(task_id, "owner")
         if task is None:
             raise KeyError(f"task {task_id} is not owned by this node")
+        if task["status"] in TERMINAL_STATES:
+            return False                                         # finished already: the board is not touched
         agent = self.local_agent(task["owner"])[1]
         workdir = agent.home(agent.project_of(task.get("request"))) if record else None   # its project (D-069)
         board = workdir / "PLAN.md" if workdir else None
-        section = plan_section(board.read_text(), task_id) if board and board.is_file() else None
+        taken: list[str] = []
+
+        def take(text: str) -> str:
+            # this task's section goes into the result and off the board in one locked rewrite, so a line the
+            # node adds meanwhile (收件) is not overwritten (Codex review of b442f2c)
+            found = plan_section(text, task_id)
+            if not found:
+                return text
+            taken.append(found)
+            return drop_plan_section(text, task_id)
+        if board and board.is_file():
+            rewrite_plan(board, take)
+        section = taken[0] if taken else None
         if section:
             outputs = result.get("outputs")
             outputs = outputs if isinstance(outputs, dict) else {"value": outputs} if outputs else {}
@@ -422,8 +436,6 @@ class Hub:
             self.mark_sub_on_plan(task_id, "!" if result["status"] == "failed" else "x", result.get("summary"))
         self.drop_inbox_line(task_id)
         if workdir:
-            if section:
-                board.write_text(drop_plan_section(board.read_text(), task_id))
             workdir.mkdir(parents=True, exist_ok=True)          # as a run does; a post may not have run yet
             with open(workdir / "worker-log.md", "a") as f:
                 f.write(log_line(task, result) + "\n")
