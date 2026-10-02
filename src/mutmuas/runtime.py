@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -394,23 +395,38 @@ async def stop_group(pgid: int, grace_s: float = 5.0) -> bool:
     """Stop a run's whole process group: SIGTERM, then SIGKILL to whatever is left after grace_s. The group is
     waited on, not just its leader: a child that ignores SIGTERM would keep running and keep its locks (a GPU
     flock) (Codex review of 9f39ff0). True once the group is gone."""
-    # macOS answers EPERM for a group of zombies only (dead, not yet reaped by their parent): that is gone too
     for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(pgid, sig)
-        except (ProcessLookupError, PermissionError):
+        if _group_gone(pgid, sig):
             return True
         deadline = time.monotonic() + grace_s
         while time.monotonic() < deadline:
             await asyncio.sleep(0.05)
-            try:
-                os.killpg(pgid, 0)
-            except (ProcessLookupError, PermissionError):
+            if _group_gone(pgid, 0):
                 return True
     return False
 
 
+def _group_gone(pgid: int, sig: int) -> bool:
+    try:
+        os.killpg(pgid, sig)
+        return False
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        # macOS answers EPERM for a group of zombies only (dead, not yet reaped by their parent): gone. A live
+        # member we may not signal is not (Codex re-review of cb77a33)
+        return all(state.startswith("Z") for state in _group_states(pgid))
+
+
+def _group_states(pgid: int) -> list[str]:
+    """The process states (ps STAT) of the members of a process group."""
+    out = subprocess.run(["/bin/ps", "-axo", "pgid=,stat="], capture_output=True, text=True).stdout
+    return [stat for line in out.splitlines() if len(parts := line.split()) == 2 and parts[0] == str(pgid)
+            for stat in [parts[1]]]
+
+
 async def _kill_group(proc: asyncio.subprocess.Process, grace_s: float = 5.0) -> None:
-    await stop_group(proc.pid, grace_s)          # the run starts its own session: its group id is its pid
+    if not await stop_group(proc.pid, grace_s):  # the run starts its own session: its group id is its pid
+        log.error("could not stop process group %s: some of it still runs", proc.pid)
     with contextlib.suppress(asyncio.TimeoutError):
         await asyncio.wait_for(asyncio.shield(proc.wait()), grace_s)

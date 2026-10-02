@@ -940,14 +940,26 @@ class NodeDaemon:
                                                             "out again with the new message")
             self._retry.add(task_id)
 
-    async def _stop_old_worker(self, task: dict[str, Any]) -> bool:
-        """A worker from before a restart still runs this task (not one of ours, so it cannot be cancelled): stop its
-        process group. True if there was one (Codex review of 9f39ff0: pause left it running)."""
-        if not same_process(task.get("runner_pid"), task.get("runner_start")):
-            return False
-        await stop_group(task["runner_pid"])           # started in its own session: group id = pid
-        self._recheck.discard(task["task_id"])
-        return True
+    def _old_worker(self, task: dict[str, Any] | None) -> bool:
+        """A worker from before a restart still runs this task: a verified process, not one of our runs."""
+        return bool(task) and task["task_id"] not in self._running and same_process(task.get("runner_pid"),
+                                                                                    task.get("runner_start"))
+
+    async def _stop_old_worker(self, task: dict[str, Any]) -> str | None:
+        """Stop the process group of a worker from before a restart (not one of ours, so it cannot be cancelled):
+        None if there is none, "stopped", or "failed": then it stays on the heartbeat's recheck and nothing runs
+        next to it (Codex reviews of 9f39ff0 and cb77a33)."""
+        if not self._old_worker(task):
+            return None
+        task_id, pid = task["task_id"], task["runner_pid"]
+        if await stop_group(pid):                      # started in its own session: group id = pid
+            self._recheck.discard(task_id)
+            return "stopped"
+        self._recheck.add(task_id)
+        if self.hub.ledger.notice_once(task_id, f"stop-failed:{pid}"):
+            self._failed("interrupt", f"could not stop the old worker's process group {pid}; checked again each "
+                                      "heartbeat", address=task["owner"], task_id=task_id)
+        return "failed"
 
     async def _check_jobs(self) -> None:
         """Background jobs (D-050): one has ended when its process is gone or its done-file is there. A task whose
@@ -1045,7 +1057,8 @@ class NodeDaemon:
             if task and task["owner"] == env.to and (trusted or env.sender == task["requester"]):
                 return "pause" if env.body.get("pause") else "resume"
             return None
-        if trusted and (env.body.get("interrupt") or env.task_id in self._running):
+        if trusted and (env.body.get("interrupt") or env.task_id in self._running
+                        or (task and task["owner"] == env.to and self._old_worker(task))):
             return "interrupt"
         return None
 
@@ -1060,14 +1073,18 @@ class NodeDaemon:
                 self._note_interrupt(task_id, text)
                 self._interrupted[task_id] = "interrupt"
                 self._running[task_id].cancel()
-            task = hub.ledger.task(env.task_id, "owner")
-            if task and task["owner"] == addr and env.task_id not in self._running and await self._stop_old_worker(task):
-                # a worker from before a restart: stopped, and the task runs again with the message
-                self._note_interrupt(env.task_id, text)
-                hub.ledger.update_task(env.task_id, "owner", attempts=0)
-                await hub.owner_transition(env.task_id, "ACCEPTED", f"interrupted by {env.sender}: the run from "
-                                                                    "before the restart was stopped")
-                self._enqueue(addr, env.task_id)
+            # workers from before a restart: of this task, or of every task of the post (interrupt: true)
+            olds = (hub.ledger.tasks(role="owner", local_agent=addr, statuses=("ACCEPTED", "RUNNING"), limit=None)
+                    if env.body.get("interrupt") else [hub.ledger.task(env.task_id, "owner")])
+            for task in olds:
+                if not (task and task["owner"] == addr and self._old_worker(task)):
+                    continue
+                self._note_interrupt(task["task_id"], text)
+                if await self._stop_old_worker(task) == "stopped":     # failed: rechecked, nothing runs beside it
+                    hub.ledger.update_task(task["task_id"], "owner", attempts=0)
+                    await hub.owner_transition(task["task_id"], "ACCEPTED", f"interrupted by {env.sender}: the run "
+                                                                           "from before the restart was stopped")
+                    self._enqueue(addr, task["task_id"])
             return
         task = hub.ledger.task(env.task_id, "owner")
         if task is None or task["status"] in TERMINAL_STATES:
@@ -1079,12 +1096,15 @@ class NodeDaemon:
             if runner and not runner.done():
                 self._interrupted[env.task_id] = "pause"
                 runner.cancel()
-            else:
-                await self._stop_old_worker(task)
+            elif await self._stop_old_worker(task) != "failed":
                 await hub.owner_transition(env.task_id, "WAITING", f"paused by {env.sender}")
         else:
             hub.ledger.update_task(env.task_id, "owner", paused=0)
             self._note_interrupt(env.task_id, "resumed by " + text)
+            if env.task_id in self._running:
+                # its stopped run is still settling (and still queued): laid out once it has left (Codex re-review
+                # of cb77a33: a resume during the pause's WAITING notice was lost)
+                self._retry.add(env.task_id)
             if hub.ledger.jobs(env.task_id):
                 pass        # still waits on a background job: its end wakes the task
             elif (agent.mode == "worker" or agent.auto_worker) and task.get("runner") != "session":
@@ -1297,6 +1317,13 @@ class NodeDaemon:
         session's task stays the session's."""
         hub, task_id = self.hub, task["task_id"]
         if task.get("runner") == "session":
+            return
+        if task.get("paused"):
+            # paused: its old worker is stopped (again, while it runs); then it waits for resume
+            if await self._stop_old_worker(task) != "failed":
+                self._recheck.discard(task_id)
+                if task["status"] != "WAITING":
+                    await hub.owner_transition(task_id, "WAITING", "paused: its old worker has stopped")
             return
         if task["status"] == "PENDING":
             if task.get("runner") == "worker":

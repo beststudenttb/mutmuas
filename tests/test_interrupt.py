@@ -8,6 +8,7 @@ import asyncio
 import contextlib
 
 import pytest
+import yaml
 from conftest import auto_worker_node, owned_task
 
 from mutmuas import node as node_module
@@ -410,3 +411,133 @@ async def test_a_restart_stops_the_old_worker_of_a_paused_task(tmp_path):
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
         ledger.close()
+
+
+# --------------------------------------------------------------------------- Codex re-review of cb77a33
+
+
+async def test_a_resume_while_the_pause_is_being_published_still_lays_the_task_out(tmp_path, monkeypatch):
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-r", "ACCEPTED", ingest=True)
+    started, publishing, release, runs = asyncio.Event(), asyncio.Event(), asyncio.Event(), []
+
+    class Blocking:
+        def __init__(self, *_):
+            pass
+
+        async def run(self, ctx):
+            runs.append(ctx)
+            started.set()
+            await asyncio.Event().wait()
+    original = hub.try_publish
+
+    async def slow_publish(env):            # the WAITING notice of the pause takes a while to go out
+        if env.task_id == "T-r" and env.type == "UPDATE" and env.body.get("state") == "WAITING":
+            publishing.set()
+            await release.wait()
+        return await original(env)
+    monkeypatch.setattr(hub, "try_publish", slow_publish)
+    monkeypatch.setattr(node_module, "make_runtime", Blocking)
+    daemon._enqueue("B:desk", "T-r")
+    runner = asyncio.create_task(daemon._runner(agent, "B:desk", daemon._queues["B:desk"]))
+    try:
+        await asyncio.wait_for(started.wait(), 3)
+        started.clear()
+        await _deliver(daemon, agent, _update("T-r", pause=True))
+        await asyncio.wait_for(publishing.wait(), 3)
+        await _deliver(daemon, agent, _update("T-r", resume=True))
+        release.set()
+        await asyncio.wait_for(started.wait(), 3)                    # it runs again, once
+        await asyncio.sleep(0.2)
+        assert len(runs) == 2 and not ledger.task("T-r", "owner")["paused"]
+    finally:
+        release.set()
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        ledger.close()
+
+
+@pytest.fixture
+def old_worker(monkeypatch):
+    """A worker from before a restart that still runs (synthetic pid identity); stop_group records, and answers
+    `stops` (True: stopped)."""
+    stopped, gone = [], set()
+    state = {"stops": True}
+
+    async def fake_stop(pgid, grace_s=5.0):
+        stopped.append(pgid)
+        if state["stops"]:
+            gone.add(pgid)
+        return state["stops"]
+    monkeypatch.setattr(node_module, "same_process", lambda pid, start: bool(pid) and pid not in gone)
+    monkeypatch.setattr(node_module, "stop_group", fake_stop)
+    return stopped, state
+
+
+async def test_a_trusted_update_reaches_an_old_worker_after_a_restart(tmp_path, old_worker):
+    stopped, _ = old_worker
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-r", "RUNNING", claim="worker", ingest=True)
+    ledger.set_runner_pid("T-r", 12345, "synthetic-start")
+    try:
+        await daemon.recover()
+        assert "T-r" in daemon._recheck
+        await _deliver(daemon, agent, _update("T-r", sender="B:secretary"))       # about the task it runs
+        assert stopped == [12345] and "T-r" in daemon._queued["B:desk"]
+        assert ledger.task("T-r", "owner")["interrupts"]
+    finally:
+        ledger.close()
+
+
+async def test_a_trusted_interrupt_of_the_post_reaches_its_old_workers(tmp_path, old_worker):
+    stopped, _ = old_worker
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-r", "RUNNING", claim="worker", ingest=True)
+    ledger.set_runner_pid("T-r", 12345, "synthetic-start")
+    try:
+        await daemon.recover()
+        await _deliver(daemon, agent, _update("T-other", sender="B:secretary", interrupt=True))
+        assert stopped == [12345] and "T-r" in daemon._queued["B:desk"]
+    finally:
+        ledger.close()
+
+
+async def test_a_stop_that_fails_is_not_reported_as_done(tmp_path, old_worker):
+    stopped, state = old_worker
+    state["stops"] = False
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-r", "RUNNING", claim="worker", ingest=True)
+    ledger.set_runner_pid("T-r", 12345, "synthetic-start")
+    try:
+        await daemon.recover()
+        await _deliver(daemon, agent, _update("T-r", sender="B:secretary"))
+        assert stopped == [12345] and "T-r" not in daemon._queued["B:desk"]      # no second run next to it
+        await _deliver(daemon, agent, _update("T-r", pause=True))
+        assert stopped == [12345, 12345]                                          # tried again
+        task = ledger.task("T-r", "owner")
+        assert task["paused"] and task["status"] == "RUNNING" and "T-r" in daemon._recheck
+        assert any("could not stop" in f["error"] for f in ledger.failures())
+    finally:
+        ledger.close()
+
+
+async def test_a_group_answering_eperm_is_gone_only_if_all_its_processes_are_zombies(monkeypatch):
+    from mutmuas import runtime
+
+    def eperm(pgid, sig):
+        raise PermissionError(1, "Operation not permitted")
+    monkeypatch.setattr(runtime.os, "killpg", eperm)
+    monkeypatch.setattr(runtime, "_group_states", lambda pgid: ["Z", "S"])
+    assert await runtime.stop_group(4242, grace_s=0.1) is False
+    monkeypatch.setattr(runtime, "_group_states", lambda pgid: ["Z"])
+    assert await runtime.stop_group(4242, grace_s=0.1) is True
+
+
+@pytest.mark.parametrize("value", ["B:secretary", None, ["B"], ["B:secretary", 3]])
+def test_trusted_controllers_must_be_a_list_of_full_addresses(tmp_path, value):
+    from mutmuas.config import ConfigError, load_config
+    path = tmp_path / "node.yaml"
+    path.write_text(yaml.safe_dump({"project": "p", "node": "B", "trusted_controllers": value,
+                                    "agents": [{"id": "desk", "mode": "interactive"}]}))
+    with pytest.raises(ConfigError, match="trusted_controllers"):
+        load_config(path)

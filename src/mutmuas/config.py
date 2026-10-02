@@ -179,6 +179,14 @@ class NatsConfig:
         return self.token or (os.environ.get(self.token_env) if self.token_env else None)
 
 
+def _is_address(text: str) -> bool:
+    try:
+        Address.parse(text)
+    except ValueError:
+        return False
+    return True
+
+
 @dataclass
 class NodeConfig:
     project: str
@@ -211,6 +219,11 @@ class NodeConfig:
     def validate(self) -> NodeConfig:
         check_token(self.project, "project")
         check_token(self.node, "node id")
+        # a control permission: a list of full addresses, or a scalar would authorize by substring (Codex review)
+        if not isinstance(self.trusted_controllers, list) or not all(
+                isinstance(a, str) and _is_address(a) for a in self.trusted_controllers):
+            raise ConfigError(f"trusted_controllers must be a list of addresses like [B:claude-secretary], "
+                              f"not {self.trusted_controllers!r}")
         seen = set()
         for agent in self.agents:
             agent.validate()
