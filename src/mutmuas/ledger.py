@@ -156,7 +156,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 """
 
-TASK_JSON_FIELDS = ("request", "result", "result_draft", "input_refs", "output_refs")
+TASK_JSON_FIELDS = ("request", "result", "result_draft", "input_refs", "output_refs", "interrupts")
 
 
 class Ledger:
@@ -178,6 +178,8 @@ class Ledger:
         self._add_column("tasks", "runner", "TEXT")
         self._add_column("tasks", "runner_pid", "INTEGER")
         self._add_column("tasks", "runner_start", "TEXT")          # the process's start time: pids get reused
+        # D-089: the process group of a run whose stop failed; nothing runs for the task while it lives
+        self._add_column("tasks", "stuck_pgid", "INTEGER")
         # D-066: a job that waits on the task's direct child tasks (parent_task) instead of a process or file
         self._add_column("jobs", "children", "INTEGER NOT NULL DEFAULT 0")
         self._add_column("reminders", "every_s", "REAL")             # repeat after this many seconds
@@ -189,6 +191,9 @@ class Ledger:
         self._add_column("tasks", "eta", "TEXT")
         self._add_column("tasks", "nudged_at", "TEXT")
         self._add_column("sessions", "accepting", "INTEGER NOT NULL DEFAULT 1")
+        # D-089: messages that interrupted a worker's run, for its next run; a task paused until resumed
+        self._add_column("tasks", "interrupts", "TEXT")
+        self._add_column("tasks", "paused", "INTEGER NOT NULL DEFAULT 0")
 
     def _add_column(self, table: str, column: str, decl: str) -> None:
         if column not in [r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")]:

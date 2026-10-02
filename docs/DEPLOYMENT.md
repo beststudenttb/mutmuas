@@ -385,6 +385,27 @@ Known risks (protections removed on purpose; one line each):
   between can be lost (D-073).
 - An internal subtask's worker is kept from mail by its tools, not by the operating system: it runs as the same
   user with the post's Read/Bash, so it could read the node's ledger file directly (D-073).
+- Who may interrupt is decided by the sender address (node.yaml `trusted_controllers`, a list of full addresses,
+  checked at load; D-089). Each node has its own bus credential and may publish only as its own node, but the
+  agents of one node share it: any process on node B can send as B:claude-secretary. The list is a soft
+  boundary between honest senders, not a guard against a forger on that node; that needs per-daemon identity or
+  credentials, or signed relays (not built). The list is a node.yaml change the leader makes. `leader: true`
+  and priority high order work, they grant nothing.
+- Pause and interrupt stop the worker's process group only. A process that left the group (its own setsid), a
+  job on another machine, or a training started elsewhere keeps running: a task shown paused does not mean its
+  GPU training stopped or its GPU locks were released. A group that cannot be shown stopped (still alive after
+  SIGKILL, EPERM from a member that is not a zombie, or a ps answer that cannot be read) is recorded on the task
+  (`stuck_pgid`) and watched as a group, also after its leader has ended; nothing runs for the task while it
+  lives, and the heartbeat lays the task out once it has gone. The node knows a run's process only from the
+  runtime's spawn report, and a group id is checked by its live members (a reused id is not told apart).
+- Pause is not reliable for every open child task: a held child (depends_on) is paused where it waits, and a
+  child its owner node has already recorded is paused there, but a pause that reaches the owner node before the
+  child's REQUEST was handled is dropped (no persistent order or tombstone for unknown tasks).
+- A run stopped while its worktree is made (code tasks) is not known to be safe: the git process may go on and
+  the next run reuses a half-made worktree as it finds it. Not verified; do not count on interrupting a code
+  task at that stage.
+- An interrupted run is killed midway: work it had not saved, and side effects it had started (a training
+  process it launched without add_job), are not undone; the next run is told it was interrupted (D-089).
 - The 收件 section is rewritten by the node under the PLAN lock; an agent editing PLAN.md at the same moment
   without the lock can lose its edit or the node's line (D-073 batch 2).
 - An eta lives on the requester's node only (not on the public card): another node's coordinator sees it only

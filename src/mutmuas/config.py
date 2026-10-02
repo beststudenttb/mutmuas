@@ -179,6 +179,14 @@ class NatsConfig:
         return self.token or (os.environ.get(self.token_env) if self.token_env else None)
 
 
+def _is_address(text: str) -> bool:
+    try:
+        Address.parse(text)
+    except ValueError:
+        return False
+    return True
+
+
 @dataclass
 class NodeConfig:
     project: str
@@ -191,6 +199,9 @@ class NodeConfig:
     message_retention_days: float = 30
     artifact_max_mb: float = 2048         # upload cap for the NATS object store backend
     escalate_to: list[str] = field(default_factory=list)   # copied on follow-ups (overdue reply, session gone)
+    # may interrupt or pause any post of this node (D-089); others pause / resume only what they asked for. A soft
+    # boundary: the nodes share one bus credential (DEPLOYMENT 8a). The leader's word comes relayed by the secretary.
+    trusted_controllers: list[str] = field(default_factory=list)
     coordinators: list[str] = field(default_factory=list)  # may see every task's status layer (visibility.py)
     # A request that needs a reply but names no deadline gets this one (seconds from sending), so the overdue
     # follow-up can chase it (no-stall design, G3). 0 = no default.
@@ -208,6 +219,11 @@ class NodeConfig:
     def validate(self) -> NodeConfig:
         check_token(self.project, "project")
         check_token(self.node, "node id")
+        # a control permission: a list of full addresses, or a scalar would authorize by substring (Codex review)
+        if not isinstance(self.trusted_controllers, list) or not all(
+                isinstance(a, str) and _is_address(a) for a in self.trusted_controllers):
+            raise ConfigError(f"trusted_controllers must be a list of addresses like [B:claude-secretary], "
+                              f"not {self.trusted_controllers!r}")
         seen = set()
         for agent in self.agents:
             agent.validate()
