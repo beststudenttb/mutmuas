@@ -35,7 +35,7 @@ from . import __version__
 from .bus import Names
 from .config import AgentConfig, NodeConfig
 from .hub import Hub
-from .ids import Address, now_iso, parse_iso
+from .ids import Address, InvalidAddress, check_token, now_iso, parse_iso
 from .protocol import (OPEN_STATES, REQUEST_KINDS, TERMINAL_STATES, ArtifactRef, Envelope, ProtocolError,
                        reply_required, result_body, task_state_for_result)
 from .runtime import TaskContext, make_runtime
@@ -544,7 +544,7 @@ class NodeDaemon:
                                        body={"reason": denial})
             return "rejected"
         await hub.publish_task_record(env.task_id)
-        if agent.mode == "worker" or (agent.auto_worker and not session_present(hub.ledger, env.to)):
+        if agent.mode == "worker" or (agent.auto_worker and not self._session_takes(agent, env.to, env.task_id)):
             await self._accept(env.task_id)
             self._enqueue(env.to, env.task_id)
             await self._notify(agent, env.to, env.task_id,      # status layer only: the lead is no participant
@@ -562,7 +562,28 @@ class NodeDaemon:
         needed = REQUEST_KINDS[env.body.get("kind", "query")]
         if not agent.has(needed):
             return f"permission denied: {env.to} lacks {needed} required for kind={env.body.get('kind', 'query')}"
+        if project := agent.project_of(env.body):
+            try:
+                check_token(str(project), "project")
+            except InvalidAddress as e:
+                return f"refused: {e}"
+            if agent.project_entry(project) is None:
+                return (f"project {project} is not set up on {env.to}: {agent.home(project)} is not a directory "
+                        "(by that exact name, not a link) under the post directory; run post-init for it first, "
+                        "or send without project")
         return None
+
+    def _session_takes(self, agent: AgentConfig, addr: str, task_id: str) -> str | None:
+        """auto_worker: why the session, not the worker, takes this task (None: the worker may run it). A session
+        started in a project directory takes only that project's work; one in the post directory takes all
+        (D-072). The leader's session still comes first within its project (D-032a)."""
+        ledger = self.hub.ledger
+        present = session_present(ledger, addr)
+        mine = agent.session_project((ledger.session_of(addr) or {}).get("cwd")) if present else None
+        if mine is None:
+            return present
+        task = ledger.task(task_id, "owner")
+        return present if agent.project_of((task or {}).get("request")) == mine else None
 
     async def _accept(self, task_id: str) -> None:
         await self.hub.owner_transition(task_id, "ACCEPTED", "accepted into queue", msg_type="ACK",
@@ -668,7 +689,7 @@ class NodeDaemon:
             # the leader's session is there, a task that has not started yet is his to decide (D-032a).
             addr = task["owner"]
             refused = hub.ledger.claim_task(task_id, "worker", ("ACCEPTED", "RUNNING"),
-                                            refuse_if=lambda: session_present(hub.ledger, addr))
+                                            refuse_if=lambda: self._session_takes(agent, addr, task_id))
             if refused:
                 if "session" in refused and task["status"] == "ACCEPTED":
                     # Release the claim first: a stop between the two steps leaves ACCEPTED + no runner, which
@@ -999,14 +1020,16 @@ class NodeDaemon:
         return True
 
     async def _auto_dispatch(self) -> None:
-        """auto_worker agents with no session (past the grace period): run the tasks still waiting for one."""
+        """auto_worker agents: run the waiting tasks no session takes (none there past the grace period, or one
+        working on another project)."""
         hub = self.hub
         for agent in self.cfg.agents:
             addr = str(Address(self.cfg.node, agent.id))
-            if not agent.auto_worker or session_present(hub.ledger, addr):
+            if not agent.auto_worker:
                 continue
             for task in hub.ledger.tasks(role="owner", local_agent=addr, statuses=("PENDING",), limit=None):
-                if task.get("runner") is None and task["task_id"] not in self._queued[addr]:
+                if (task.get("runner") is None and task["task_id"] not in self._queued[addr]
+                        and not self._session_takes(agent, addr, task["task_id"])):
                     await self._accept(task["task_id"])
                     self._enqueue(addr, task["task_id"])
 

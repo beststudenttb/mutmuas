@@ -354,7 +354,8 @@ class Hub:
         task = self.ledger.task(task_id, "owner")
         if task is None:
             raise KeyError(f"task {task_id} is not owned by this node")
-        workdir = self.local_agent(task["owner"])[1].workdir_path if record else None
+        agent = self.local_agent(task["owner"])[1]
+        workdir = agent.home(agent.project_of(task.get("request"))) if record else None   # its project (D-069)
         board = workdir / "PLAN.md" if workdir else None
         section = plan_section(board.read_text(), task_id) if board and board.is_file() else None
         if section:

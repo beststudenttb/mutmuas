@@ -270,10 +270,19 @@ class Ledger:
             return f" AND ({in_types} OR json_extract(envelope, '$.body.next') = ?)", (*types, next_to)
         return f" AND {in_types}", tuple(types)
 
+    @staticmethod
+    def _project_filter(project: tuple[str, str] | None) -> tuple[str, tuple]:
+        """project = (the session's project, the post's default project): leave out requests of other projects,
+        which the worker takes (D-072). A request without `project` belongs to the default project."""
+        if not project:
+            return "", ()
+        return (" AND NOT (type = 'REQUEST' AND COALESCE(json_extract(envelope, '$.body.project'), ?) IS NOT ?)",
+                (project[1], project[0]))
+
     def unseen(self, local_agent: str, limit: int = 50, mark: bool = True,
                types: tuple[str, ...] | None = None, since: str | None = None,
                next_to: str | None = None, show: bool = True, own_results: bool = False,
-               leader_first: bool = False) -> list[Envelope]:
+               leader_first: bool = False, project: tuple[str, str] | None = None) -> list[Envelope]:
         """Inbound messages an interactive agent has not looked at yet.
         leader_first: the leader's mail (body.leader, D-049) before the rest, each in arrival order; ordered
         before the limit, so it is on the page however long the backlog is.
@@ -283,6 +292,8 @@ class Ledger:
         """
         with self.tx() as db:
             type_sql, type_args = self._type_filter(types, next_to, own_results)
+            project_sql, project_args = self._project_filter(project)
+            type_sql, type_args = type_sql + project_sql, (*type_args, *project_args)
             # a digit-only `since` is a rowid cursor (monotonic; timestamps collide within a millisecond)
             by_row = since is not None and str(since).isdigit()
             since_sql = (" AND rowid > ?" if by_row else " AND created_at > ?") if since else ""
@@ -303,14 +314,16 @@ class Ledger:
         self.db.execute("UPDATE messages SET seen=1 WHERE direction='in' AND task_id=?", (task_id,))
 
     def unseen_count(self, local_agent: str, types: tuple[str, ...] | None = None, since: str | None = None,
-                     next_to: str | None = None, own_results: bool = False) -> int:
+                     next_to: str | None = None, own_results: bool = False,
+                     project: tuple[str, str] | None = None) -> int:
         sql = "SELECT COUNT(*) FROM messages WHERE direction='in' AND seen=0 AND state='handled' AND local_agent=?"
         args: list[Any] = [local_agent]
         if since:
             sql += " AND rowid > ?" if str(since).isdigit() else " AND created_at > ?"
             args.append(int(since) if str(since).isdigit() else since)
         type_sql, type_args = self._type_filter(types, next_to, own_results)
-        return self.db.execute(sql + type_sql, [*args, *type_args]).fetchone()[0]
+        project_sql, project_args = self._project_filter(project)
+        return self.db.execute(sql + type_sql + project_sql, [*args, *type_args, *project_args]).fetchone()[0]
 
     def last_rowid(self) -> int:
         """The newest message's rowid: a cursor meaning "from now on"."""

@@ -39,6 +39,8 @@ class AgentConfig:
     model: str = ""
     description: str = ""
     workdir: str = "."
+    default_project: str = ""            # D-069: a request without `project` belongs to this one ("" = the post
+                                         # directory itself, as before projects existed)
     repo: str = ""                       # git repo for kind=code tasks (each task gets its own worktree)
     auto_worker: bool = False            # interactive only: while no session holds the agent, the daemon runs its
                                          # tasks as a worker (runtime); the leader's session always comes first
@@ -82,6 +84,8 @@ class AgentConfig:
             raise ConfigError(f"agent {self.id}: code_mode must be one of {CODE_MODES}")
         if self.code_mode == "direct" and not self.code_dirs:
             raise ConfigError(f"agent {self.id}: code_mode direct needs code_dirs (the project code to edit)")
+        if self.default_project:
+            check_token(self.default_project, "default_project")
         bad = [p for p in self.permissions if p not in PERMISSIONS]
         if bad:
             raise ConfigError(f"agent {self.id}: unknown permission(s) {bad}; known: {PERMISSIONS}")
@@ -95,6 +99,49 @@ class AgentConfig:
     @property
     def workdir_path(self) -> Path:
         return Path(os.path.expandvars(self.workdir)).expanduser().resolve()
+
+    def project_of(self, body: dict[str, Any] | None) -> str | None:
+        """The project a request belongs to (D-069): its own `project`, else this post's default_project."""
+        return (body or {}).get("project") or self.default_project or None
+
+    def home(self, project: str | None) -> Path:
+        """Where work for `project` happens: work/<post>/<project>/, or the post directory without a project."""
+        return self.workdir_path / project if project else self.workdir_path
+
+    def project_entry(self, name: str) -> str | None:
+        """`name` if it is exactly the on-disk name of a real directory (not a link) right under the post
+        directory, else None. One identity for a project everywhere (Codex review of fe64cee): a case variant on a
+        case-insensitive file system or a link is not a second name for it."""
+        home = self.workdir_path
+        try:
+            entries = os.listdir(home)
+        except OSError:
+            return None
+        path = home / name
+        return name if name in entries and path.is_dir() and not path.is_symlink() else None
+
+    def session_project(self, cwd: str | None) -> str | None:
+        """The project a session works on (D-072): the real directory right under the post directory that its cwd
+        is in, by its on-disk name, found by file identity (samefile), so a case variant or a link into it counts
+        as that directory. None for a session in the post directory itself (the coordinator: it takes all work)
+        or outside it. memory/ and hidden directories are not projects."""
+        if not cwd:
+            return None
+        home = self.workdir_path
+        try:
+            here = Path(os.path.realpath(cwd))
+            if os.path.samefile(here, home):
+                return None
+            top = next((a for a in here.parents if os.path.samefile(a.parent, home)), None)
+            if top is None and os.path.samefile(here.parent, home):
+                top = here
+            if top is None:
+                return None
+            name = next((e for e in os.listdir(home) if not (home / e).is_symlink() and (home / e).is_dir()
+                         and os.path.samefile(home / e, top)), None)
+        except OSError:
+            return None
+        return None if name is None or name == "memory" or name.startswith(".") else name
 
     @property
     def copies_code(self) -> bool:

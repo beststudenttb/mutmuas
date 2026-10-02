@@ -45,8 +45,13 @@ class TaskContext:
     jobs: list[dict[str, Any]] = field(default_factory=list)   # background jobs of this task that have ended
 
     @property
+    def home(self) -> Path:
+        """The directory of this task's project (D-069), or the post directory without one."""
+        return self.agent.home(self.agent.project_of(self.request.body))
+
+    @property
     def cwd(self) -> Path:
-        return self.workdir or self.agent.workdir_path
+        return self.workdir or self.home
 
     def allows(self, permission: str) -> bool:
         """Tools follow the post's permissions alone, whatever the kind (D-064): a query on a post that may write
@@ -163,7 +168,7 @@ def llm_start_dir(ctx: TaskContext) -> Path:
         repo = Path(os.path.realpath(Path(os.path.expandvars(ctx.agent.repo)).expanduser()))
         if Path(os.path.realpath(ctx.agent.workdir_path)).is_relative_to(repo):
             return ctx.workdir
-    return ctx.agent.workdir_path
+    return ctx.home
 
 
 def extra_dirs(ctx: TaskContext) -> list[Path]:

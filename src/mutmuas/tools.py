@@ -51,7 +51,7 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                        deadline: str | None = None, artifacts: list[dict] | None = None,
                        parent_task: str | None = None, priority: str = "normal",
                        reply: str | None = None, observers: list[str] | None = None,
-                       leader: bool = False) -> dict[str, Any]:
+                       leader: bool = False, project: str | None = None) -> dict[str, Any]:
     default_deadline = None
     if not deadline and reply != "none" and hub.cfg.default_reply_deadline_s > 0:
         # Without a deadline nothing ever chases a missing reply (no-stall design, G3): take the node's default,
@@ -66,6 +66,8 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                         deadline=deadline or default_deadline, timeout_s=timeout_s, reply=reply, observers=observers,
                         deadline_default=bool(default_deadline),  # the owner can tell it from a chosen one
                         leader=leader)
+    if project:
+        body["project"] = project                    # D-069: the recipient routes it to that project's directory
     sender = str(hub.local_agent(me)[0])
     for ref in artifacts or []:
         # Attaching grants the recipient access (visibility.artifact_visible), so only what the sender may see
@@ -137,7 +139,12 @@ async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, 
     since: only messages that reached this node's ledger after this ISO timestamp (a notifier's cursor,
     so --peek does not report the same unread message again and again).
     show=False: a notifier's read (watch, push), which does not count as showing the mail to the session."""
-    addr, _ = hub.local_agent(me)
+    addr, agent = hub.local_agent(me)
+    from .node import session_alive
+    session = hub.ledger.session_of(str(addr))
+    mine = agent.session_project(session["cwd"]) if session and session_alive(session) else None
+    # a project's session: only its requests (D-072); the rest go to the worker, so only when there is one
+    project = (mine, agent.default_project) if mine and agent.auto_worker else None
     # A message that hands me the baton (body.next == me) needs me as much as a REQUEST does.
     # (a notifier's ACTIONABLE view too: Codex's watch, which then sees a background job's wake-up)
     next_to = str(addr) if types in (WAKE, ACTIONABLE) else None
@@ -147,7 +154,8 @@ async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, 
         # Messages reach this node's ledger through the daemon, so waiting on the ledger is enough
         # (a second JetStream consumer on the same mailbox would split the messages).
         deadline = asyncio.get_running_loop().time() + wait_s
-        while (hub.ledger.unseen_count(str(addr), types, since, next_to=next_to, own_results=own_results) == 0
+        while (hub.ledger.unseen_count(str(addr), types, since, next_to=next_to, own_results=own_results,
+                                       project=project) == 0
                and asyncio.get_running_loop().time() < deadline):
             await asyncio.sleep(0.5)
     if include_seen:
@@ -155,7 +163,7 @@ async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, 
     else:
         # The leader's mail first (D-049). A watcher's peek keeps arrival order: its cursor is the last row.
         envs = hub.ledger.unseen(str(addr), limit, mark=not peek, types=types, since=since, next_to=next_to,
-                                 show=show, own_results=own_results, leader_first=not peek)
+                                 show=show, own_results=own_results, leader_first=not peek, project=project)
         if not peek:
             await _read_receipts(hub, str(addr), envs)
     meta = {r[0]: (r[1], r[2], r[3]) for r in hub.ledger.db.execute(
