@@ -49,6 +49,7 @@ log = logging.getLogger(__name__)
 AUTO_WORKER_GRACE_S = 120
 SESSION_STALE_S = 50          # the session's MCP process beats every 15 s (mcp_server.HEARTBEAT_S)
 FOLLOW_UP_EVERY_S = 30
+ETA_REPLY_GRACE_S = 3600     # 催办 (D-076): after a chase, how long to wait for a new eta before telling the requester
 
 
 def _pid_alive(pid: int) -> bool:
@@ -414,6 +415,8 @@ class NodeDaemon:
             return self._on_observer_copy(env)
         if env.type == "UPDATE" and env.body.get("observers_add"):
             return self._on_observers_added(env)
+        if env.type == "UPDATE" and env.body.get("nudge"):
+            self._on_nudge(agent, env)                   # then kept in the inbox below: it wakes the session
         if env.type == "REQUEST":
             return await self._on_request(agent, env)
         elif env.type == "CANCEL":
@@ -552,9 +555,13 @@ class NodeDaemon:
                                        body={"reason": denial})
             return "rejected"
         await hub.publish_task_record(env.task_id)
+        position = None
+        if not env.body.get("internal"):              # a sub has its own line on its brain's plan (D-073)
+            hub.add_inbox_line(hub.ledger.task(env.task_id, "owner"))
+            position = self._position(env.to, env.task_id)
         if (agent.mode == "worker" or env.body.get("internal")
                 or (agent.auto_worker and not self._session_takes(agent, env.to, env.task_id))):
-            await self._accept(env.task_id)
+            await self._accept(env.task_id, position)
             self._enqueue(env.to, env.task_id)
             await self._notify(agent, env.to, env.task_id,      # status layer only: the lead is no participant
                                f"FYI: {env.to} accepted {env.task_id} from {env.sender}: "
@@ -563,7 +570,21 @@ class NodeDaemon:
             # Interactive agents accept explicitly (accept_task). Tell the requester it arrived meanwhile,
             # so "delivered but not picked up yet" is distinguishable from "lost".
             await hub.reply(env.to, env.task_id, "UPDATE", {
-                "state": "PENDING", "message": f"delivered to the inbox of {env.to}; waiting to be accepted"})
+                "state": "PENDING", "position": position,
+                "message": f"delivered to the inbox of {env.to}; waiting to be accepted; {position} in the queue "
+                           "(an estimate: the leader's work goes first)"})
+
+    def _position(self, addr: str, task_id: str) -> int:
+        """Where a task stands in its owner's queue (an estimate, spec v1.1 §3.1): the open work ahead of it and
+        itself; the leader's work goes first (D-049)."""
+        task = self.hub.ledger.task(task_id, "owner")
+        mine = bool((task.get("request") or {}).get("leader"))
+        ahead = [t for t in self.hub.ledger.tasks(role="owner", local_agent=addr,
+                                                  statuses=("PENDING", "ACCEPTED", "RUNNING"), limit=None)
+                 if not (t.get("request") or {}).get("internal") and t["task_id"] != task_id
+                 and t["created_at"] <= task["created_at"]
+                 and (not mine or (t.get("request") or {}).get("leader"))]
+        return len(ahead) + 1
 
     def _check_policy(self, agent: AgentConfig, env: Envelope) -> str | None:
         if not agent.accepts(env.sender):
@@ -598,15 +619,18 @@ class NodeDaemon:
         (D-072). The leader's session still comes first within its project (D-032a)."""
         ledger = self.hub.ledger
         present = session_present(ledger, addr)
+        if present and not (ledger.session_of(addr) or {}).get("accepting", 1):
+            return None                       # online but switched off (`mutmuas <post> off`): the worker takes it
         mine = agent.session_project((ledger.session_of(addr) or {}).get("cwd")) if present else None
         if mine is None:
             return present
         task = ledger.task(task_id, "owner")
         return present if agent.project_of((task or {}).get("request")) == mine else None
 
-    async def _accept(self, task_id: str) -> None:
-        await self.hub.owner_transition(task_id, "ACCEPTED", "accepted into queue", msg_type="ACK",
-                                        body={"state": "ACCEPTED", "message": "accepted into queue"})
+    async def _accept(self, task_id: str, position: int | None = None) -> None:
+        message = "accepted into queue" + (f"; {position} in the queue (an estimate)" if position else "")
+        await self.hub.owner_transition(task_id, "ACCEPTED", message, msg_type="ACK",
+                                        body={"state": "ACCEPTED", "message": message, "position": position})
 
     async def _on_cancel(self, env: Envelope) -> str | None:
         task = self.hub.ledger.task(env.task_id, "owner")
@@ -650,6 +674,8 @@ class NodeDaemon:
                         task["owner"])
             return "rejected"
         fields: dict[str, Any] = {"last_message": env.message_id}
+        if env.body.get("eta"):
+            fields["eta"] = env.body["eta"]          # the owner's estimate (D-076): chased once it passes
         status = REQUESTER_TRANSITIONS.get(env.type)
         if env.type == "UPDATE":
             status = env.body.get("state")
@@ -868,6 +894,8 @@ class NodeDaemon:
                 if asyncio.get_running_loop().time() - last_follow_up >= FOLLOW_UP_EVERY_S:
                     last_follow_up = asyncio.get_running_loop().time()
                     await self._follow_ups()
+                    await self._chase_etas()
+                await self._release_held()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -952,6 +980,85 @@ class NodeDaemon:
         wake = Envelope(type="UPDATE", sender=owner, to=owner, task_id=task_id, body={"message": text, "next": owner})
         hub.ledger.ingest(wake)
         hub.ledger.mark_handled(wake.message_id)
+
+    def _on_nudge(self, agent: AgentConfig, env: Envelope) -> None:
+        """A nudge from the requester (or an eta chase): a worker's task that is neither running nor queued is
+        laid out again (a stalled worker); a session is woken by the message itself (next)."""
+        task = self.hub.ledger.task(env.task_id, "owner")
+        if (not task or env.sender != task["requester"] or task["status"] not in ("ACCEPTED", "RUNNING")
+                or not (agent.mode == "worker" or agent.auto_worker) or task.get("runner") == "session"):
+            return
+        if env.task_id in self._queued.get(task["owner"], set()) or same_process(task.get("runner_pid"),
+                                                                                   task.get("runner_start")):
+            return
+        self._enqueue(task["owner"], env.task_id)
+
+    async def _chase_etas(self) -> None:
+        """催办 (D-076): a request of ours whose owner's eta has passed gets one reminder that asks for a new eta;
+        no answer within ETA_REPLY_GRACE_S: the requester is told (and the escalation addresses, e.g. the
+        secretary). A new eta starts over. Work that waits on a job or on subtasks (WAITING) or on the requester
+        (BLOCKED) is not chased; an owner whose node is offline is not chased either (the clock waits); a session
+        that looks stuck (gone, and no worker to take over) is reported, not chased."""
+        hub = self.hub
+        now = datetime.now(timezone.utc)
+        for t in hub.ledger.tasks(role="requester", statuses=OPEN_STATES, limit=None):
+            eta = t.get("eta")
+            if not eta or t["status"] in ("WAITING", "BLOCKED"):
+                continue
+            with contextlib.suppress(TypeError, ValueError):
+                if parse_iso(eta) > now:
+                    continue
+            card = await hub.card_or_none(t["owner"])
+            if not (card and card.get("online")):
+                continue
+            requester = t["local_agent"]
+            stuck = card.get("mode") == "interactive" and not card.get("auto_worker") and card.get("session") != "online"
+            if stuck:
+                if hub.ledger.notice_once(t["task_id"], f"stuck:{eta}"):
+                    await self._follow_up(t, "stuck", f"{t['owner']}'s session is gone and nothing else takes "
+                                                      f"{t['task_id']} (eta {eta} passed)")
+                continue
+            if hub.ledger.notice_once(t["task_id"], f"eta:{eta}"):
+                await hub.send(Envelope(type="UPDATE", sender=requester, to=t["owner"], task_id=t["task_id"], body={
+                    "message": f"eta {eta} has passed for {t['task_id']}: reply with a new eta (report_progress "
+                               "eta=…) and what you are doing or where you are stuck", "next": t["owner"],
+                    "nudge": True, "chase": eta}))
+                continue
+            sent = hub.ledger.db.execute("SELECT created_at FROM notices WHERE task_id=? AND reason=?",
+                                         (t["task_id"], f"eta:{eta}")).fetchone()
+            if (sent and (now - parse_iso(sent["created_at"])).total_seconds() >= ETA_REPLY_GRACE_S
+                    and hub.ledger.notice_once(t["task_id"], f"eta-silent:{eta}")):
+                await self._follow_up(t, "eta_silent", f"{t['owner']} gave no new eta after its eta {eta} passed "
+                                                       f"for {t['task_id']}: wait, or hand it to someone else")
+
+    async def _release_held(self) -> None:
+        """Requests held until the tasks they depend on are done (depends_on): sent with those results and their
+        artifacts once all are done; if one failed, was refused or withdrawn, not sent: the requester is told."""
+        hub = self.hub
+        for held in hub.ledger.held():
+            deps = {d: hub.ledger.task(d) for d in held["depends_on"]}
+            failed = [d for d, t in deps.items() if t and t["status"] in TERMINAL_STATES
+                      and (t["status"] != "COMPLETED" or t.get("result_status") == "failed")]
+            env = held["envelope"]
+            if failed:
+                hub.ledger.drop_held(env.task_id)
+                text = f"{env.task_id} was not sent: it depends on {', '.join(failed)}, which did not complete"
+                hub.ledger.update_task(env.task_id, "requester", status="FAILED", result_status="failed",
+                                       result=result_body("failed", text))
+                note = Envelope(type="UPDATE", sender=env.sender, to=env.sender, task_id=env.task_id,
+                                body={"message": text, "next": env.sender})
+                hub.ledger.ingest(note)
+                hub.ledger.mark_handled(note.message_id)
+                continue
+            if not all(t and t["status"] == "COMPLETED" for t in deps.values()):
+                continue
+            env.body["dependencies"] = [{"task_id": d, "owner": t["owner"], "status": t.get("result_status"),
+                                         "summary": short((t.get("result") or {}).get("summary") or "", 300)}
+                                        for d, t in deps.items()]
+            env.artifacts = [*env.artifacts, *(ArtifactRef.from_dict(a) for t in deps.values()
+                                               for a in t.get("output_refs") or [])]
+            hub.ledger.release_held(env)
+            await hub.try_publish(env)
 
     async def _expire_brains(self) -> None:
         """End a brain batch (D-073) after brain_batch_idle_s without a brain run, unless one of the post's subs

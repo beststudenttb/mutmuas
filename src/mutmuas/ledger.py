@@ -116,6 +116,14 @@ CREATE TABLE IF NOT EXISTS failures (
     error           TEXT NOT NULL            -- "<ExceptionType>: <message>"
 );
 
+-- Requests held by their sender until the tasks they depend on are done (D-073 batch 2, depends_on).
+CREATE TABLE IF NOT EXISTS held (
+    task_id         TEXT PRIMARY KEY,
+    envelope        TEXT NOT NULL,
+    depends_on      TEXT NOT NULL,           -- json list of task ids
+    created_at      TEXT NOT NULL
+);
+
 -- A post's brain batch (D-073): worker runs of (agent, project) resume this conversation until an idle spell.
 CREATE TABLE IF NOT EXISTS brains (
     local_agent     TEXT NOT NULL,
@@ -167,6 +175,13 @@ class Ledger:
         self._add_column("jobs", "children", "INTEGER NOT NULL DEFAULT 0")
         self._add_column("reminders", "every_s", "REAL")             # repeat after this many seconds
         self._add_column("reminders", "cancelled_at", "TEXT")
+        # D-073 batch 2: push state per message (spec §5.1), the owner's eta (D-076), the last nudge (requester
+        # side), and a session that is online but takes no work (`off`)
+        self._add_column("messages", "pushed", "INTEGER NOT NULL DEFAULT 0")
+        self._add_column("messages", "pushed_at", "TEXT")
+        self._add_column("tasks", "eta", "TEXT")
+        self._add_column("tasks", "nudged_at", "TEXT")
+        self._add_column("sessions", "accepting", "INTEGER NOT NULL DEFAULT 1")
 
     def _add_column(self, table: str, column: str, decl: str) -> None:
         if column not in [r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")]:
@@ -552,6 +567,47 @@ class Ledger:
                               " children) VALUES (?,?,?,?,?,?,?,?,?)",
                               (task_id, owner, pid, pid_start, done_file, log, note, now_iso(), int(children)))
         return cur.lastrowid
+
+    def mark_pushed(self, message_ids: list[str]) -> None:
+        now = now_iso()
+        self.db.executemany("UPDATE messages SET pushed=pushed+1, pushed_at=? WHERE message_id=? AND direction='in'",
+                            [(now, m) for m in message_ids])
+
+    def push_state(self, local_agent: str) -> dict[str, Any]:
+        """The oldest unread message's arrival and the last push into the session (spec §5.1)."""
+        row = self.db.execute("SELECT MIN(created_at) oldest, MAX(pushed_at) last_push FROM messages"
+                              " WHERE direction='in' AND local_agent=? AND state='handled' AND seen=0",
+                              (local_agent,)).fetchone()
+        last = self.db.execute("SELECT MAX(pushed_at) FROM messages WHERE direction='in' AND local_agent=?",
+                               (local_agent,)).fetchone()[0]
+        return {"oldest_unread_at": row["oldest"], "last_push_at": last}
+
+    def set_session_accepting(self, local_agent: str, accepting: bool) -> bool:
+        cur = self.db.execute("UPDATE sessions SET accepting=? WHERE local_agent=?", (int(accepting), local_agent))
+        return cur.rowcount == 1
+
+    def hold_request(self, env: Envelope, depends_on: list[str]) -> None:
+        """A REQUEST that waits for other tasks (depends_on): its requester-side task exists, the message is not
+        queued yet."""
+        with self.tx() as db:
+            self._insert_task(db, env, role="requester", local_agent=env.sender, status="PENDING")
+            db.execute("INSERT INTO held (task_id, envelope, depends_on, created_at) VALUES (?,?,?,?)",
+                       (env.task_id, env.to_json().decode(), json.dumps(depends_on), now_iso()))
+
+    def held(self) -> list[dict[str, Any]]:
+        return [{"task_id": r["task_id"], "envelope": Envelope.from_json(r["envelope"]),
+                 "depends_on": json.loads(r["depends_on"])} for r in self.db.execute("SELECT * FROM held")]
+
+    def release_held(self, env: Envelope) -> None:
+        """Queue the held REQUEST (its task already exists) and forget the hold, in one transaction."""
+        with self.tx() as db:
+            self._queue(db, env)                              # its task exists already: only the message is new
+            db.execute("UPDATE tasks SET request=?, updated_at=? WHERE task_id=? AND role='requester'",
+                       (json.dumps(env.body, ensure_ascii=False), now_iso(), env.task_id))
+            db.execute("DELETE FROM held WHERE task_id=?", (env.task_id,))
+
+    def drop_held(self, task_id: str) -> None:
+        self.db.execute("DELETE FROM held WHERE task_id=?", (task_id,))
 
     def brain_session(self, local_agent: str, project: str | None) -> str | None:
         row = self.db.execute("SELECT session_id FROM brains WHERE local_agent=? AND project=?",

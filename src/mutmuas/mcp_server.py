@@ -140,7 +140,7 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
             await io["write"].send(SessionMessage(message=JSONRPCNotification(
                 jsonrpc="2.0", method=CHANNEL, params=params)))
 
-    async def push(hub: Hub, addr: str, cursor: int) -> None:
+    async def push(hub: Hub, addr: str, cursor: int | None) -> None:
         """Wake the session on new mail that needs it (Claude Code channels). Never marks anything read."""
         await asyncio.sleep(PUSH_POLL_S)          # let the handshake finish before the first notification
 
@@ -156,10 +156,10 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
                 if disk != state["code"] and not state.get("stale_told"):
                     state["stale_told"] = True
                     await send(stale_notice(state["code"], disk))
-            for m in await tools.inbox(hub, addr, peek=True, types=tools.WAKE, since=str(cursor), limit=20,
-                                       show=False):
-                cursor = max(cursor, m["seq"] or cursor)
-                if not state.get("duplicate_of"):          # only the session holding the agent is woken
+            if not state.get("duplicate_of"):              # only the session holding the agent is woken
+                # first round: every unread message that needs the session; then each new one once (spec §5.1)
+                rows, cursor = await tools.push_due(hub, addr, cursor)
+                for m in rows:
                     await send(channel_notice(m))
             await asyncio.sleep(PUSH_POLL_S)
 
@@ -173,7 +173,7 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         if holds_session(hub.local_agent(me)[1], worker_task):
             background.append(asyncio.create_task(heartbeat(hub, state["me"])))
             if channel:
-                background.append(asyncio.create_task(push(hub, state["me"], hub.ledger.last_rowid())))
+                background.append(asyncio.create_task(push(hub, state["me"], None)))
         try:
             yield {}
         finally:
@@ -240,11 +240,13 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
                            timeout_s: float | None = None, artifacts: list[dict[str, Any]] | None = None,
                            priority: str = "normal", reply: str = "required", deadline: str | None = None,
                            observers: list[str] | None = None, leader: bool = False,
-                           project: str | None = None, internal: bool = False, model: str | None = None) -> str:
+                           project: str | None = None, internal: bool = False, model: str | None = None,
+                           depends_on: list[str] | None = None) -> str:
         """Delegate a task to another agent. kind: query | artifact | experiment | code.
         project: the project the work belongs to (the recipient works in its directory for it); default: theirs.
         internal: a long piece of your own work for your worker (to = yourself; never your session; it gets only
         report_progress/submit_result/add_job; model defaults to the latest Sonnet). Wait with add_job(children=True).
+        depends_on: task ids it needs first: it is held here and sent, with their results, once they are done.
         leader: true only when the leader asked for this task (it goes first in their queue).
         reply: required (the default: they owe you a RESULT) | none (a notice; closed once they read it).
         deadline: ISO time with timezone by which you need the reply; overdue replies are followed up.
@@ -253,7 +255,7 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
             hub(), state["me"], to, objective, reason, kind=kind, inputs=inputs, expected_outputs=expected_outputs,
             constraints=constraints, acceptance_criteria=acceptance_criteria, timeout_s=timeout_s,
             artifacts=artifacts, priority=priority, reply=reply, deadline=deadline, observers=observers,
-            leader=leader, project=project, internal=internal, model=model))
+            leader=leader, project=project, internal=internal, model=model, depends_on=depends_on))
 
     @server.tool()
     async def check_task(task_id: str) -> str:
@@ -319,9 +321,10 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
                                       types=tools.ACTIONABLE if actionable_only else None))
 
     @server.tool()
-    async def accept_task(task_id: str) -> str:
-        """Accept a task that was sent to you (interactive agents)."""
-        return dump(await tools.accept_task(hub(), state["me"], task_id))
+    async def accept_task(task_id: str, eta: str | None = None) -> str:
+        """Accept a task that was sent to you (interactive agents). eta: when you expect to deliver (ISO time with
+        timezone); the requester's node reminds you once it passes and asks for a new one."""
+        return dump(await tools.accept_task(hub(), state["me"], task_id, eta=eta))
 
     @server.tool()
     async def reject_task(task_id: str, reason: str) -> str:
@@ -330,10 +333,17 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
 
     @server.tool()
     async def report_progress(message: str, task_id: str | None = None, state_: str | None = None,
-                              next: str | None = None) -> str:
+                              next: str | None = None, eta: str | None = None) -> str:
         """Tell the requester about progress on a task you own. state_: RUNNING | WAITING | BLOCKED.
-        next: the address whose move it is now (wakes them)."""
-        return dump(await tools.report_progress(hub(), state["me"], message, task_id, state_, next=next))
+        next: the address whose move it is now (wakes them). eta: a new estimate (ISO time with timezone),
+        e.g. when you were reminded that the old one passed."""
+        return dump(await tools.report_progress(hub(), state["me"], message, task_id, state_, next=next, eta=eta))
+
+    @server.tool()
+    async def nudge(task_id: str, note: str = "") -> str:
+        """Remind the owner of a task you requested that seems stuck: it is woken and must answer what it does,
+        where it is stuck and a new eta. At most once every few hours per task."""
+        return dump(await tools.nudge(hub(), state["me"], task_id, note))
 
     @server.tool()
     async def add_job(pid: int | None = None, done_file: str | None = None, log: str | None = None,

@@ -173,8 +173,10 @@ class Hub:
 
     async def request(self, sender: str | None, to: str, body: dict[str, Any], *,
                       artifacts: list[ArtifactRef] | None = None, parent_task: str | None = None,
-                      priority: str = "normal", task_id: str | None = None) -> tuple[str, str]:
-        """Send a REQUEST. Returns (task_id, delivery)."""
+                      priority: str = "normal", task_id: str | None = None,
+                      hold_for: list[str] | None = None) -> tuple[str, str]:
+        """Send a REQUEST. Returns (task_id, delivery). hold_for: task ids it depends on (D-073 batch 2): the
+        request is kept on this node ("held") until they are done, then sent with their results."""
         addr, agent = self.local_agent(sender)
         if not agent.has("REQUEST_TASK"):
             raise PermissionDenied(f"{addr} lacks REQUEST_TASK permission")
@@ -184,6 +186,10 @@ class Hub:
             body = {**body, "parent_task": parent_task}
         env = Envelope(type="REQUEST", sender=str(addr), to=await self.resolve(to), body=body,
                        task_id=task_id or new_task_id(), priority=priority, artifacts=artifacts or [])
+        if hold_for:
+            env.validate()
+            self.ledger.hold_request(env, hold_for)
+            return env.task_id, "held"
         delivery = await self.send(env)
         await self.copy_to_observers(str(addr), env, body.get("observers") or [])
         return env.task_id, delivery
@@ -255,7 +261,7 @@ class Hub:
         view: dict[str, Any] = dict(remote or {})
         if local:
             view.setdefault("task_id", task_id)
-            for key in ("requester", "owner", "parent_task", "request", "created_at"):
+            for key in ("requester", "owner", "parent_task", "request", "created_at", "eta"):
                 view.setdefault(key, local.get(key))
             # Prefer whichever side saw the more recent change.
             if not remote or (local["updated_at"] >= remote.get("updated_at", "")):
@@ -346,6 +352,8 @@ class Hub:
         if env is not None:
             await self.try_publish(env)
         await self.publish_task_record(task_id)
+        if status in TERMINAL_STATES:
+            self.drop_inbox_line(task_id)                    # refused or withdrawn: off the 收件 section
         log.info("task %s -> %s (%s)", task_id, status, message)
         return True
 
@@ -358,19 +366,28 @@ class Hub:
             return
         agent = self.local_agent(task["owner"])[1]
         board = agent.home(agent.project_of(request)) / "PLAN.md"
-        if not board.is_file():
+        if board.is_file():
+            rewrite_plan(board, lambda text: mark_plan_line(text, task_id, marker, note))
+
+    def add_inbox_line(self, task: dict[str, Any]) -> None:
+        """Arriving work goes on the post's plan, in the 收件 section (spec v1.1 §3.1): one unchecked line naming
+        the task; the agent moves it into its plan when it takes the work, and delivery removes it."""
+        request = task.get("request") or {}
+        agent = self.local_agent(task["owner"])[1]
+        board = agent.home(agent.project_of(request)) / "PLAN.md"
+        first = " ".join(str(request.get("objective") or "").splitlines()[:1])[:100]
+        line = f"- [ ] {task['task_id']} from {task['requester']}: {first}"
+        board.parent.mkdir(parents=True, exist_ok=True)
+        rewrite_plan(board, lambda text: add_to_section(text, INBOX_SECTION, line), create=True)
+
+    def drop_inbox_line(self, task_id: str) -> None:
+        task = self.ledger.task(task_id, "owner")
+        if not task:
             return
-        # several subs finish at once: one writer at a time over the whole read-modify-write, and a temporary file
-        # of its own (Codex review of 09456a9)
-        with open(board.with_name(".PLAN.md.lock"), "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            text = board.read_text()
-            marked = mark_plan_line(text, task_id, marker, note)
-            if marked != text:
-                fd, tmp = tempfile.mkstemp(dir=board.parent, prefix=".PLAN.md.", suffix=".tmp")
-                with os.fdopen(fd, "w") as f:
-                    f.write(marked)
-                Path(tmp).replace(board)
+        agent = self.local_agent(task["owner"])[1]
+        board = agent.home(agent.project_of(task.get("request"))) / "PLAN.md"
+        if board.is_file():
+            rewrite_plan(board, lambda text: drop_section_line(text, INBOX_SECTION, task_id))
 
     async def finish(self, task_id: str, result: dict[str, Any], artifacts: list[ArtifactRef] | None = None,
                      record: bool = True) -> bool:
@@ -403,6 +420,7 @@ class Hub:
         if (task.get("request") or {}).get("internal"):
             # a sub's line on its brain's plan (D-073); the brain itself adds and rearranges the lines
             self.mark_sub_on_plan(task_id, "!" if result["status"] == "failed" else "x", result.get("summary"))
+        self.drop_inbox_line(task_id)
         if workdir:
             if section:
                 board.write_text(drop_plan_section(board.read_text(), task_id))
@@ -410,6 +428,52 @@ class Hub:
             with open(workdir / "worker-log.md", "a") as f:
                 f.write(log_line(task, result) + "\n")
         return True
+
+
+INBOX_SECTION = "## 收件"
+
+
+def rewrite_plan(board: Path, change, create: bool = False) -> None:
+    """Rewrite PLAN.md with change(text): one writer at a time over the whole read-modify-write (a cross-process
+    lock), through a temporary file of its own (Codex review of 09456a9)."""
+    with open(board.with_name(".PLAN.md.lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not board.is_file() and not create:
+            return
+        text = board.read_text() if board.is_file() else "# PLAN\n"
+        changed = change(text)
+        if changed != text:
+            fd, tmp = tempfile.mkstemp(dir=board.parent, prefix=".PLAN.md.", suffix=".tmp")
+            with os.fdopen(fd, "w") as f:
+                f.write(changed)
+            Path(tmp).replace(board)
+
+
+def add_to_section(text: str, heading: str, line: str) -> str:
+    """Append line at the end of the section with this heading, creating the section at the end if missing."""
+    lines = text.rstrip("\n").split("\n")
+    if heading not in lines:
+        return "\n".join(lines + ["", heading, line]) + "\n"
+    i = lines.index(heading) + 1
+    while i < len(lines) and not _HEADING.match(lines[i]):
+        i += 1
+    while i > lines.index(heading) + 1 and not lines[i - 1].strip():
+        i -= 1
+    return "\n".join(lines[:i] + [line] + lines[i:]) + "\n"
+
+
+def drop_section_line(text: str, heading: str, task_id: str) -> str:
+    """Remove the first line of that section naming task_id."""
+    lines = text.split("\n")
+    if heading not in lines:
+        return text
+    i = lines.index(heading) + 1
+    pattern = re.compile(rf"\b{re.escape(task_id)}\b")
+    while i < len(lines) and not _HEADING.match(lines[i]):
+        if pattern.search(lines[i]):
+            return "\n".join(lines[:i] + lines[i + 1:])
+        i += 1
+    return text
 
 
 def mark_plan_line(text: str, task_id: str, marker: str, note: str | None = None) -> str:
