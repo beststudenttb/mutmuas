@@ -407,23 +407,25 @@ async def stop_group(pgid: int, grace_s: float = 5.0) -> bool:
 
 
 def _group_gone(pgid: int, sig: int) -> bool:
+    """Whether the group is gone after sending it sig. Members that are zombies (dead, not yet reaped by their
+    parent) count as gone: Linux lets kill() reach a zombie, macOS answers EPERM for a group of zombies only
+    (secretary's run on B, Codex re-review of cb77a33). A live member we may not signal is not gone."""
     try:
         os.killpg(pgid, sig)
-        return False
     except ProcessLookupError:
         return True
     except PermissionError:
-        # macOS answers EPERM for a group of zombies only (dead, not yet reaped by their parent): gone. A live
-        # member we may not signal is not (Codex re-review of cb77a33)
         return all(state.startswith("Z") for state in _group_states(pgid))
+    return sig == 0 and all(state.startswith("Z") for state in _group_states(pgid))
 
 
 def _group_states(pgid: int) -> list[str]:
     """The process states (ps STAT) of the members of a process group; ["?"] (unknown, not a zombie) when ps
     cannot run or fails (a sandbox): then the group is not shown gone and the stop counts as failed."""
     try:
-        done = subprocess.run(["/bin/ps", "-axo", "pgid=,stat="], capture_output=True, text=True)
-    except (OSError, subprocess.SubprocessError):
+        ps = next(p for p in ("/bin/ps", "/usr/bin/ps") if os.path.exists(p))       # by absolute path, as node.py
+        done = subprocess.run([ps, "-A", "-o", "pgid=,stat="], capture_output=True, text=True)       # POSIX flags
+    except (OSError, subprocess.SubprocessError, StopIteration):
         return ["?"]
     if done.returncode != 0:
         return ["?"]

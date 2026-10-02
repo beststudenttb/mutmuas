@@ -567,3 +567,35 @@ async def test_a_failing_ps_does_not_make_a_group_look_gone(monkeypatch):
     monkeypatch.setattr(runtime.subprocess, "run",
                         lambda *a, **k: subprocess.CompletedProcess(a, 1, stdout="", stderr="ps: not allowed"))
     assert await runtime.stop_group(4242, grace_s=0.1) is False
+
+
+async def test_a_group_of_zombies_is_gone_where_kill_succeeds_on_them(monkeypatch):
+    """Linux: kill() on a zombie succeeds (macOS answers EPERM), so a stopped group whose members are not reaped
+    yet still answers killpg (secretary's run on B, 752de2e)."""
+    from mutmuas import runtime
+    sent = []
+    monkeypatch.setattr(runtime.os, "killpg", lambda pgid, sig: sent.append(sig))
+    monkeypatch.setattr(runtime, "_group_states", lambda pgid: ["Z"])
+    assert await runtime.stop_group(4242, grace_s=1) is True
+    monkeypatch.setattr(runtime, "_group_states", lambda pgid: ["Z", "S"])
+    assert await runtime.stop_group(4242, grace_s=0.1) is False
+
+
+def test_group_states_reads_this_systems_ps():
+    import os
+    import subprocess
+    import sys
+    import time
+    from mutmuas import runtime
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+    try:
+        assert runtime._group_states(child.pid) and not runtime._group_states(child.pid)[0].startswith("Z")
+        os.kill(child.pid, 9)                # dead, not reaped yet (no wait): a zombie, on macOS and Linux
+        for _ in range(100):
+            if all(s.startswith("Z") for s in runtime._group_states(child.pid)):
+                break
+            time.sleep(0.02)
+        assert runtime._group_states(child.pid) and all(s.startswith("Z") for s in runtime._group_states(child.pid))
+    finally:
+        child.kill()
+        child.wait()
