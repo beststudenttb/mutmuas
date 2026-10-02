@@ -184,12 +184,16 @@ async def _retire(path, cfg, agent, hand_over, dry_run, keep_mailbox) -> dict[st
                                   "keep the mailbox for whoever takes over")
         if dry_run:
             return plan
+        # the manifest first: if it cannot be written, nothing has been done (Codex re-review of f5d9ad5)
+        manifest = _Manifest(path.with_name(f"RETIRED-{agent_id}-{stamp}.json"),
+                             {**plan, "at": stamp, "state": "planned", "steps": [], "archived_to": None})
         # 0 the fence, in one transaction with the session check: from here no session takes the post
         if (why := ledger.begin_retire(addr, lambda: session_present(ledger, addr))):
+            manifest.path.unlink(missing_ok=True)
             raise PermissionError(f"{addr}: {why}; close its session first")
-        manifest = _Manifest(path.with_name(f"RETIRED-{agent_id}-{stamp}.json"),
-                             {**plan, "at": stamp, "state": "started", "steps": ["fence"], "archived_to": None})
         try:
+            manifest.record["state"] = "started"
+            manifest.step("fence")
             # 1 node.yaml: a timestamped backup, then only this block out (checked above), written atomically
             backup = path.with_name(f"{path.name}.bak-{stamp}-retire-{agent_id}")
             shutil.copy2(path, backup)
@@ -220,6 +224,7 @@ async def _retire(path, cfg, agent, hand_over, dry_run, keep_mailbox) -> dict[st
             manifest.step("card", card=card)
             # 4 the post directory is moved whole
             if archive_to:
+                manifest.step("archiving")              # undo looks for it there even if no later write lands
                 archive_to.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(post), str(archive_to))
                 manifest.step("archived", archived_to=str(archive_to))
@@ -237,44 +242,67 @@ async def _retire(path, cfg, agent, hand_over, dry_run, keep_mailbox) -> dict[st
 
 async def undo(manifest: Path | str, dry_run: bool = False) -> dict[str, Any]:
     """Put a retired post back from its manifest, also one of a run that failed midway: its block into the agents
-    list where it was, its directory where it was, and the fence lifted. Everything is checked before anything
-    changes: a directory that is there again (both are named) or a block that would not fit changes nothing.
-    Messages that went out (rejections, withdrawals) cannot be taken back."""
+    list where it was, its directory where it was, and the fence lifted. Only with the node daemon stopped (as
+    retiring). What is on disk decides, not only what the manifest got to record. Everything is checked before
+    anything changes: a directory that is there again (both are named), a different agent under the same id, or a
+    block that would not fit changes nothing. Messages that went out (rejections, withdrawals) cannot be taken
+    back."""
+    from .node import daemon_lock
     done = json.loads(Path(manifest).read_text())
     path = Path(done["config"])
+    cfg = load_config(path)
+    with contextlib.ExitStack() as lock:
+        try:
+            lock.enter_context(daemon_lock(cfg))
+            running = False
+        except BlockingIOError:
+            running = True
+        if running and not dry_run:
+            raise PermissionError(f"node {cfg.node}'s daemon is running: stop it, undo, then start it again")
+        out = _undo(path, done, dry_run)
+        if running:
+            out["daemon"] = f"node {cfg.node}'s daemon is running: stop it before the real undo"
+        return out
+
+
+def _undo(path: Path, done: dict[str, Any], dry_run: bool) -> dict[str, Any]:
     agent_id = done["agent"].split(":", 1)[1]
     steps = done.get("steps") or []
     out: dict[str, Any] = {"agent": done["agent"], "dry_run": dry_run, "config": None, "directory": None}
     text = path.read_text()
     candidate = None
     try:
-        config_block(text, agent_id)
+        _, _, index = config_block(text, agent_id)
+        if (yaml.safe_load(text) or {})["agents"][index] != done["entry"]:
+            raise FileExistsError(f"a different {done['agent']} is configured now (not the retired one): nothing "
+                                  "changed; sort the two out by hand")
         out["config"] = "already configured"
     except KeyError:
-        if "config" in steps:
-            candidate = _insert(text, done)
-            out["config"] = f"block goes back as item {done['index']} of agents"
-    archived = done.get("archived_to")
-    if archived and "archived" in steps:
-        if Path(done["workdir"]).exists():
-            raise FileExistsError(f"{done['workdir']} exists again: the archive {archived} is not moved back over "
-                                  "it (nothing changed); merge the two by hand")
-        if not Path(archived).exists():
-            raise FileNotFoundError(f"the archive {archived} is gone (nothing changed)")
-        out["directory"] = f"{archived} -> {done['workdir']}"
+        candidate = _insert(text, done)
+        out["config"] = f"block goes back as item {done['index']} of agents"
+    # the directory: where it was archived, or was being archived when the manifest stopped
+    archive = done.get("archived_to") or (done.get("archive_to") if "archiving" in steps else None)
+    workdir = Path(done["workdir"])
+    if archive and Path(archive).exists():
+        if workdir.exists():
+            raise FileExistsError(f"{workdir} exists again: the archive {archive} is not moved back over it "
+                                  "(nothing changed); merge the two by hand")
+        out["directory"] = f"{archive} -> {workdir}"
+    elif archive and not workdir.exists():
+        raise FileNotFoundError(f"neither {workdir} nor its archive {archive} is there (nothing changed)")
     if dry_run:
         return out
     if candidate is not None:
         _write_atomic(path, candidate)
         load_config(path)
     if out["directory"]:
-        shutil.move(archived, done["workdir"])
+        shutil.move(archive, str(workdir))
     ledger = Ledger(load_config(path).db_path)
     try:
         ledger.end_retire(done["agent"])
     finally:
         ledger.close()
-    out.update(restored=True, note="restart the node to bring it back online; rejected tasks stay rejected and "
+    out.update(restored=True, note="start the node to bring it back online; rejected tasks stay rejected and "
                                    "withdrawn ones withdrawn")
     return out
 

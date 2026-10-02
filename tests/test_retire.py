@@ -321,3 +321,103 @@ def test_undo_with_dry_run_changes_nothing(tmp_path, bus, capsys):
     cli.agent_node(["retire-agent", "--undo", done["manifest"], "--dry-run"])
     assert "id: vision" not in path.read_text() and not post.exists()
     assert json.loads(capsys.readouterr().out)["dry_run"]
+
+
+# --------------------------------------------------------------------------- Codex re-review of f5d9ad5
+
+
+async def test_a_manifest_that_cannot_be_written_stops_retirement_before_anything(tmp_path, bus, monkeypatch):
+    from mutmuas.retire import _Manifest
+    path, post = _small(tmp_path)
+
+    def broken(self):
+        raise OSError("first journal write failed")
+    monkeypatch.setattr(_Manifest, "save", broken)
+    with pytest.raises(OSError):
+        await retire(path, "vision")
+    ledger = Ledger(load_config(path).db_path)
+    try:
+        assert ledger.db.execute("SELECT count(*) FROM retiring").fetchone()[0] == 0      # no fence left
+    finally:
+        ledger.close()
+    assert "id: vision" in path.read_text() and post.is_dir()
+
+
+async def test_undo_finds_the_directory_moved_after_the_last_manifest_write(tmp_path, bus, monkeypatch):
+    from mutmuas.retire import _Manifest
+    path, post = _small(tmp_path)
+    original = _Manifest.save
+
+    def fails_after_the_move(self):
+        if "archived" in self.record["steps"] or self.record.get("archived_to"):
+            raise OSError("journal writes fail after the directory move")
+        return original(self)
+    monkeypatch.setattr(_Manifest, "save", fails_after_the_move)
+    with pytest.raises(OSError):
+        await retire(path, "vision")
+    monkeypatch.setattr(_Manifest, "save", original)
+    [manifest] = list(tmp_path.glob("RETIRED-vision-*.json"))
+    back = await undo(manifest)
+    assert back["restored"] and (post / "leader-note").read_text() == "keep me"
+    assert [a.id for a in load_config(path).agents] == ["lead", "vision"]
+
+
+async def test_undo_is_refused_while_the_node_daemon_runs(tmp_path, bus):
+    from mutmuas.node import daemon_lock
+    path, post = _small(tmp_path)
+    done = await retire(path, "vision")
+    with daemon_lock(load_config(path)):
+        with pytest.raises(PermissionError, match="daemon"):
+            await undo(done["manifest"])
+    assert "id: vision" not in path.read_text() and not post.exists()
+
+
+async def test_undo_refuses_when_a_different_post_took_the_id(tmp_path, bus):
+    path, post = _small(tmp_path)
+    done = await retire(path, "vision")
+    path.write_text(path.read_text() + "- id: vision\n  mode: interactive\n  role: new post\n"
+                                       "  workdir: ./work/new-vision\n")
+    with pytest.raises(FileExistsError, match="different"):
+        await undo(done["manifest"])
+    assert not post.exists() and Path(done["archived_to"]).is_dir()
+
+
+async def test_a_retiring_post_can_use_no_mail_tool(tmp_path, bus):
+    import asyncio
+    from mutmuas.mcp_server import build_server
+    path, post = _small(tmp_path)
+    cfg = load_config(path)
+    ledger = Ledger(cfg.db_path)
+    request = Envelope(type="REQUEST", sender="A:sender", to="C:vision", task_id="T-fenced",
+                       body=request_body("fenced mail", "review"))
+    ledger.ingest(request)
+    ledger.create_owned_task(request)
+    assert ledger.begin_retire("C:vision", lambda: None) is None
+    ledger.close()
+    server = build_server(cfg, "C:vision")
+    async with server.settings.lifespan(server):
+        await asyncio.sleep(0)
+        for tool, args in (("inbox", {"only": "all", "peek": True}), ("accept_task", {"task_id": "T-fenced"}),
+                           ("send_request", {"to": "C:lead", "objective": "x", "reason": "y"})):
+            out = await server.call_tool(tool, args)
+            assert "being retired" in out.content[0].text, tool
+    check = Ledger(cfg.db_path)
+    try:
+        assert check.task("T-fenced", "owner")["status"] == "PENDING"
+    finally:
+        check.close()
+
+
+async def test_a_daemon_that_fails_to_start_lets_go_of_its_lock(tmp_path):
+    from mutmuas.node import NodeDaemon, daemon_lock
+    path, post = _small(tmp_path)
+    cfg = load_config(path)
+    daemon = NodeDaemon(cfg)
+
+    async def broken_connect():
+        raise RuntimeError("synthetic startup failure")
+    daemon._connect = broken_connect
+    with pytest.raises(RuntimeError):
+        await daemon.run_forever()
+    with daemon_lock(cfg):
+        pass

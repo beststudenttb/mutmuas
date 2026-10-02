@@ -583,9 +583,11 @@ def node_start(args):
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stop.set)
-        await daemon.start()
-        await stop.wait()
-        await daemon.stop()
+        try:
+            await daemon.start()
+            await stop.wait()
+        finally:
+            await daemon.stop()         # also after a failed start: lets go of data_dir/daemon.lock
 
     try:
         asyncio.run(main())            # the daemon holds data_dir/daemon.lock while it runs

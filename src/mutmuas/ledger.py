@@ -429,6 +429,9 @@ class Ledger:
             db.execute("INSERT OR REPLACE INTO retiring (local_agent, at) VALUES (?,?)", (local_agent, now_iso()))
         return None
 
+    def retiring(self, local_agent: str) -> bool:
+        return self.db.execute("SELECT 1 FROM retiring WHERE local_agent=?", (local_agent,)).fetchone() is not None
+
     def end_retire(self, local_agent: str) -> None:
         self.db.execute("DELETE FROM retiring WHERE local_agent=?", (local_agent,))
 

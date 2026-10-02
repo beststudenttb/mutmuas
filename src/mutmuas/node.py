@@ -170,7 +170,11 @@ def lease_refusal(ledger, agent: str) -> str | None:
     """Why this process may not act as `agent` now, or None. A live session holds the agent: only that session
     (its MCP process, or anything the session itself started, e.g. agentctl from its shell) may use it.
     No environment variable exempts a process: MUTMUAS_TASK_ID is set by whoever starts the process, so it
-    proves nothing (Codex review of dfdd719). Daemon-run tasks act as worker agents, which hold no lease."""
+    proves nothing (Codex review of dfdd719). Daemon-run tasks act as worker agents, which hold no lease.
+    A post being retired is refused to everyone (Codex re-review of f5d9ad5: the fence only stopped the lease)."""
+    if ledger.retiring(agent):
+        return (f"{agent} is being retired (agent-node retire-agent): no session or tool may act as it; "
+                "`retire-agent --undo` lifts this.")
     row = ledger.session_of(agent)
     if not row or row["pid"] in (0, os.getpid()) or not session_alive(row):
         return None
@@ -312,8 +316,8 @@ class NodeDaemon:
         log.info("node %s stopped", self.cfg.node)
 
     async def run_forever(self) -> None:
-        await self.start()
         try:
+            await self.start()          # a failed start is cleaned up too: its lock let go (Codex re-review)
             await asyncio.Event().wait()
         finally:
             await self.stop()

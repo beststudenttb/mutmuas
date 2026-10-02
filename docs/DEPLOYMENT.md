@@ -321,9 +321,11 @@ that has the post, **with the node daemon stopped** (Codex review of c46cfb9):
    daemon cannot start meanwhile), while the post's session is online, or while a worker of it runs a task;
    refuses also while unread mail waits in its mailbox, unless `--keep-mailbox` (the mailbox is then kept and
    listed under `todo`; nothing unread is deleted);
-2. fences the post in the same ledger transaction as the session check: from then on no session takes it;
-3. writes the manifest `RETIRED-<id>-<time>.json` next to node.yaml **before the first change**, and again after
-   every step (state started / done / failed, the steps done, the error);
+2. writes the manifest `RETIRED-<id>-<time>.json` next to node.yaml **before the first change** (if it cannot,
+   nothing is done), and again after every step, an intent before the directory move (state planned / started /
+   done / failed, the steps done, the error);
+3. fences the post in the same ledger transaction as the session check: from then on no session takes it and no
+   tool (MCP or agentctl) acts as it;
 4. node.yaml: a timestamped backup (`node.yaml.bak-<time>-retire-<id>`), then only that agent's list item is
    taken out, found from the parsed YAML's own positions (a comment inside the item goes with it; comments after
    it stay). The result is checked to differ from the original by that one agent and nothing else, and written
@@ -337,10 +339,11 @@ that has the post, **with the node daemon stopped** (Codex review of c46cfb9):
    identity (a case variant or a link of the path is the same directory).
 
 Start the node again afterwards: it forgets the address. `agent-node retire-agent --undo <manifest>` (also with
-`--dry-run`) works from the manifest of a finished or a failed run: the block goes back to its old place in the
-agents list (checked the same way), the directory back where it was, the fence is lifted; then start the node.
-It changes nothing when the post directory exists again (both directories are named: merge them by hand) or the
-archive is gone. Refused and withdrawn tasks stay so.
+`--dry-run`) works from the manifest of a finished or a failed run, also with the node daemon stopped: the block
+goes back to its old place in the agents list (checked the same way), the directory back from wherever it is on
+disk, the fence is lifted; then start the node. It changes nothing when the post directory exists again (both
+directories are named: merge them by hand), when a different agent now has the same id, or when neither the
+directory nor its archive is there. Refused and withdrawn tasks stay so.
 
 ## 8a. Supervision and known risks
 
