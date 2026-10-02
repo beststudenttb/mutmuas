@@ -5,6 +5,7 @@ directory to work/_archive/ untouched, and can be undone."""
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 import yaml
@@ -121,7 +122,7 @@ async def test_retiring_is_undone_from_its_manifest(node):
     path, cfg, ledger, post = node
     done = await retire(path, "vision")
     back = await undo(done["manifest"])
-    assert [a.id for a in load_config(path).agents] == ["lead", "plain", "vision"]
+    assert [a.id for a in load_config(path).agents] == ["lead", "vision", "plain"]      # back where it was
     assert post.is_dir() and (post / "leader-notes.md").read_text() == "the leader's own file\n"
     assert "rejected tasks stay rejected" in back["note"]
 
@@ -151,3 +152,172 @@ def test_agent_node_retire_agent_shows_the_plan_until_told_yes(node, capsys):
     assert out["rejected"] == ["T-open"] and "id: vision" not in path.read_text()
     cli.agent_node(["retire-agent", "--undo", out["manifest"]])
     assert "id: vision" in path.read_text() and post.is_dir()
+
+
+# --------------------------------------------------------------------------- Codex review of c46cfb9
+
+SMALL = """project: p
+node: C
+data_dir: ./data
+agents:
+- id: lead
+  mode: interactive
+  workdir: {lead}
+- id: vision
+  mode: interactive
+{comment}  workdir: ./work/vision
+{trailing}"""
+
+
+def _small(tmp_path, lead="./work/lead", comment="", trailing=""):
+    path = tmp_path / "node.yaml"
+    path.write_text(SMALL.format(lead=lead, comment=comment, trailing=trailing))
+    (tmp_path / "work" / "vision").mkdir(parents=True)
+    (tmp_path / "work" / "vision" / "leader-note").write_text("keep me")
+    return path, tmp_path / "work" / "vision"
+
+
+class FakeBus:
+    """remove_agent as the real Bus does it, over a fake card store and a mailbox with `pending` unread."""
+    def __init__(self, pending=0, fail=False):
+        from types import SimpleNamespace
+        self.pending, self.fail, self.events = pending, fail, []
+        self.names = SimpleNamespace(agents_kv="cards", stream="mail", consumer=str)
+        self.js = self
+
+    async def kv_delete(self, *args):
+        self.events.append("card deleted")
+
+    async def inbox_pending(self, _addr):
+        return self.pending
+
+    async def delete_consumer(self, *args):
+        if self.fail:
+            raise OSError("synthetic mailbox deletion failure")      # after node.yaml changed
+        self.events.append("mailbox deleted")
+
+    async def close(self):
+        pass
+
+    from mutmuas.bus import Bus
+    remove_agent = Bus.remove_agent
+
+
+@pytest.fixture
+def bus(monkeypatch):
+    from mutmuas.hub import Hub
+    made = {"bus": None}
+
+    async def fake_open(cfg, *_args, **_kwargs):
+        return Hub(cfg, made["bus"], Ledger(cfg.db_path))
+    monkeypatch.setattr("mutmuas.retire.Hub.open", fake_open)
+    return made
+
+
+async def test_a_case_variant_of_a_directory_another_post_uses_is_not_moved(tmp_path, bus):
+    path, post = _small(tmp_path, lead="./work/VISION")
+    alias = tmp_path / "work" / "VISION"
+    if not (alias.exists() and alias.samefile(post)):
+        pytest.skip("case-sensitive file system")
+    done = await retire(path, "vision")
+    assert post.is_dir() and done["archived_to"] is None and "shared" in done["note"]
+
+
+async def test_a_failure_midway_leaves_a_manifest_to_undo_from(tmp_path, bus):
+    path, post = _small(tmp_path)
+    bus["bus"] = FakeBus(fail=True)
+    with pytest.raises(OSError):
+        await retire(path, "vision")
+    [manifest] = list(tmp_path.glob("RETIRED-vision-*.json"))
+    record = json.loads(manifest.read_text())
+    assert record["state"] == "failed" and "config" in record["steps"] and "synthetic" in record["error"]
+    back = await undo(manifest)
+    assert [a.id for a in load_config(path).agents] == ["lead", "vision"] and back["restored"]
+
+
+async def test_a_comment_inside_the_block_stays_out_of_the_neighbour(tmp_path, bus):
+    path, post = _small(tmp_path, comment="# ordinary comment within the vision item\n")
+    (tmp_path / "work" / "lead").mkdir()
+    await retire(path, "vision")
+    [lead] = load_config(path).agents
+    assert lead.id == "lead" and lead.workdir_path == (tmp_path / "work" / "lead").resolve()
+    assert (tmp_path / "work" / "lead").is_dir() and "workdir: ./work/vision" not in path.read_text()
+
+
+async def test_undo_puts_the_block_back_inside_agents_with_keys_after_it(tmp_path, bus):
+    path, post = _small(tmp_path, trailing="heartbeat_s: 30\n")
+    done = await retire(path, "vision")
+    await undo(done["manifest"])
+    cfg = load_config(path)
+    assert [a.id for a in cfg.agents] == ["lead", "vision"] and cfg.heartbeat_s == 30
+
+
+async def test_a_session_coming_online_during_retirement_cannot_take_the_post(tmp_path, bus, monkeypatch):
+    import os
+    import mutmuas.retire as retire_module
+    from mutmuas.node import session_alive
+    path, post = _small(tmp_path)
+    ledger = Ledger(load_config(path).db_path)
+    copy, claims = retire_module.shutil.copy2, []
+
+    def a_session_starts(src, dest, *args, **kwargs):          # right after the checks, as in Codex's repro
+        if not claims:
+            claims.append(ledger.session_claim("C:vision", os.getpid(), str(post), session_alive,
+                                               session_pid=os.getpid()))
+        return copy(src, dest, *args, **kwargs)
+    monkeypatch.setattr(retire_module.shutil, "copy2", a_session_starts)
+    try:
+        await retire(path, "vision")
+        assert claims and claims[0] != os.getpid()            # refused: the post is being retired
+        ledger.session_beat("C:vision", os.getpid(), str(post), session_pid=os.getpid())     # a raw beat neither
+        assert ledger.session_of("C:vision") is None
+    finally:
+        ledger.close()
+
+
+async def test_retiring_is_refused_while_the_node_daemon_runs(tmp_path, bus):
+    from mutmuas.node import daemon_lock
+    path, post = _small(tmp_path)
+    with daemon_lock(load_config(path)):
+        plan = await retire(path, "vision", dry_run=True)
+        assert "stop it" in plan["daemon"]
+        with pytest.raises(PermissionError, match="daemon"):
+            await retire(path, "vision")
+    assert "id: vision" in path.read_text() and post.is_dir()
+
+
+async def test_undo_refuses_when_the_post_directory_was_made_again(tmp_path, bus):
+    path, post = _small(tmp_path)
+    done = await retire(path, "vision")
+    post.mkdir()
+    (post / "new-note").write_text("new files stay")
+    with pytest.raises(FileExistsError, match="archive"):
+        await undo(done["manifest"])
+    assert (post / "new-note").exists() and not (post / "leader-note").exists()
+    assert (Path(done["archived_to"]) / "leader-note").exists() and "id: vision" not in path.read_text()
+
+
+async def test_a_mailbox_with_unread_mail_is_not_dropped_silently(tmp_path, bus):
+    path, post = _small(tmp_path)
+    bus["bus"] = FakeBus(pending=3)
+    with pytest.raises(PermissionError, match="3 unread"):
+        await retire(path, "vision")
+    assert "id: vision" in path.read_text() and bus["bus"].events == []
+    done = await retire(path, "vision", keep_mailbox=True)
+    assert bus["bus"].events == ["card deleted"]
+    assert any("3 unread" in t for t in done["todo"])
+    bus["bus"] = FakeBus()
+    (tmp_path / "again").mkdir()
+    path2, _ = _small(tmp_path / "again")
+    done = await retire(path2, "vision")
+    assert bus["bus"].events == ["card deleted", "mailbox deleted"] and not done["todo"]
+
+
+def test_undo_with_dry_run_changes_nothing(tmp_path, bus, capsys):
+    import asyncio
+    from mutmuas import cli
+    path, post = _small(tmp_path)
+    done = asyncio.run(retire(path, "vision"))
+    cli.agent_node(["retire-agent", "--undo", done["manifest"], "--dry-run"])
+    assert "id: vision" not in path.read_text() and not post.exists()
+    assert json.loads(capsys.readouterr().out)["dry_run"]

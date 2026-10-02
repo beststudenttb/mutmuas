@@ -116,6 +116,13 @@ CREATE TABLE IF NOT EXISTS failures (
     error           TEXT NOT NULL            -- "<ExceptionType>: <message>"
 );
 
+-- A post being retired (agent-node retire-agent): no session may take its lease from the check on (Codex review
+-- of c46cfb9). Cleared by --undo.
+CREATE TABLE IF NOT EXISTS retiring (
+    local_agent     TEXT PRIMARY KEY,
+    at              TEXT NOT NULL
+);
+
 -- Requests held by their sender until the tasks they depend on are done (D-073 batch 2, depends_on).
 CREATE TABLE IF NOT EXISTS held (
     task_id         TEXT PRIMARY KEY,
@@ -394,20 +401,36 @@ class Ledger:
 
     def session_beat(self, local_agent: str, pid: int, cwd: str | None, session_pid: int | None = None) -> None:
         now = now_iso()
-        self.db.execute(self._BEAT_SQL, (local_agent, pid, session_pid, cwd, now, now))
+        with self.tx() as db:
+            if not db.execute("SELECT 1 FROM retiring WHERE local_agent=?", (local_agent,)).fetchone():
+                db.execute(self._BEAT_SQL, (local_agent, pid, session_pid, cwd, now, now))
 
     def session_claim(self, local_agent: str, pid: int, cwd: str | None, holder_alive,
                       session_pid: int | None = None) -> int:
         """One agent, one session: beat as the holder if the lease is free, stale or already ours; otherwise return
-        the holder's pid. The check and the write are one transaction (BEGIN IMMEDIATE), so two sessions starting
-        together cannot both win."""
+        the holder's pid, or -1 while the agent is being retired. The check and the write are one transaction
+        (BEGIN IMMEDIATE), so two sessions starting together cannot both win."""
         now = now_iso()
         with self.tx() as db:
+            if db.execute("SELECT 1 FROM retiring WHERE local_agent=?", (local_agent,)).fetchone():
+                return -1
             row = db.execute("SELECT * FROM sessions WHERE local_agent=?", (local_agent,)).fetchone()
             if row is not None and row["pid"] not in (0, pid) and holder_alive(dict(row)):
                 return row["pid"]
             db.execute(self._BEAT_SQL, (local_agent, pid, session_pid, cwd, now, now))
         return pid
+
+    def begin_retire(self, local_agent: str, refuse_if) -> str | None:
+        """Fence an agent for retirement, or say why not: refuse_if() (e.g. its session is there) is checked in the
+        same transaction that sets the fence, so no session can take the lease in between."""
+        with self.tx() as db:
+            if (why := refuse_if()):
+                return why
+            db.execute("INSERT OR REPLACE INTO retiring (local_agent, at) VALUES (?,?)", (local_agent, now_iso()))
+        return None
+
+    def end_retire(self, local_agent: str) -> None:
+        self.db.execute("DELETE FROM retiring WHERE local_agent=?", (local_agent,))
 
     def claim_task(self, task_id: str, runner: str, statuses: tuple[str, ...],
                    refuse_if=None) -> str | None:

@@ -315,20 +315,32 @@ ls ~/.mutmuas/visual_rl/B/runs/  # per-task agent output (<task>.<UTC start time
 ## 8b. Retire a post (D-085/D-089)
 
 `agent-node retire-agent <id> [--hand-over <addr>]` shows what it would do; add `-y` to do it, on the node
-that has the post:
+that has the post, **with the node daemon stopped** (Codex review of c46cfb9):
 
-1. refuses while the post's session is online or its worker runs a task (stop them first);
-2. node.yaml: a timestamped backup (`node.yaml.bak-<time>-retire-<id>`), then only that agent's block is taken
-   out; the rest of the file (other agents, comments) is kept as written, and the result must load;
-3. its open work is refused back to each requester ("retired; ask <hand-over> instead"); what it asked others
+1. refuses while the node daemon runs (it holds `data/daemon.lock`; the command holds it to the end, so the
+   daemon cannot start meanwhile), while the post's session is online, or while a worker of it runs a task;
+   refuses also while unread mail waits in its mailbox, unless `--keep-mailbox` (the mailbox is then kept and
+   listed under `todo`; nothing unread is deleted);
+2. fences the post in the same ledger transaction as the session check: from then on no session takes it;
+3. writes the manifest `RETIRED-<id>-<time>.json` next to node.yaml **before the first change**, and again after
+   every step (state started / done / failed, the steps done, the error);
+4. node.yaml: a timestamped backup (`node.yaml.bak-<time>-retire-<id>`), then only that agent's list item is
+   taken out, found from the parsed YAML's own positions (a comment inside the item goes with it; comments after
+   it stay). The result is checked to differ from the original by that one agent and nothing else, and written
+   atomically;
+5. its open work is refused back to each requester ("retired; ask <hand-over> instead"); what it asked others
    for is withdrawn (their nodes cascade further down);
-4. its registry card is removed now when the bus is reachable, else at the node's next start;
-5. its post directory is moved whole to `work/_archive/<post>-<time>/`. Nothing in it is deleted, since it may
-   hold the leader's files. A directory another agent uses is left in place;
-6. everything done goes into `RETIRED.json` in the archive (or next to node.yaml).
+6. its registry card and mailbox are removed now when the bus is reachable, else listed under `todo` (the node
+   removes the card at its next start);
+7. its post directory is moved whole to `work/_archive/<post>-<time>/`. Nothing in it is deleted, since it may
+   hold the leader's files. A directory another agent uses, or one inside it, is left in place, judged by file
+   identity (a case variant or a link of the path is the same directory).
 
-Restart the node afterwards to stop the post's loops. `agent-node retire-agent --undo <RETIRED.json>` puts the
-block and the directory back (then restart); refused and withdrawn tasks stay so.
+Start the node again afterwards: it forgets the address. `agent-node retire-agent --undo <manifest>` (also with
+`--dry-run`) works from the manifest of a finished or a failed run: the block goes back to its old place in the
+agents list (checked the same way), the directory back where it was, the fence is lifted; then start the node.
+It changes nothing when the post directory exists again (both directories are named: merge them by hand) or the
+archive is gone. Refused and withdrawn tasks stay so.
 
 ## 8a. Supervision and known risks
 
@@ -376,6 +388,10 @@ Known risks (protections removed on purpose; one line each):
   through check_task on a task it may see.
 - Retiring a post cannot take back the refusals and withdrawals it sent; `--undo` restores only the config
   block and the directory (D-085).
+- A retired post's fence lives in the ledger: a session started while it stands gets "being retired" and no mail;
+  a run that failed before node.yaml changed keeps the fence until `--undo` lifts it.
+- `retire-agent` trusts `data/daemon.lock`: a daemon started from another data directory for the same node is not
+  seen.
 - Two brain runs of one post never overlap, so different projects of a post wait for each other's brain runs.
 - A session started in any real subdirectory of the post directory (other than memory/ and hidden ones) counts
   as working on a project of that name, and with auto_worker takes only that project's requests (D-072).

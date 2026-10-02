@@ -487,17 +487,19 @@ def node_init(args):
 
 
 def node_retire_agent(args):
-    """agent-node retire-agent <id> [--hand-over ADDR] [--dry-run] [-y]; agent-node retire-agent --undo <manifest>."""
+    """agent-node retire-agent <id> [--hand-over ADDR] [--keep-mailbox] [--dry-run] [-y];
+    agent-node retire-agent --undo <manifest> [--dry-run]."""
     from .retire import retire, undo
-    if args.undo:
-        print(json.dumps(asyncio.run(undo(args.undo)), indent=2, ensure_ascii=False))
-        return
-    if not args.id:
-        raise SystemExit("usage: agent-node retire-agent <id> [--hand-over ADDR] [--dry-run] [-y]")
-    dry = args.dry_run or not args.yes
     try:
-        out = asyncio.run(retire(find_config(args.config), args.id, hand_over=args.hand_over, dry_run=dry))
-    except (KeyError, PermissionError) as e:
+        if args.undo:
+            print(json.dumps(asyncio.run(undo(args.undo, dry_run=args.dry_run)), indent=2, ensure_ascii=False))
+            return
+        if not args.id:
+            raise SystemExit("usage: agent-node retire-agent <id> [--hand-over ADDR] [--dry-run] [-y]")
+        dry = args.dry_run or not args.yes
+        out = asyncio.run(retire(find_config(args.config), args.id, hand_over=args.hand_over, dry_run=dry,
+                                 keep_mailbox=args.keep_mailbox))
+    except (KeyError, PermissionError, FileExistsError, ValueError) as e:
         raise SystemExit(f"error: {e}")
     print(json.dumps(out, indent=2, ensure_ascii=False))
     if dry and not args.dry_run:
@@ -585,7 +587,11 @@ def node_start(args):
         await stop.wait()
         await daemon.stop()
 
-    asyncio.run(main())
+    try:
+        asyncio.run(main())            # the daemon holds data_dir/daemon.lock while it runs
+    except BlockingIOError:
+        raise SystemExit(f"error: {cfg.data_path / 'daemon.lock'} is held: another daemon of node {cfg.node} "
+                         "runs, or retire-agent is changing the node")
 
 
 def node_server_config(args):
@@ -947,7 +953,9 @@ def agent_node_parser() -> argparse.ArgumentParser:
     p.add_argument("--hand-over", metavar="ADDR", help="who takes over: named in each refusal of its open work")
     p.add_argument("--dry-run", action="store_true", help="show what would be done; change nothing")
     p.add_argument("-y", "--yes", action="store_true", help="do it (without -y only the plan is shown)")
-    p.add_argument("--undo", metavar="MANIFEST", help="put a retired post back (its RETIRED.json)")
+    p.add_argument("--keep-mailbox", action="store_true",
+                   help="retire although unread mail waits in its mailbox (the mailbox is kept, listed under todo)")
+    p.add_argument("--undo", metavar="MANIFEST", help="put a retired post back (its RETIRED-<id>-<time>.json)")
     p.set_defaults(sync=node_retire_agent)
     p = sub.add_parser("join", help="point this node at a server and verify connectivity")
     p.add_argument("--config")

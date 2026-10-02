@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import itertools
 import json
 import logging
@@ -66,6 +67,19 @@ def _pid_alive(pid: int) -> bool:
 
 def session_alive(session: dict[str, Any]) -> bool:
     return session_fields(session).get("session") == "online"
+
+
+@contextlib.contextmanager
+def daemon_lock(cfg: NodeConfig):
+    """Held by the node daemon while it runs (one per data dir), and by retire-agent while it changes the node:
+    BlockingIOError when someone else holds it."""
+    cfg.data_path.mkdir(parents=True, exist_ok=True)
+    fd = os.open(cfg.data_path / "daemon.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        os.close(fd)
 
 
 def session_present(ledger, agent: str) -> str | None:
@@ -233,6 +247,10 @@ class NodeDaemon:
     # ---- lifecycle ----------------------------------------------------
 
     async def start(self) -> None:
+        # one daemon per data dir, and none while retire-agent changes the node (Codex review of c46cfb9)
+        lock = daemon_lock(self.cfg)
+        lock.__enter__()
+        self._daemon_lock = lock
         self.hub = await self._connect()
         hub = self.hub
         for agent in self.cfg.agents:
@@ -288,6 +306,9 @@ class NodeDaemon:
             with contextlib.suppress(Exception):
                 await self._publish_cards(state_override="offline")
             await self.hub.close()
+        if (lock := getattr(self, "_daemon_lock", None)) is not None:
+            self._daemon_lock = None
+            lock.__exit__(None, None, None)
         log.info("node %s stopped", self.cfg.node)
 
     async def run_forever(self) -> None:

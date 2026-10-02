@@ -126,7 +126,12 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         me = os.getpid()
         while True:
             holder = hub.ledger.session_claim(addr, me, os.getcwd(), session_alive, session_pid=os.getppid())
-            if holder != me and state.get("duplicate_of") != holder:
+            if holder == -1 and state.get("duplicate_of") != holder:
+                state["duplicate_of"] = holder
+                await push_now({"content": f"mutmuas: {addr} is being retired (agent-node retire-agent): this "
+                                           "session gets no mail and must not act as it.",
+                                "meta": {"session": "retired"}})
+            elif holder != me and state.get("duplicate_of") != holder:
                 state["duplicate_of"] = holder
                 await push_now(duplicate_notice(addr, holder))
             elif holder == me:
