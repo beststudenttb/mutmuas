@@ -8,8 +8,12 @@ registry lookup, sending (outbox first), task views, owner-side task state.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import logging
+import os
 import re
+import tempfile
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any
 
@@ -354,13 +358,19 @@ class Hub:
             return
         agent = self.local_agent(task["owner"])[1]
         board = agent.home(agent.project_of(request)) / "PLAN.md"
-        if board.is_file():
+        if not board.is_file():
+            return
+        # several subs finish at once: one writer at a time over the whole read-modify-write, and a temporary file
+        # of its own (Codex review of 09456a9)
+        with open(board.with_name(".PLAN.md.lock"), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
             text = board.read_text()
             marked = mark_plan_line(text, task_id, marker, note)
             if marked != text:
-                tmp = board.with_suffix(".md.tmp")
-                tmp.write_text(marked)
-                tmp.replace(board)
+                fd, tmp = tempfile.mkstemp(dir=board.parent, prefix=".PLAN.md.", suffix=".tmp")
+                with os.fdopen(fd, "w") as f:
+                    f.write(marked)
+                Path(tmp).replace(board)
 
     async def finish(self, task_id: str, result: dict[str, Any], artifacts: list[ArtifactRef] | None = None,
                      record: bool = True) -> bool:

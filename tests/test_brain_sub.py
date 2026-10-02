@@ -233,3 +233,137 @@ async def test_a_failed_resume_starts_the_next_attempt_afresh(tmp_path, monkeypa
         assert ledger.brain_session("B:desk", "robo") is None and "T-p" in daemon._retry
     finally:
         ledger.close()
+
+
+def test_a_brain_is_told_to_update_its_handoff_before_every_run_ends(tmp_path):
+    """Sandbox run (T-20261002103910-305ca252): the brain's last run delivered but left HANDOFF saying it still
+    waited on its subs; the next batch would have started from that."""
+    from mutmuas.config import AgentConfig, NodeConfig
+    from mutmuas.runtime import TaskContext, worker_prompt
+    node = NodeConfig(project="p", node="B", data_dir=str(tmp_path / "data"))
+    agent = AgentConfig(id="desk", runtime="claude-code", workdir=str(tmp_path))
+    ctx = TaskContext("T-1", Envelope(type="REQUEST", sender="A:x", to="B:desk", task_id="T-1",
+                                      body=request_body("x", "y")), agent, node)
+    prompt = worker_prompt(ctx)
+    assert "Before every run ends" in prompt and "HANDOFF.md" in prompt
+    assert "what you did, what comes next and whom you wait for" in prompt
+
+
+# --------------------------------------------------------------------------- Codex light review of 09456a9
+
+
+def _be_the_subs_worker(ledger, sub):
+    """The calling (test) process becomes the sub's daemon-started worker: pid and start time recorded."""
+    from mutmuas.node import proc_start
+    assert ledger.claim_task(sub, "worker", ("ACCEPTED",)) is None
+    ledger.set_runner_pid(sub, os.getpid(), proc_start(os.getpid()))
+
+
+async def test_a_sub_worker_is_recognised_by_its_process_tree_not_its_environment(tmp_path, monkeypatch):
+    """No MUTMUAS_TASK_ID, no worker_task binding: a process descending from the sub's worker still gets no mail,
+    sends none, and its MCP server and agentctl still offer only the sub's three tools."""
+    from mutmuas.mcp_server import build_server
+    agent, cfg, ledger, hub, daemon = _node(tmp_path)
+    _parent(ledger)
+    monkeypatch.delenv("MUTMUAS_TASK_ID", raising=False)
+    try:
+        sub, _ = await _sub(hub, daemon, agent)
+        _be_the_subs_worker(ledger, sub)
+        for call in (lambda: tools.inbox(hub, "B:desk", peek=True),
+                     lambda: tools.send_request(hub, "B:desk", "A:lead", "x", "y"),
+                     lambda: tools.clear_inbox(hub, "B:desk", 10**9)):
+            with pytest.raises(PermissionError, match="internal subtask"):
+                await call()
+        names = {t.name for t in await build_server(cfg, "B:desk", worker_task=None).list_tools()}
+        assert names == {"report_progress", "submit_result", "add_job"}
+    finally:
+        ledger.close()
+
+
+async def test_two_subs_marking_the_plan_at_once_keep_both_marks(tmp_path, monkeypatch):
+    import threading
+    from pathlib import Path
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    _parent(ledger)
+    try:
+        first, _ = await _sub(hub, daemon, agent)
+        second, _ = await _sub(hub, daemon, agent)
+        board = agent.home("robo") / "PLAN.md"
+        board.write_text(f"# PLAN\n- [ ] {first} first\n- [ ] {second} second\n")
+        replace, other = Path.replace, []
+
+        def interleave(path, target):                  # the second writer runs while the first is mid-update
+            if not other and target == board:
+                other.append(threading.Thread(target=hub.mark_sub_on_plan, args=(second, ">")))
+                other[0].start()
+                other[0].join(1)
+            return replace(path, target)
+        monkeypatch.setattr(Path, "replace", interleave)
+        hub.mark_sub_on_plan(first, ">")
+        other[0].join(5)
+        text = board.read_text()
+        assert f"[>] {first}" in text and f"[>] {second}" in text
+    finally:
+        ledger.close()
+
+
+async def test_a_plain_worker_address_refuses_internal_subtasks(tmp_path):
+    """Brain batches, the serial brain and the sub pool are a post's (auto_worker); a plain worker refuses."""
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    agent.auto_worker, agent.mode = False, "worker"
+    _parent(ledger)
+    try:
+        sub, _ = await _sub(hub, daemon, agent)
+        assert ledger.task(sub, "owner")["status"] == "FAILED"
+    finally:
+        ledger.close()
+
+
+def _age_brains(ledger):
+    old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    ledger.db.execute("UPDATE brains SET updated_at=?", (old,))
+
+
+async def test_a_brain_still_running_or_queued_keeps_its_batch(tmp_path):
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    _parent(ledger)                                      # T-p RUNNING in robo: the brain is at it
+    try:
+        ledger.set_brain_session("B:desk", "robo", "S-1")
+        _age_brains(ledger)
+        await daemon._expire_brains()
+        assert ledger.brain_session("B:desk", "robo") == "S-1"
+    finally:
+        ledger.close()
+
+
+async def test_busy_and_idle_are_per_project(tmp_path):
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    agent.home("other").mkdir()
+    _parent(ledger, project="other")
+    try:
+        await _sub(hub, daemon, agent)                  # other is busy with a sub
+        ledger.update_task("T-p", "owner", status="WAITING")
+        ledger.set_brain_session("B:desk", "robo", "S-robo")
+        ledger.set_brain_session("B:desk", "other", "S-other")
+        _age_brains(ledger)
+        await daemon._expire_brains()
+        assert ledger.brain_session("B:desk", "robo") is None          # idle robo ends
+        assert ledger.brain_session("B:desk", "other") == "S-other"    # busy other stays
+    finally:
+        ledger.close()
+
+
+async def test_a_sub_belongs_to_its_parents_project(tmp_path):
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    agent.home("other").mkdir()
+    _parent(ledger)                                      # parent in robo
+    try:
+        with pytest.raises(ValueError, match="parent"):
+            await _sub(hub, daemon, agent, project="other")
+        body = {**request_body("x", "y"), "internal": True, "project": "other", "parent_task": "T-p"}
+        env = Envelope(type="REQUEST", sender="B:desk", to="B:desk", task_id="T-forged", body=body)
+        ledger.ingest(env)
+        await daemon._on_request(agent, env)                         # sent around send_request
+        assert ledger.task("T-forged", "owner")["status"] == "FAILED"
+    finally:
+        ledger.close()

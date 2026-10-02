@@ -72,12 +72,9 @@ async def _with_hub(args, fn, *, require_bus: bool = True, watch: bool = False):
             delay = min(delay * 2, 30)
     try:
         command = getattr(getattr(args, "fn", None), "__name__", "")
-        sub = os.environ.get("MUTMUAS_TASK_ID")
-        if sub and command not in SUB_COMMANDS:
-            task = hub.ledger.task(sub, "owner")
-            if ((task or {}).get("request") or {}).get("internal"):
-                raise SystemExit(f"error: {sub} is an internal subtask (D-073): its worker sees no mail and sends "
-                                 "none; it may only report progress, register a job and submit its result")
+        if command not in SUB_COMMANDS and (sub := tools.internal_caller(hub)):     # by process tree (D-073)
+            raise SystemExit(f"error: {sub} is an internal subtask (D-073): its worker sees no mail and sends "
+                             "none; it may only report progress, register a job and submit its result")
         if command not in LEASE_FREE and not (command == "cmd_watch" and getattr(args, "headers_only", False)):
             from .node import lease_refusal
             refusal = lease_refusal(hub.ledger, str(hub.local_agent(_me(args))[0]))

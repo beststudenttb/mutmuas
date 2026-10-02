@@ -574,8 +574,13 @@ class NodeDaemon:
         if env.body.get("internal"):
             if env.sender != env.to:
                 return "refused: an internal subtask is sent by an agent to itself (D-073)"
-            if not (agent.mode == "worker" or agent.auto_worker):
-                return f"refused: {env.to} has no worker to run an internal subtask (auto_worker is off)"
+            if not agent.auto_worker:
+                # a brain, its batch and its sub pool are a post's (Codex review of 09456a9)
+                return f"refused: internal subtasks are for a post with auto_worker; {env.to} has none"
+            parent = self.hub.ledger.task(env.body.get("parent_task") or "", "owner")
+            if parent and agent.project_of(env.body) != agent.project_of(parent.get("request")):
+                return (f"refused: an internal subtask belongs to its parent's project "
+                        f"({agent.project_of(parent.get('request'))}), not {agent.project_of(env.body)}")
         if project := agent.project_of(env.body):
             try:
                 check_token(str(project), "project")
@@ -955,11 +960,16 @@ class NodeDaemon:
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=self.cfg.brain_batch_idle_s)
         ledger = self.hub.ledger
         for row in ledger.brains():
-            if parse_iso(row["updated_at"]) > cutoff:
+            agent = self._agent_cfg(row["local_agent"])
+            if agent is None or parse_iso(row["updated_at"]) > cutoff:
                 continue
+            # busy, per project (Codex review of 09456a9): a sub of it still open, a task waiting on a job, or a
+            # brain run under way or queued
             busy = [t for t in ledger.tasks(role="owner", local_agent=row["local_agent"], statuses=OPEN_STATES,
                                             limit=None)
-                    if (t.get("request") or {}).get("internal") or ledger.jobs(t["task_id"])]
+                    if (agent.project_of(t.get("request")) or "") == row["project"]
+                    and ((t.get("request") or {}).get("internal") or ledger.jobs(t["task_id"])
+                         or t["status"] in ("RUNNING", "ACCEPTED"))]
             if not busy:
                 ledger.forget_brain(row["local_agent"], row["project"])
 

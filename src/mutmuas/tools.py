@@ -8,13 +8,14 @@ Codex (via MCP) and from scripts/humans (via ``agentctl``).
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from .hub import Hub
-from .ids import parse_iso
+from .ids import Address, parse_iso
 from .visibility import acl, artifact_visible, is_participant, message_visible, short
 from .protocol import OPEN_STATES, TERMINAL_STATES, ArtifactRef, Envelope, request_body, result_body
 
@@ -76,7 +77,14 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
             body["model"] = model
         parent = parent_task or _current_task()
         owner = hub.ledger.task(parent, "owner") if parent else None
-        project = project or ((owner or {}).get("request") or {}).get("project")
+        if owner:
+            # a sub belongs to its parent's project (its brain's plan is there; Codex review of 09456a9)
+            agent = hub.local_agent(me)[1]
+            inherited = agent.project_of(owner.get("request"))
+            if project and project != inherited:
+                raise ValueError(f"an internal subtask belongs to its parent's project ({inherited}), "
+                                 f"not {project}")
+            project = inherited
     if project:
         body["project"] = project                    # D-069: the recipient routes it to that project's directory
     sender = str(hub.local_agent(me)[0])
@@ -552,3 +560,36 @@ def _owned(hub: Hub, me: str, task_id: str) -> dict[str, Any]:
         raise PermissionError(f"{task_id} is not owned by {addr}")
     return task
 
+
+
+def internal_caller(hub: Hub) -> str | None:
+    """The internal subtask (D-073) whose worker the calling process descends from, if any. Decided from the
+    process tree (the worker's pid and start time are recorded when the daemon starts it), as for the lease and
+    _check_actor; MUTMUAS_TASK_ID can only add the restriction, never lift it (Codex review of 09456a9)."""
+    from .node import _ancestors, worker_tasks_of
+    chain = {os.getpid(), *_ancestors(os.getpid())}
+    ids = {t for a in hub.cfg.agents for t in worker_tasks_of(hub.ledger, str(Address(hub.cfg.node, a.id)), chain)}
+    if os.environ.get("MUTMUAS_TASK_ID"):
+        ids.add(os.environ["MUTMUAS_TASK_ID"])
+    for task_id in ids:
+        task = hub.ledger.task(task_id, "owner")
+        if ((task or {}).get("request") or {}).get("internal"):
+            return task_id
+    return None
+
+
+def _not_for_subs(fn):
+    """An internal subtask's worker sees no mail and sends none (D-073)."""
+    @functools.wraps(fn)
+    async def guarded(hub: Hub, *args, **kwargs):
+        if sub := internal_caller(hub):
+            raise PermissionError(f"{sub} is an internal subtask (D-073): its worker may only report progress, "
+                                  "register a job and submit its result")
+        return await fn(hub, *args, **kwargs)
+    return guarded
+
+
+for _name in ("send_request", "check_task", "wait_for_result", "inbox", "clear_inbox", "remind_me",
+              "cancel_reminder", "accept_task", "ask_question", "answer", "cancel_task", "add_observer",
+              "list_tasks", "history"):
+    globals()[_name] = _not_for_subs(globals()[_name])

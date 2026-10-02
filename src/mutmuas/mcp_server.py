@@ -95,16 +95,17 @@ SUB_TOOLS = {"report_progress", "submit_result", "add_job"}
 
 
 def internal_subtask(cfg: NodeConfig, task_id: str | None) -> bool:
-    """Is this the worker of an internal subtask (D-073)? Read from the owner's ledger, not from the caller."""
-    if not task_id:
-        return False
+    """Is this the worker of an internal subtask (D-073)? From the owner's ledger: the task it was started for, or
+    the process tree (it descends from a sub's recorded worker process), whatever the caller's binding says."""
     from .ledger import Ledger
     ledger = Ledger(cfg.db_path)
     try:
-        task = ledger.task(task_id, "owner")
+        task = ledger.task(task_id, "owner") if task_id else None
+        if ((task or {}).get("request") or {}).get("internal"):
+            return True
+        return tools.internal_caller(Hub(cfg, None, ledger)) is not None
     finally:
         ledger.close()
-    return bool(((task or {}).get("request") or {}).get("internal"))
 
 
 def holds_session(agent, worker_task: str | None) -> bool:

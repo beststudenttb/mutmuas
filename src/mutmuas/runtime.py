@@ -247,7 +247,9 @@ submit_result, list_agents, find_agent, send_request, wait_for_result, check_tas
 Rules:
 1. Work only inside your working directory ({llm_start_dir(ctx)}){' and ' + ', '.join(map(str, code)) if code else ''}
    unless the request says otherwise. Keep PLAN.md and HANDOFF.md there up to date as a session would
-   (R7.11, D-066). Do not write worker-log.md: the node writes the line when the task is delivered.
+   (R7.11, D-066). Before every run ends (before submit_result, and before ending to wait on a job or on
+   subtasks), rewrite HANDOFF.md's current state: what you did, what comes next and whom you wait for. A later
+   run may start afresh from it. Do not write worker-log.md: the node writes the line when the task is delivered.
 2. Never paste large data into text. Put files/datasets/logs into artifacts with publish_artifact
    and pass the returned references to submit_result.
 3. Call report_progress for meaningful milestones of long work.
