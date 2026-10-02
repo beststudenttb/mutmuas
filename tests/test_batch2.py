@@ -410,3 +410,21 @@ async def test_two_nudges_at_once_send_one(tmp_path, monkeypatch):
         assert len([e for e in ledger.outbox() if e.task_id == "T-nudge" and e.body.get("nudge")]) == 1
     finally:
         ledger.close()
+
+
+async def test_a_refused_result_leaves_the_plan_section_alone(tmp_path):
+    """Codex review of ea40b88: an invalid RESULT (empty summary) was refused after the task's PLAN section had
+    already been taken off the board."""
+    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    owned_task(ledger, "T-s", "RUNNING", ingest=True)
+    board = agent.workdir_path / "PLAN.md"
+    board.parent.mkdir(parents=True, exist_ok=True)
+    board.write_text("# PLAN\n## [>] T-s\n- [ ] important unsaved work\n")
+    try:
+        with pytest.raises(Exception):
+            await tools.submit_result(hub, "B:desk", "complete", "", task_id="T-s")
+        task = ledger.task("T-s", "owner")
+        assert task["status"] == "RUNNING" and task["result"] is None
+        assert "important unsaved work" in board.read_text()
+    finally:
+        ledger.close()
