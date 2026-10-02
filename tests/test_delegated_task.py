@@ -99,6 +99,7 @@ async def test_node_lead_is_notified_of_worker_tasks(make_config, cluster):
                                     inputs={"action": "echo", "text": "ok"})
     await tools.wait_for_result(hub_a, sent["task_id"], 30)
     fyi = await eventually(lambda: _two(tools.inbox(hub_b, "B:main", peek=True)), what="two FYIs at B:main")
+    fyi = sorted(fyi, key=lambda m: m["seq"])                 # the inbox lists the newest first (D-074)
     assert all(m["type"] == "UPDATE" and m["body"]["fyi"] and m["task_id"] == sent["task_id"] for m in fyi)
     assert "accepted" in fyi[0]["body"]["message"] and "from A:main" in fyi[0]["body"]["message"]
     assert "finished" in fyi[1]["body"]["message"] and "(complete)" in fyi[1]["body"]["message"]
