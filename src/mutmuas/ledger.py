@@ -282,10 +282,15 @@ class Ledger:
     def unseen(self, local_agent: str, limit: int = 50, mark: bool = True,
                types: tuple[str, ...] | None = None, since: str | None = None,
                next_to: str | None = None, show: bool = True, own_results: bool = False,
-               leader_first: bool = False, project: tuple[str, str] | None = None) -> list[Envelope]:
+               leader_first: bool = False, project: tuple[str, str] | None = None, before_seq: int | None = None,
+               leader_before_seq: int | None = None) -> list[Envelope]:
         """Inbound messages an interactive agent has not looked at yet.
-        leader_first: the leader's mail (body.leader, D-049) before the rest, each in arrival order; ordered
-        before the limit, so it is on the page however long the backlog is.
+        Without `since` (a session looking at its mail) the page holds the newest (D-074): the leader's mail first
+        (body.leader, D-049, when leader_first), then newest to oldest. Paging back has two stages (Codex review of
+        374be94): leader_before_seq continues the leader's mail older than it (then fills up with the newest other
+        mail); before_seq pages through the other mail only.
+        With `since` (a notifier's cursor, advanced to the last row) it stays in arrival order, oldest first, so
+        nothing is skipped.
 
         Only messages the dispatcher has fully handled: a REQUEST shows up once its task exists
         (so accept_task always works), and requests rejected by policy never show up.
@@ -298,10 +303,16 @@ class Ledger:
             by_row = since is not None and str(since).isdigit()
             since_sql = (" AND rowid > ?" if by_row else " AND created_at > ?") if since else ""
             since_arg = ((int(since) if by_row else since),) if since else ()
-            order = "json_extract(envelope, '$.body.leader') IS NOT 1, rowid" if leader_first else "rowid"
+            if since:
+                order = "rowid"
+            else:
+                order = "json_extract(envelope, '$.body.leader') IS NOT 1, rowid DESC" if leader_first \
+                    else "rowid DESC"
+            before_sql, before_arg = self._page_filter(before_seq, leader_before_seq)
             rows = db.execute("SELECT message_id, envelope FROM messages WHERE direction='in' AND seen=0"
-                              f" AND state='handled' AND local_agent=?{type_sql}{since_sql} ORDER BY {order} LIMIT ?",
-                              (local_agent, *type_args, *since_arg, limit)).fetchall()
+                              f" AND state='handled' AND local_agent=?{type_sql}{since_sql}{before_sql}"
+                              f" ORDER BY {order} LIMIT ?",
+                              (local_agent, *type_args, *since_arg, *before_arg, limit)).fetchall()
             # show: a foreground listing for the session (peek too) = shown, so clear_inbox may clear it later;
             # a notifier's read (watch, push) is not (Codex review of 8c018ee). mark: read.
             sets = [x for x, on in (("shown=1", show), ("seen=1", mark)) if on]
@@ -313,11 +324,29 @@ class Ledger:
     def mark_seen(self, task_id: str) -> None:
         self.db.execute("UPDATE messages SET seen=1 WHERE direction='in' AND task_id=?", (task_id,))
 
+    _LEADER = "json_extract(envelope, '$.body.leader') IS 1"
+
+    def _page_filter(self, before_seq: int | None, leader_before_seq: int | None,
+                     leader_only: bool = False) -> tuple[str, tuple]:
+        """The part of the unread mail a page cursor still covers (D-074): before_seq = the other mail older than
+        it; leader_before_seq = the leader's mail older than it plus all other mail; neither = everything."""
+        sql, args = (f" AND {self._LEADER}", []) if leader_only else ("", [])
+        if before_seq is not None:
+            sql += f" AND NOT ({self._LEADER}) AND rowid < ?"
+            args.append(int(before_seq))
+        elif leader_before_seq is not None:
+            sql += f" AND (NOT ({self._LEADER}) OR rowid < ?)"
+            args.append(int(leader_before_seq))
+        return sql, tuple(args)
+
     def unseen_count(self, local_agent: str, types: tuple[str, ...] | None = None, since: str | None = None,
                      next_to: str | None = None, own_results: bool = False,
-                     project: tuple[str, str] | None = None) -> int:
+                     project: tuple[str, str] | None = None, before_seq: int | None = None,
+                     leader_before_seq: int | None = None, leader_only: bool = False) -> int:
         sql = "SELECT COUNT(*) FROM messages WHERE direction='in' AND seen=0 AND state='handled' AND local_agent=?"
-        args: list[Any] = [local_agent]
+        page_sql, page_args = self._page_filter(before_seq, leader_before_seq, leader_only)
+        sql += page_sql
+        args: list[Any] = [local_agent, *page_args]
         if since:
             sql += " AND rowid > ?" if str(since).isdigit() else " AND created_at > ?"
             args.append(int(since) if str(since).isdigit() else since)

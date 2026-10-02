@@ -282,8 +282,19 @@ async def cmd_inbox(args, hub: Hub):
     if args.only:
         named = {"actionable": tools.ACTIONABLE, "wake": tools.WAKE}
         types = named.get(args.only) or tuple(t.strip().upper() for t in args.only.split(","))
-    rows = await tools.inbox(hub, _me(args), include_seen=args.all, peek=args.peek, wait_s=args.wait, types=types,
-                             since=args.since)
+    more = None
+    if args.all or args.since or args.wait is not None:
+        rows = await tools.inbox(hub, _me(args), include_seen=args.all, peek=args.peek, wait_s=args.wait,
+                                 types=types, since=args.since)
+    else:
+        # a look at the mail: the newest page, and what it left out (D-074)
+        page = await tools.inbox_page(hub, _me(args), peek=args.peek, types=types, before_seq=args.before_seq,
+                                      leader_before_seq=args.leader_before_seq)
+        rows = page["messages"]
+        if page.get("next"):
+            key, value = next(iter(page["next"].items()))
+            more = (f"{page['unread']} unread, {page['listed']} listed; {page['older_unlisted']} older not listed: "
+                    f"agentctl inbox --{key.replace('_', '-')} {value}")
     if args.json:
         _print(rows, True)
     elif not rows:
@@ -292,6 +303,8 @@ async def cmd_inbox(args, hub: Hub):
         if not args.json:
             print(f"{m['timestamp']}  {m['type']:<8} from {m['from']:<24} task {m['task_id']}  "
                   f"{tools._note({'body': m['body']})[:80]}")
+    if more:
+        print(more, file=sys.stderr if args.json else sys.stdout)   # --json stays a plain list for scripts
     if args.wait is not None and not rows:
         raise SystemExit(3)      # timed out: lets a watcher loop tell "nothing yet" from "new mail"
 
@@ -778,6 +791,10 @@ def agentctl_parser() -> argparse.ArgumentParser:
                         "watcher), 'actionable' (also RESULTs), or comma separated types, e.g. REQUEST,QUESTION")
     p.add_argument("--wait", type=float, nargs="?", const=3600, metavar="SECONDS",
                    help="block until a message arrives (default up to 3600 s); exit code 3 on timeout")
+    p.add_argument("--before-seq", type=int, metavar="SEQ",
+                   help="page back: unread mail older than this seq (the listing says which cursor to use)")
+    p.add_argument("--leader-before-seq", type=int, metavar="SEQ",
+                   help="page back through the leader's mail first (the listing says when)")
     p.add_argument("--clear-before", type=int, metavar="SEQ",
                    help="mark all unread mail up to this seq as read (after looking at it with --all/--peek)")
     p = add("watch", cmd_watch, "run forever: desktop notification per new actionable message (launchd/systemd)")

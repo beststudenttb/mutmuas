@@ -37,15 +37,16 @@ async def test_a_workers_queue_takes_the_leaders_tasks_first(tmp_path):
 
 
 async def test_the_sessions_inbox_lists_the_leaders_mail_first(tmp_path):
-    """A watcher's --peek keeps arrival order: its cursor is the last row's received_at."""
+    """The leader's mail first, then the newest (D-074), whether the session peeks or reads. A watcher's cursor
+    (since) keeps arrival order: its cursor is the last row (test_inbox_newest)."""
     _, _, ledger, hub, _ = auto_worker_node(tmp_path)
     try:
         for task_id, leader in (("T-1", False), ("T-L", True), ("T-2", False)):
             _request(ledger, task_id, leader)
         peeked = await tools.inbox(hub, "B:desk", peek=True)
-        assert [r["task_id"] for r in peeked] == ["T-1", "T-L", "T-2"]
+        assert [r["task_id"] for r in peeked] == ["T-L", "T-2", "T-1"]
         read = await tools.inbox(hub, "B:desk")
-        assert [r["task_id"] for r in read] == ["T-L", "T-1", "T-2"]
+        assert [r["task_id"] for r in read] == ["T-L", "T-2", "T-1"]
     finally:
         ledger.close()
 
@@ -87,13 +88,13 @@ async def test_a_restart_queues_tasks_in_the_order_they_came(tmp_path):
 
 async def test_the_leaders_mail_leads_a_backlog_longer_than_one_page(tmp_path):
     """The inbox reads one page (50); the leader's mail must be on it however far back it came (Codex light
-    review ②). The rest keep arrival order."""
+    review ②). The rest of the page is the newest (D-074)."""
     _, _, ledger, hub, _ = auto_worker_node(tmp_path)
     try:
         for n in range(55):
             _request(ledger, f"T-{n:02d}")
         _request(ledger, "T-L", leader=True)
         read = await tools.inbox(hub, "B:desk")
-        assert [r["task_id"] for r in read] == ["T-L"] + [f"T-{n:02d}" for n in range(49)]
+        assert [r["task_id"] for r in read] == ["T-L"] + [f"T-{n:02d}" for n in range(54, 5, -1)]
     finally:
         ledger.close()

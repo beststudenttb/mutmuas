@@ -249,14 +249,21 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         return dump(await tools.cancel_task(hub(), state["me"], task_id, reason))
 
     @server.tool()
-    async def inbox(include_seen: bool = False, peek: bool = False, only: str = "wake") -> str:
+    async def inbox(include_seen: bool = False, peek: bool = False, only: str = "wake",
+                    before_seq: int | None = None, leader_before_seq: int | None = None) -> str:
         """Messages addressed to you. only: "wake" (the default: what needs you - requests, questions, answers,
         refusals, anything naming you as next; with wake_on_own_results in node.yaml also the results of your
         requests that want a reply), "actionable" (also results of your requests) or "all" (also
         ACKs and progress). peek=True leaves them unread. A row with "note" (e.g. rejected: ...) is FYI.
-        Old mail you have dealt with elsewhere: look at inbox(only="all", peek=True), then clear_inbox."""
+        Old mail you have dealt with elsewhere: look at inbox(only="all", peek=True), then clear_inbox.
+        A long backlog lists the leader's mail first, then the newest 50; "more" says how many older ones were
+        left out and `next`, the cursor (before_seq or leader_before_seq) to pass for the following page.
+        Reading marks only what is listed."""
         types = {"wake": tools.WAKE, "actionable": tools.ACTIONABLE}.get(only)
-        return dump(await tools.inbox(hub(), state["me"], include_seen, peek=peek, types=types))
+        if include_seen:
+            return dump(await tools.inbox(hub(), state["me"], include_seen, peek=peek, types=types))
+        return dump(await tools.inbox_page(hub(), state["me"], peek=peek, types=types, before_seq=before_seq,
+                                           leader_before_seq=leader_before_seq))
 
     @server.tool()
     async def add_observer(task_id: str, observer: str) -> str:
