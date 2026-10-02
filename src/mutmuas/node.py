@@ -822,6 +822,7 @@ class NodeDaemon:
                 return
             raise
         except Exception as e:
+            self._mark_unstopped(task_id, spawned)       # its cleanup may have failed too (Codex fourth review)
             await self._run_failed(agent, task_id, attempt, result_body("failed", f"runtime error: {e!r}"))
             return
 
@@ -1108,11 +1109,19 @@ class NodeDaemon:
                 if not (task and task["owner"] == addr and self._old_worker(task)):
                     continue
                 self._note_interrupt(task["task_id"], text)
-                if await self._stop_old_worker(task) == "stopped":     # failed: rechecked, nothing runs beside it
-                    hub.ledger.update_task(task["task_id"], "owner", attempts=0)
-                    await hub.owner_transition(task["task_id"], "ACCEPTED", f"interrupted by {env.sender}: the run "
-                                                                           "from before the restart was stopped")
-                    self._enqueue(addr, task["task_id"])
+                if await self._stop_old_worker(task) != "stopped":
+                    continue                                            # rechecked, nothing runs beside it
+                if hub.ledger.task(task["task_id"], "owner").get("paused"):
+                    # paused: stopped, and still waits for resume; the message waits on the task (Codex fourth
+                    # review: it was laid out without a resume)
+                    if task["status"] != "WAITING":
+                        await hub.owner_transition(task["task_id"], "WAITING", f"paused; interrupted by "
+                                                                               f"{env.sender}: its old run stopped")
+                    continue
+                hub.ledger.update_task(task["task_id"], "owner", attempts=0)
+                await hub.owner_transition(task["task_id"], "ACCEPTED", f"interrupted by {env.sender}: the run "
+                                                                       "from before the restart was stopped")
+                self._enqueue(addr, task["task_id"])
             return
         task = hub.ledger.task(env.task_id, "owner")
         if task is None or task["status"] in TERMINAL_STATES:

@@ -741,3 +741,69 @@ async def test_a_command_that_exits_without_reading_its_stdin_is_not_a_runtime_e
                        body=request_body("x" * 2_000_000, "a big task"))
     outcome = await make_runtime(agent, cfg).run(TaskContext("T-1", request, agent, cfg))
     assert outcome.exit_code == 0
+
+
+# --------------------------------------------------------------------------- Codex fourth review (a41498e)
+
+
+async def test_a_run_that_fails_with_an_io_error_and_cannot_be_stopped_is_watched(tmp_path, monkeypatch):
+    import sys
+    from mutmuas import runtime
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-r", "ACCEPTED", ingest=True)
+    runs, procs = [], []
+
+    async def could_not_stop(pgid, grace_s=5.0):
+        return False
+
+    class Breaks:
+        def __init__(self, *_):
+            pass
+
+        async def run(self, ctx):
+            runs.append(ctx)
+            proc = await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(60)",
+                                                        start_new_session=True)
+            procs.append(proc)
+            ctx.on_spawn(proc.pid)
+            try:
+                raise OSError("synthetic: reading the run's output failed")
+            except BaseException:
+                await runtime._kill_group(proc, grace_s=0.01)       # the runtime's own cleanup, failing
+                raise
+    monkeypatch.setattr(runtime, "stop_group", could_not_stop)
+    monkeypatch.setattr(node_module, "make_runtime", Breaks)
+    daemon._enqueue("B:desk", "T-r")
+    runner = asyncio.create_task(daemon._runner(agent, "B:desk", daemon._queues["B:desk"]))
+    try:
+        await _settle(lambda: "T-r" in daemon._recheck)
+        await asyncio.sleep(0.3)
+        assert len(runs) == 1 and ledger.task("T-r", "owner")["stuck_pgid"] == procs[0].pid
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        for p in procs:
+            p.kill()
+            await p.wait()
+        ledger.close()
+
+
+async def test_an_interrupt_of_a_paused_task_stops_its_group_and_leaves_it_paused(tmp_path, monkeypatch):
+    live = {"group": True}
+
+    async def stopped(pgid, grace_s=5.0):
+        live["group"] = False
+        return True
+    monkeypatch.setattr(node_module, "same_process", lambda *_: False)
+    monkeypatch.setattr(node_module, "group_alive", lambda pgid: live["group"])
+    monkeypatch.setattr(node_module, "stop_group", stopped)
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-r", "WAITING", claim="worker", ingest=True)
+    ledger.update_task("T-r", "owner", paused=1, stuck_pgid=12345)
+    try:
+        await _deliver(daemon, agent, _update("T-r", sender="B:secretary"))
+        task = ledger.task("T-r", "owner")
+        assert not live["group"] and task["paused"] and task["status"] == "WAITING"
+        assert "T-r" not in daemon._queued["B:desk"] and task["interrupts"]          # kept for after resume
+    finally:
+        ledger.close()
