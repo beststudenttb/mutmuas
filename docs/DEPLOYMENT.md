@@ -177,6 +177,7 @@ daemon (`launchctl kickstart -k …` / `systemctl --user restart mutmuas-agent-n
   runtime: claude-code          # claude-code | codex | script
   model: opus                   # optional; empty = CLI default
   workdir: ~/mutmuas/work/representation/visual-rl   # function x project directory (v4), not in a repo
+  default_project: ""           # D-069: requests without `project` go to work/<post>/<this>/ ("" = workdir)
   repo: ~/work/visual_rl        # optional: kind=code tasks get their own git worktree
   code_mode: copy               # copy (default): kind=code works on a private worktree of repo;
                                 # direct: edit code_dirs in place and commit (project-level work, D-031)
@@ -346,6 +347,8 @@ Known risks (protections removed on purpose; one line each):
 - A task waiting on child tasks whose owners never answer and that have no deadline waits forever (sends normally
   get the node's default reply deadline, so this needs `reply: none` or a removed deadline).
 - A limit-stopped run that is laid out again usually stops at the same limit: the retry costs one more run.
+- A session started in any subdirectory of the post directory (other than memory/ and hidden ones) counts as
+  working on a project of that name, and takes only that project's requests (D-072).
   Cancelling such a task does not stop the job: the node knows no process for it.
 - A session's job wake-up moves the task to RUNNING and then writes the session's note; a crash between the two
   loses that wake-up (the task is no longer WAITING, so recovery does not make it up).

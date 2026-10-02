@@ -187,7 +187,7 @@ async def cmd_ask(args, hub: Hub):
         inputs=_parse_kv(args.input) or None, expected_outputs=args.expect, acceptance_criteria=args.accept,
         constraints=args.constraint, timeout_s=args.timeout, priority=args.priority,
         reply=args.reply, deadline=_parse_due(args.due), observers=args.observer,
-        artifacts=[{"uri": uri} for uri in args.artifact or []], leader=args.leader)
+        artifacts=[{"uri": uri} for uri in args.artifact or []], leader=args.leader, project=args.project)
     if args.wait is not None:
         out = await tools.wait_for_result(hub, out["task_id"], args.wait, me=_me(args))
     _print(out, args.json)
@@ -737,6 +737,7 @@ def agentctl_parser() -> argparse.ArgumentParser:
                    help="the leader asked for this task: it goes first in the owner's queue (D-049)")
     p.add_argument("--reason")
     p.add_argument("--kind", default="query", choices=["query", "artifact", "experiment", "code"])
+    p.add_argument("--project", help="the project the work belongs to (default: the recipient's)")
     p.add_argument("--input", action="append", help="key=value (value may be JSON)")
     p.add_argument("--expect", action="append", help="expected output (repeatable)")
     p.add_argument("--accept", action="append", help="acceptance criterion (repeatable)")

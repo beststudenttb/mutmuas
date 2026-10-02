@@ -27,7 +27,7 @@ Addresses and ids used in subjects allow `[A-Za-z0-9_-]` only.
 
 | type | direction | required body | optional body | effect on task |
 |---|---|---|---|---|
-| `REQUEST` | requester → owner | `objective`, `reason` | `kind`, `inputs`, `expected_outputs`, `constraints`, `acceptance_criteria`, `deadline`, `deadline_default`, `timeout_s`, `parent_task`, `reply`, `leader` | creates task (PENDING) |
+| `REQUEST` | requester → owner | `objective`, `reason` | `kind`, `inputs`, `expected_outputs`, `constraints`, `acceptance_criteria`, `deadline`, `deadline_default`, `timeout_s`, `parent_task`, `reply`, `leader`, `project` | creates task (PENDING) |
 | `ACK` | owner → requester | – | `state`, `message` | ACCEPTED (or RUNNING when an interactive agent accepts) |
 | `UPDATE` | owner → requester | `message` | `state` (task state), `progress` | `state` if given |
 | `QUESTION` | either | `question` | – | requester side: WAITING |
@@ -86,6 +86,14 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   queued again as a fresh run (attempts reset; the prompt says how each job ended). A session instead gets a note
   in its own inbox with `next` set to itself, which wakes it. There is no time limit; `whoami` lists
   `jobs_waiting`.
+- **Projects** (D-069/D-072): one address per post, one directory per project under the post directory
+  (`work/<post>/<project>/`). A REQUEST may name its `project` (`send_request(project=…)`, `agentctl ask
+  --project`); without one it belongs to the post's `default_project` (node.yaml), or to the post directory
+  itself when that is unset. The owner's node refuses a request whose project directory does not exist ("run
+  post-init first"). A worker starts in the project directory, and delivery reads that directory's PLAN.md and
+  appends to its worker-log.md. A session started in a project directory takes only that project's requests
+  (its inbox and wake-ups leave out the others, and the worker runs them); a session in the post directory
+  takes all of them, as before.
 - **Waiting on child tasks** (D-066): requests an owner sends while working on a task carry `parent_task` (set
   automatically inside a worker run). `add_job(children=True)` makes the task wait on its direct children; so does
   reporting `state: WAITING` while a child is open. The wait ends once every child has a result, was refused or
