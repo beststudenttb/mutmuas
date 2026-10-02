@@ -352,6 +352,10 @@ Known risks (protections removed on purpose; one line each):
   between can be lost (D-073).
 - An internal subtask's worker is kept from mail by its tools, not by the operating system: it runs as the same
   user with the post's Read/Bash, so it could read the node's ledger file directly (D-073).
+- The 收件 section is rewritten by the node under the PLAN lock; an agent editing PLAN.md at the same moment
+  without the lock can lose its edit or the node's line (D-073 batch 2).
+- An eta lives on the requester's node only (not on the public card): another node's coordinator sees it only
+  through check_task on a task it may see.
 - Two brain runs of one post never overlap, so different projects of a post wait for each other's brain runs.
 - A session started in any real subdirectory of the post directory (other than memory/ and hidden ones) counts
   as working on a project of that name, and with auto_worker takes only that project's requests (D-072).

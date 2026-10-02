@@ -14,7 +14,7 @@ from mutmuas import cli, tools
 CASES = [
     (["cancel", "T-1", "--reason", "why"], "cmd_cancel", "cancel_task", ("T-1", "why"), {}),
     (["cancel", "T-1"], "cmd_cancel", "cancel_task", ("T-1", ""), {}),
-    (["accept", "T-1"], "cmd_accept", "accept_task", ("T-1",), {}),
+    (["accept", "T-1"], "cmd_accept", "accept_task", ("T-1",), {"eta": None}),
     (["reject", "T-1", "no time"], "cmd_reject", "reject_task", ("T-1", "no time"), {}),
     (["question", "T-1", "which one?", "--next", "B:x"], "cmd_question", "ask_question", ("T-1", "which one?"),
      {"next": "B:x"}),

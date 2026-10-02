@@ -100,6 +100,33 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   takes all of them, as before. Which project a session is in is found by file identity, so a case variant of
   the directory or a link into it counts as that project. An agent without `auto_worker` has nobody to hand
   the rest to, so its session takes and sees all work wherever it was started.
+- **Follow-up and receipts** (D-073 batch 2, D-076):
+  - *Arriving work goes on the plan*: the owner's node adds `- [ ] <task> from <sender>: <first line>` to the
+    `## 收件` section of the project's PLAN.md, and the receipt (the PENDING UPDATE, or a worker's ACK) says its
+    place in the queue (`position`, an estimate: the leader's work goes first). Delivery, refusal or withdrawal
+    removes the line. Internal subtasks are not added (their brain writes their lines).
+  - *Push*: the session's MCP server pushes each new message that needs the session once, and when it starts
+    (opening a session, /mcp reconnect) every unread one again, oldest first. It does not push again and again
+    while the session works; the Stop hook has the agent look before it ends a turn. Each push is counted
+    (`messages.pushed`, `pushed_at`); `whoami` shows `inbox_unread`, `oldest_unread_s` and `last_push_at`.
+  - *eta*: `accept_task(eta=…)` and `report_progress(eta=…)` (ISO time with timezone) send the owner's estimate;
+    the requester's node keeps it (`check_task` shows it). When it has passed, the requester's node reminds the
+    owner once (an UPDATE with `next`, asking for a new eta). No new eta within an hour: the requester is told,
+    and the node's `escalate_to` addresses (the secretary) get a copy. A new eta starts over. WAITING (on a job
+    or subtasks) and BLOCKED work is not chased; an owner whose node is offline is not chased; a session that is
+    gone with no worker behind it is reported instead of chased.
+  - *depends_on*: `send_request(depends_on=[…])` names tasks this node knows. The request is held on the
+    sender's node (`delivery: held`) and sent once they are all done, with their summaries in
+    `body.dependencies` and their artifacts attached. Only tasks the sender takes part in can be named, and
+    only artifacts it may see travel with it (checked again when it is sent). If one failed, was refused or
+    withdrawn, it is not sent: it fails and its sender is told. Withdrawing a held request drops it (no CANCEL
+    goes out). While held it is not chased, and its default reply deadline starts when it is sent.
+  - *nudge*: `nudge(task_id, note)` reminds the owner of a task we requested: it is woken (`next`) and must
+    answer what it does, where it is stuck and a new eta. At most once in three hours per task. The owner's
+    node lays out again a worker's task that is neither running nor queued.
+  - *off*: `agentctl session off` (the launcher's `mutmuas <post> off`) keeps the session online but gives
+    it no work: the worker takes new requests and the session's inbox leaves them out; `session on` undoes it.
+    A post without a worker (auto_worker) cannot switch off: nobody else would take the work.
 - **Brain and subs** (D-073): a post's worker runs are its *brain*. With claude-code, its runs for one project
   share one conversation (`claude -p --resume`) while work keeps coming; after `brain_batch_idle_s` (node.yaml,
   default 1800) with no brain run, no sub running and no job waited on, the node forgets the conversation and the
@@ -139,8 +166,9 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   `{task_id, msg_type, sender, summary}`.
   - Start the session with `claude --dangerously-load-development-channels server:mutmuas` until the
     channel is approved.
-  - The push never marks anything read. Mail that arrived before the session started is not pushed, so
-    handle the backlog with `inbox`.
+  - The push never marks anything read. When the MCP server starts (a new session, /mcp reconnect) it pushes
+    every unread message that needs the session once more, oldest first (D-073 batch 2); after that each new
+    one once.
   - Codex keeps `agentctl watch` → `codex queue`.
 - **Presence.** The session's own mutmuas MCP process writes a heartbeat to the node ledger every 15 s. The
   registry card of an interactive agent then shows one of:

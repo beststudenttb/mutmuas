@@ -89,7 +89,7 @@ async def _with_hub(args, fn, *, require_bus: bool = True, watch: bool = False):
 # holder's mail through it (Codex review of dfdd719). `watch --headers-only` shows no content (count, type,
 # sender) and stays lease-free, for notifier services that run outside the session.
 SUB_COMMANDS = {"cmd_update", "cmd_job", "cmd_submit", "cmd_status"}      # all an internal subtask may run
-LEASE_FREE = {"cmd_status", "cmd_agents", "cmd_find"}      # not whoami: MCP whoami is exempt in the MCP layer
+LEASE_FREE = {"cmd_status", "cmd_agents", "cmd_find", "cmd_session"}   # session: run from a shell beside it      # not whoami: MCP whoami is exempt in the MCP layer
                                                           # only (Codex review of 8c018ee)
 
 
@@ -191,7 +191,8 @@ async def cmd_ask(args, hub: Hub):
         inputs=_parse_kv(args.input) or None, expected_outputs=args.expect, acceptance_criteria=args.accept,
         constraints=args.constraint, timeout_s=args.timeout, priority=args.priority,
         reply=args.reply, deadline=_parse_due(args.due), observers=args.observer,
-        artifacts=[{"uri": uri} for uri in args.artifact or []], leader=args.leader, project=args.project)
+        artifacts=[{"uri": uri} for uri in args.artifact or []], leader=args.leader, project=args.project,
+        depends_on=args.depends_on)
     if args.wait is not None:
         out = await tools.wait_for_result(hub, out["task_id"], args.wait, me=_me(args))
     _print(out, args.json)
@@ -365,7 +366,7 @@ async def cmd_cancel(args, hub: Hub):
 
 
 async def cmd_accept(args, hub: Hub):
-    _print(await tools.accept_task(hub, _me(args), args.task_id), args.json)
+    _print(await tools.accept_task(hub, _me(args), args.task_id, eta=args.eta), args.json)
 
 
 async def cmd_reject(args, hub: Hub):
@@ -373,8 +374,17 @@ async def cmd_reject(args, hub: Hub):
 
 
 async def cmd_update(args, hub: Hub):
-    _print(await tools.report_progress(hub, _me(args), args.message, args.task, args.state, next=args.next),
-           args.json)
+    _print(await tools.report_progress(hub, _me(args), args.message, args.task, args.state, next=args.next,
+                                       eta=args.eta), args.json)
+
+
+async def cmd_nudge(args, hub: Hub):
+    _print(await tools.nudge(hub, _me(args), args.task_id, args.note or ""), args.json)
+
+
+async def cmd_session(args, hub: Hub):
+    """`mutmuas <post> off|on` (D-073 batch 2): the session stays online but takes no work (the worker does)."""
+    _print(await tools.set_session_taking_work(hub, _me(args), args.action == "on"), args.json)
 
 
 async def cmd_job(args, hub: Hub):
@@ -755,6 +765,8 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--reason")
     p.add_argument("--kind", default="query", choices=["query", "artifact", "experiment", "code"])
     p.add_argument("--project", help="the project the work belongs to (default: the recipient's)")
+    p.add_argument("--depends-on", action="append", metavar="TASK",
+                   help="hold it here until this task (repeatable) is done; sent with its result")
     p.add_argument("--input", action="append", help="key=value (value may be JSON)")
     p.add_argument("--expect", action="append", help="expected output (repeatable)")
     p.add_argument("--accept", action="append", help="acceptance criterion (repeatable)")
@@ -812,6 +824,7 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--reason")
     p = add("accept", cmd_accept, "accept a task sent to me", bus=False)
     p.add_argument("task_id")
+    p.add_argument("--eta", help="when you expect to deliver (ISO time with timezone)")
     p = add("reject", cmd_reject, "reject a task sent to me", bus=False)
     p.add_argument("task_id")
     p.add_argument("reason")
@@ -820,6 +833,13 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--task")
     p.add_argument("--state", choices=["RUNNING", "WAITING", "BLOCKED"])
     p.add_argument("--next", metavar="ADDR", help="whose move it is now (wakes them)")
+    p.add_argument("--eta", help="a new estimate (ISO time with timezone)")
+    p = add("nudge", cmd_nudge, "remind the owner of a task I requested that seems stuck", bus=False)
+    p.add_argument("task_id")
+    p.add_argument("--note")
+    p = add("session", cmd_session, "my session: off = online but takes no work (the worker does); on = back",
+            bus=False)
+    p.add_argument("action", choices=["off", "on"])
     p = add("job", cmd_job, "register a background job my task waits on; the node wakes me when it ends", bus=False)
     p.add_argument("action", choices=["add"])
     p.add_argument("--task", help="default: $MUTMUAS_TASK_ID (inside a worker run)")
