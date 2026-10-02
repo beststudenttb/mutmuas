@@ -5,6 +5,7 @@ Pause and resume stop and restart a worker's task and travel down to its child t
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 import pytest
 from conftest import auto_worker_node, owned_task
@@ -46,6 +47,13 @@ async def _running(daemon, agent, task_id):
     return runner
 
 
+def _node(tmp_path):
+    """B:desk whose node trusts B:secretary (the leader's word is relayed by the secretary) to interrupt."""
+    agent, cfg, ledger, hub, daemon = auto_worker_node(tmp_path)
+    cfg.trusted_controllers = ["B:secretary"]
+    return agent, cfg, ledger, hub, daemon
+
+
 def _update(task_id, sender="A:sender", priority="normal", **body):
     return Envelope(type="UPDATE", sender=sender, to="B:desk", task_id=task_id, priority=priority,
                     body={"message": "stop using the old environment; use env v2", **body})
@@ -65,11 +73,11 @@ async def _settle(cond, timeout=5):
 
 
 async def test_the_leaders_word_interrupts_a_running_worker_and_is_given_to_the_next_run(tmp_path, blocking):
-    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    agent, _, ledger, hub, daemon = _node(tmp_path)
     owned_task(ledger, "T-r", "ACCEPTED", ingest=True)
     runner = await _running(daemon, agent, "T-r")
     try:
-        await _deliver(daemon, agent, _update("T-r", leader=True))
+        await _deliver(daemon, agent, _update("T-r", sender="B:secretary", leader=True))
         await asyncio.wait_for(blocking.started.wait(), 5)             # stopped, laid out again, running again
         first, second = blocking.runs
         assert "stop using the old environment" not in worker_prompt(first)
@@ -84,7 +92,7 @@ async def test_the_leaders_word_interrupts_a_running_worker_and_is_given_to_the_
 
 
 async def test_ordinary_mail_does_not_interrupt(tmp_path, blocking):
-    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    agent, _, ledger, hub, daemon = _node(tmp_path)
     owned_task(ledger, "T-r", "ACCEPTED", ingest=True)
     runner = await _running(daemon, agent, "T-r")
     try:
@@ -99,7 +107,7 @@ async def test_ordinary_mail_does_not_interrupt(tmp_path, blocking):
 
 async def test_high_priority_with_interrupt_stops_whatever_the_post_runs(tmp_path, blocking):
     """A new instruction (not about the running task) marked interrupt: the running task is laid out again."""
-    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    agent, _, ledger, hub, daemon = _node(tmp_path)
     owned_task(ledger, "T-r", "ACCEPTED", ingest=True)
     runner = await _running(daemon, agent, "T-r")
     try:
@@ -113,7 +121,7 @@ async def test_high_priority_with_interrupt_stops_whatever_the_post_runs(tmp_pat
 
 
 async def test_pause_stops_a_running_worker_until_resume(tmp_path, blocking):
-    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    agent, _, ledger, hub, daemon = _node(tmp_path)
     owned_task(ledger, "T-r", "ACCEPTED", ingest=True)
     runner = await _running(daemon, agent, "T-r")
     try:
@@ -137,7 +145,7 @@ async def test_pause_stops_a_running_worker_until_resume(tmp_path, blocking):
 
 
 async def test_pause_and_resume_travel_down_to_child_tasks(tmp_path):
-    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    agent, _, ledger, hub, daemon = _node(tmp_path)
     owned_task(ledger, "T-p", "RUNNING", ingest=True)
     child = await tools.send_request(hub, "B:desk", "C:rl", "train", "for T-p", parent_task="T-p")
     try:
@@ -152,7 +160,7 @@ async def test_pause_and_resume_travel_down_to_child_tasks(tmp_path):
 
 
 async def test_only_the_requester_or_the_leader_can_pause(tmp_path, blocking):
-    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    agent, _, ledger, hub, daemon = _node(tmp_path)
     owned_task(ledger, "T-r", "ACCEPTED", ingest=True)
     runner = await _running(daemon, agent, "T-r")
     try:
@@ -166,7 +174,7 @@ async def test_only_the_requester_or_the_leader_can_pause(tmp_path, blocking):
 
 
 async def test_a_restart_leaves_a_paused_task_paused(tmp_path):
-    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    agent, _, ledger, hub, daemon = _node(tmp_path)
     owned_task(ledger, "T-r", "WAITING", claim="worker", ingest=True)
     ledger.update_task("T-r", "owner", paused=1)
     try:
@@ -181,7 +189,7 @@ async def test_an_interrupted_brain_run_is_resumed_in_the_same_conversation(tmp_
     midway left none and the next run started afresh. The node now names a new conversation itself
     (--session-id) and records it before the run starts."""
     from mutmuas.runtime import ClaudeCodeRuntime
-    agent, cfg, ledger, hub, daemon = auto_worker_node(tmp_path)
+    agent, cfg, ledger, hub, daemon = _node(tmp_path)
     agent.runtime = "claude-code"
     owned_task(ledger, "T-b", "ACCEPTED", ingest=True)
     runner = await _running(daemon, agent, "T-b")
@@ -191,7 +199,7 @@ async def test_an_interrupted_brain_run_is_resumed_in_the_same_conversation(tmp_
         argv, _ = ClaudeCodeRuntime(agent, cfg).command(first)
         assert argv[argv.index("--session-id") + 1] == first.session_id
         assert ledger.brain_session("B:desk", None) == first.session_id         # known before the run ends
-        await _deliver(daemon, agent, _update("T-b", leader=True))
+        await _deliver(daemon, agent, _update("T-b", sender="B:secretary", leader=True))
         await asyncio.wait_for(blocking.started.wait(), 5)
         second = blocking.runs[1]
         assert second.resume == first.session_id
@@ -200,4 +208,205 @@ async def test_an_interrupted_brain_run_is_resumed_in_the_same_conversation(tmp_
     finally:
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
+        ledger.close()
+
+
+# --------------------------------------------------------------------------- Codex review of 9f39ff0
+
+
+async def test_stopping_a_run_stops_its_whole_process_group_and_frees_its_lock(tmp_path):
+    """A child in the run's process group that ignores SIGTERM and holds a (GPU-like) flock is killed too."""
+    import fcntl
+    import os
+    import sys
+    from mutmuas.runtime import _kill_group
+    lock = tmp_path / "gpu0.lock"
+    code = ("import os,signal,time,fcntl,sys\n"
+            "fd=os.open(sys.argv[1], os.O_RDWR|os.O_CREAT, 0o600)\nfcntl.flock(fd, fcntl.LOCK_EX)\n"
+            "os.set_inheritable(fd,True)\npid=os.fork()\n"
+            "if pid==0:\n signal.signal(signal.SIGTERM,signal.SIG_IGN)\n os.close(1)\n while True: time.sleep(1)\n"
+            "else:\n print(pid,flush=True)\n while True: time.sleep(1)\n")
+    proc = await asyncio.create_subprocess_exec(sys.executable, "-c", code, str(lock),
+                                                stdout=asyncio.subprocess.PIPE, start_new_session=True)
+    child = int(await proc.stdout.readline())
+    try:
+        await _kill_group(proc, grace_s=0.5)
+        with pytest.raises(ProcessLookupError):
+            os.kill(child, 0)
+        fd = os.open(lock, os.O_RDWR)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)            # free again
+        os.close(fd)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, 9)
+
+
+async def test_a_resume_while_the_paused_run_is_still_stopping_keeps_the_task_going(tmp_path, monkeypatch):
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-r", "ACCEPTED", ingest=True)
+    started, cleaning, release, runs = asyncio.Event(), asyncio.Event(), asyncio.Event(), []
+
+    class SlowStop:
+        def __init__(self, *_):
+            pass
+
+        async def run(self, ctx):
+            runs.append(ctx)
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cleaning.set()
+                await release.wait()
+                raise
+    monkeypatch.setattr(node_module, "make_runtime", SlowStop)
+    daemon._enqueue("B:desk", "T-r")
+    runner = asyncio.create_task(daemon._runner(agent, "B:desk", daemon._queues["B:desk"]))
+    try:
+        await asyncio.wait_for(started.wait(), 3)
+        started.clear()
+        await _deliver(daemon, agent, _update("T-r", pause=True))
+        await asyncio.wait_for(cleaning.wait(), 3)
+        await _deliver(daemon, agent, _update("T-r", resume=True))
+        release.set()
+        await asyncio.wait_for(started.wait(), 3)                       # run again
+        assert len(runs) == 2 and not ledger.task("T-r", "owner")["paused"]
+    finally:
+        release.set()
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        ledger.close()
+
+
+async def test_after_a_restart_pause_stops_the_old_worker_still_running(tmp_path):
+    import subprocess
+    import sys
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-r", "RUNNING", claim="worker", ingest=True)
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+    try:
+        daemon._record_worker("T-r", proc.pid)
+        await daemon.recover()                                           # the old worker is left running
+        await _deliver(daemon, agent, _update("T-r", pause=True))
+        assert proc.wait(10) is not None
+        task = ledger.task("T-r", "owner")
+        assert task["paused"] and task["status"] == "WAITING"
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        ledger.close()
+
+
+async def test_an_interrupt_before_the_runtime_starts_still_lays_the_task_out_again(tmp_path, monkeypatch):
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-r", "ACCEPTED", ingest=True)
+    entered, original = asyncio.Event(), hub.owner_transition
+
+    async def stuck_transition(task_id, state, *args, **kwargs):
+        if task_id == "T-r" and state == "RUNNING" and not entered.is_set():
+            entered.set()
+            await asyncio.Event().wait()
+        return await original(task_id, state, *args, **kwargs)
+    monkeypatch.setattr(hub, "owner_transition", stuck_transition)
+    daemon._enqueue("B:desk", "T-r")
+    runner = asyncio.create_task(daemon._runner(agent, "B:desk", daemon._queues["B:desk"]))
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        await _deliver(daemon, agent, _update("T-r", sender="B:secretary", leader=True))
+        # laid out again, and the next run (attempt 1 again: the stopped one does not count) closes it
+        await _settle(lambda: ledger.task("T-r", "owner")["status"] in ("COMPLETED", "FAILED"))
+        assert ledger.task("T-r", "owner")["attempts"] == 1
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        ledger.close()
+
+
+async def test_a_job_ending_while_paused_leaves_the_task_paused(tmp_path):
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-r", "WAITING", claim="worker", ingest=True)
+    ledger.update_task("T-r", "owner", paused=1)
+    done = tmp_path / "train.done"
+    done.write_text("exit 0")
+    ledger.add_job("T-r", "B:desk", None, None, str(done), None, "training")
+    try:
+        await daemon._check_jobs()
+        task = ledger.task("T-r", "owner")
+        assert task["status"] == "WAITING" and task["paused"] and "T-r" not in daemon._queued["B:desk"]
+        assert ledger.jobs("T-r") == [] and any("training" in n for n in task["interrupts"])
+        await _deliver(daemon, agent, _update("T-r", resume=True))
+        assert "T-r" in daemon._queued["B:desk"]
+    finally:
+        ledger.close()
+
+
+async def test_a_held_child_is_paused_and_not_sent_until_resumed(tmp_path):
+    from mutmuas.protocol import result_body
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-p", "RUNNING", ingest=True)
+    dep = await tools.send_request(hub, "B:desk", "C:far", "train", "dep", parent_task="T-x")
+    held = await tools.send_request(hub, "B:desk", "C:rl", "evaluate", "after", parent_task="T-p",
+                                    depends_on=[dep["task_id"]])
+    try:
+        await _deliver(daemon, agent, _update("T-p", pause=True))
+        await daemon._on_reply(Envelope(type="RESULT", sender="C:far", to="B:desk", task_id=dep["task_id"],
+                                        body=result_body("complete", "trained")))
+        await daemon._release_held()
+        assert not [e for e in ledger.outbox() if e.task_id == held["task_id"] and e.type == "REQUEST"]
+        await _deliver(daemon, agent, _update("T-p", resume=True))
+        await daemon._release_held()
+        assert [e for e in ledger.outbox() if e.task_id == held["task_id"] and e.type == "REQUEST"]
+    finally:
+        ledger.close()
+
+
+async def test_only_trusted_addresses_interrupt_and_priority_is_no_permission(tmp_path, blocking):
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-r", "ACCEPTED", ingest=True)
+    runner = await _running(daemon, agent, "T-r")
+    try:
+        for env in (_update("T-r", sender="C:stranger", priority="high", leader=True),   # claims, not trusted
+                    _update("T-r", priority="high", leader=True),                         # even its requester
+                    _update("T-other", sender="C:stranger", priority="high", interrupt=True)):
+            await _deliver(daemon, agent, env)
+        await asyncio.sleep(0.3)
+        assert len(blocking.runs) == 1 and "T-r" in daemon._running
+        await _deliver(daemon, agent, _update("T-r", sender="B:secretary"))             # trusted
+        await asyncio.wait_for(blocking.started.wait(), 5)
+        assert len(blocking.runs) == 2
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        ledger.close()
+
+
+async def test_a_requester_pauses_only_its_own_task_sent_to_this_address(tmp_path):
+    agent, cfg, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-r", "ACCEPTED", ingest=True)                 # A:sender -> B:desk
+    try:
+        stray = Envelope(type="UPDATE", sender="A:sender", to="B:other", task_id="T-r",
+                         body={"message": "x", "pause": True})          # not the address the task belongs to
+        assert daemon._interrupt_kind(stray) is None
+        assert daemon._interrupt_kind(_update("T-r", sender="C:stranger", pause=True)) is None
+        assert daemon._interrupt_kind(_update("T-r", pause=True)) == "pause"
+    finally:
+        ledger.close()
+
+
+async def test_a_restart_stops_the_old_worker_of_a_paused_task(tmp_path):
+    import subprocess
+    import sys
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-r", "WAITING", claim="worker", ingest=True)
+    ledger.update_task("T-r", "owner", paused=1)
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+    try:
+        daemon._record_worker("T-r", proc.pid)          # paused, but its worker outlived the old node
+        await daemon.recover()
+        assert proc.wait(10) is not None
+        task = ledger.task("T-r", "owner")
+        assert task["paused"] and task["status"] == "WAITING"
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
         ledger.close()

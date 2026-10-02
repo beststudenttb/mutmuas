@@ -14,11 +14,13 @@ MUTMUAS_CONFIG / MUTMUAS_AGENT / MUTMUAS_TASK_ID from the environment, so
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import signal
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -388,16 +390,27 @@ def _last_json(text: str) -> dict[str, Any] | None:
     return None
 
 
-async def _kill_group(proc: asyncio.subprocess.Process) -> None:
-    if proc.returncode is not None:
-        return
-    for sig, wait in ((signal.SIGTERM, 5), (signal.SIGKILL, 5)):
+async def stop_group(pgid: int, grace_s: float = 5.0) -> bool:
+    """Stop a run's whole process group: SIGTERM, then SIGKILL to whatever is left after grace_s. The group is
+    waited on, not just its leader: a child that ignores SIGTERM would keep running and keep its locks (a GPU
+    flock) (Codex review of 9f39ff0). True once the group is gone."""
+    # macOS answers EPERM for a group of zombies only (dead, not yet reaped by their parent): that is gone too
+    for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
-            os.killpg(proc.pid, sig)
-        except ProcessLookupError:
-            return
-        try:
-            await asyncio.wait_for(asyncio.shield(proc.wait()), wait)
-            return
-        except asyncio.TimeoutError:
-            continue
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            return True
+        deadline = time.monotonic() + grace_s
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+            try:
+                os.killpg(pgid, 0)
+            except (ProcessLookupError, PermissionError):
+                return True
+    return False
+
+
+async def _kill_group(proc: asyncio.subprocess.Process, grace_s: float = 5.0) -> None:
+    await stop_group(proc.pid, grace_s)          # the run starts its own session: its group id is its pid
+    with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(proc.wait()), grace_s)

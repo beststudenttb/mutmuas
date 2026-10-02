@@ -39,7 +39,7 @@ from .hub import Hub
 from .ids import Address, InvalidAddress, check_token, now_iso, parse_iso
 from .protocol import (OPEN_STATES, REQUEST_KINDS, TERMINAL_STATES, ArtifactRef, Envelope, ProtocolError,
                        reply_required, result_body, task_state_for_result)
-from .runtime import TaskContext, make_runtime
+from .runtime import TaskContext, make_runtime, stop_group
 from .visibility import CARD_KEYS, accepts_kinds, acl, artifact_visible, is_participant, short
 from .worktree import GitError, Worktree
 
@@ -327,8 +327,12 @@ class NodeDaemon:
         # every open task, not just the newest page (A:codex: a backlog > 200 left old tasks stuck)
         for task in hub.ledger.tasks(role="owner", statuses=OPEN_STATES, limit=None):
             agent = self._agent_cfg(task["owner"])
-            if agent is None or task.get("paused"):
-                continue                # gone from the config, or paused until resumed (D-089)
+            if agent is not None and task.get("paused"):
+                # paused until resumed (D-089); a worker that outlived the old node is stopped (Codex review of 9f39ff0)
+                await self._stop_old_worker(task)
+                continue
+            if agent is None:
+                continue                # gone from the config
             if hub.ledger.jobs(task["task_id"]):
                 continue        # waits on a background job: the heartbeat wakes it when the job ends
             if task["status"] == "WAITING" and (ended := hub.ledger.jobs(task["task_id"], open_only=False)):
@@ -720,6 +724,10 @@ class NodeDaemon:
                         raise
             finally:
                 self._running.pop(task_id, None)
+                if (why := self._interrupted.pop(task_id, None)) is not None:
+                    # stopped before its runtime ran (in Worktree.create, in the RUNNING transition): settled here,
+                    # or the stop was lost (Codex review of 9f39ff0)
+                    await self._settle_stopped(task_id, why)
                 self._queued[addr].discard(task_id)
                 if task_id in self._retry:
                     self._retry.discard(task_id)
@@ -797,14 +805,7 @@ class NodeDaemon:
             return
         except asyncio.CancelledError:
             if (why := self._interrupted.pop(task_id, None)) is not None:
-                # stopped on purpose (D-089): paused, or laid out again with the message for the next run
-                hub.ledger.update_task(task_id, "owner", attempts=max(0, attempt - 1))
-                if why == "pause":
-                    await hub.owner_transition(task_id, "WAITING", "paused: the run was stopped; waits for resume")
-                else:
-                    await hub.owner_transition(task_id, "ACCEPTED", "interrupted: the run was stopped and is laid "
-                                                                    "out again with the new message")
-                    self._retry.add(task_id)
+                await self._settle_stopped(task_id, why)
                 return
             if task_id in self._cancel_requested:
                 self._cancel_requested.discard(task_id)
@@ -923,6 +924,31 @@ class NodeDaemon:
             except Exception as e:
                 self._failed("heartbeat", e)
 
+    async def _settle_stopped(self, task_id: str, why: str) -> None:
+        """A run stopped on purpose (D-089): paused, or laid out again with the message for the next run. The run
+        does not count as an attempt. A pause resumed while the run was still stopping goes on as an interrupt
+        (Codex review of 9f39ff0: the queue was lost)."""
+        hub = self.hub
+        task = hub.ledger.task(task_id, "owner")
+        if task is None or task["status"] in TERMINAL_STATES:
+            return
+        hub.ledger.update_task(task_id, "owner", attempts=max(0, task["attempts"] - 1))
+        if why == "pause" and task.get("paused"):
+            await hub.owner_transition(task_id, "WAITING", "paused: the run was stopped; waits for resume")
+        else:
+            await hub.owner_transition(task_id, "ACCEPTED", "interrupted: the run was stopped and is laid "
+                                                            "out again with the new message")
+            self._retry.add(task_id)
+
+    async def _stop_old_worker(self, task: dict[str, Any]) -> bool:
+        """A worker from before a restart still runs this task (not one of ours, so it cannot be cancelled): stop its
+        process group. True if there was one (Codex review of 9f39ff0: pause left it running)."""
+        if not same_process(task.get("runner_pid"), task.get("runner_start")):
+            return False
+        await stop_group(task["runner_pid"])           # started in its own session: group id = pid
+        self._recheck.discard(task["task_id"])
+        return True
+
     async def _check_jobs(self) -> None:
         """Background jobs (D-050): one has ended when its process is gone or its done-file is there. A task whose
         last job ended is woken: a worker's is queued again (a fresh run, attempts reset), a session is told."""
@@ -942,6 +968,11 @@ class NodeDaemon:
             task = hub.ledger.task(job["task_id"], "owner")
             if task["status"] in TERMINAL_STATES or hub.ledger.jobs(job["task_id"]):
                 continue            # closed meanwhile, or still waiting on another job
+            if task.get("paused"):
+                # paused: stays WAITING; resume runs it with this news (Codex review of 9f39ff0)
+                self._note_interrupt(job["task_id"], f"background job ended while paused: {ended}; "
+                                                     f"log {job['log'] or '-'}; note {job['note'] or '-'}")
+                continue
             await self._wake_for_job(task, job, ended)
 
     def _children_ended(self, task_id: str) -> str | None:
@@ -1004,15 +1035,17 @@ class NodeDaemon:
         hub.ledger.mark_handled(wake.message_id)
 
     def _interrupt_kind(self, env: Envelope) -> str | None:
-        """D-089: the leader's word, or priority high, interrupts a worker's run: a message about the task it runs, or
-        any marked interrupt. pause / resume stop and restart a task; its requester may also send them."""
-        urgent = env.priority == "high" or bool(env.body.get("leader"))
+        """D-089: a trusted controller (node.yaml trusted_controllers; the leader's word comes relayed by the
+        secretary) interrupts a worker's run: a message about the task it runs, or any marked interrupt; it may pause
+        and resume any task here. Anyone else may pause / resume only a task it requested from this address.
+        priority and body.leader are not permissions: they only order what is allowed (Codex review of 9f39ff0)."""
+        trusted = env.sender in self.cfg.trusted_controllers
         task = self.hub.ledger.task(env.task_id, "owner")
         if env.body.get("pause") or env.body.get("resume"):
-            if task and (urgent or env.sender == task["requester"]):
+            if task and task["owner"] == env.to and (trusted or env.sender == task["requester"]):
                 return "pause" if env.body.get("pause") else "resume"
             return None
-        if urgent and (env.body.get("interrupt") or env.task_id in self._running):
+        if trusted and (env.body.get("interrupt") or env.task_id in self._running):
             return "interrupt"
         return None
 
@@ -1027,6 +1060,14 @@ class NodeDaemon:
                 self._note_interrupt(task_id, text)
                 self._interrupted[task_id] = "interrupt"
                 self._running[task_id].cancel()
+            task = hub.ledger.task(env.task_id, "owner")
+            if task and task["owner"] == addr and env.task_id not in self._running and await self._stop_old_worker(task):
+                # a worker from before a restart: stopped, and the task runs again with the message
+                self._note_interrupt(env.task_id, text)
+                hub.ledger.update_task(env.task_id, "owner", attempts=0)
+                await hub.owner_transition(env.task_id, "ACCEPTED", f"interrupted by {env.sender}: the run from "
+                                                                    "before the restart was stopped")
+                self._enqueue(addr, env.task_id)
             return
         task = hub.ledger.task(env.task_id, "owner")
         if task is None or task["status"] in TERMINAL_STATES:
@@ -1039,11 +1080,14 @@ class NodeDaemon:
                 self._interrupted[env.task_id] = "pause"
                 runner.cancel()
             else:
+                await self._stop_old_worker(task)
                 await hub.owner_transition(env.task_id, "WAITING", f"paused by {env.sender}")
         else:
             hub.ledger.update_task(env.task_id, "owner", paused=0)
             self._note_interrupt(env.task_id, "resumed by " + text)
-            if (agent.mode == "worker" or agent.auto_worker) and task.get("runner") != "session":
+            if hub.ledger.jobs(env.task_id):
+                pass        # still waits on a background job: its end wakes the task
+            elif (agent.mode == "worker" or agent.auto_worker) and task.get("runner") != "session":
                 await hub.owner_transition(env.task_id, "ACCEPTED", f"resumed by {env.sender}")
                 self._enqueue(addr, env.task_id)
             else:
@@ -1056,8 +1100,13 @@ class NodeDaemon:
 
     async def _cascade(self, env: Envelope, kind: str) -> None:
         """Pause and resume travel down parent_task to the open child tasks, on whatever node they run (D-089)."""
+        held = self.hub.ledger.held_ids()
         for child in self.hub.ledger.children(env.task_id):
             if child["status"] in TERMINAL_STATES:
+                continue
+            if child["task_id"] in held:
+                # not sent yet (depends_on): it waits here, paused, until resumed (Codex review of 9f39ff0)
+                self.hub.ledger.update_task(child["task_id"], "requester", paused=int(kind == "pause"))
                 continue
             await self.hub.send(Envelope(
                 type="UPDATE", sender=child["local_agent"], to=child["owner"], task_id=child["task_id"],
@@ -1121,6 +1170,8 @@ class NodeDaemon:
         artifacts once all are done; if one failed, was refused or withdrawn, not sent: the requester is told."""
         hub = self.hub
         for held in hub.ledger.held():
+            if (hub.ledger.task(held["task_id"], "requester") or {}).get("paused"):
+                continue                                      # its parent is paused (D-089)
             deps = {d: hub.ledger.task(d) for d in held["depends_on"]}
             failed = [d for d, t in deps.items() if t and t["status"] in TERMINAL_STATES
                       and (t["status"] != "COMPLETED" or t.get("result_status") == "failed")]

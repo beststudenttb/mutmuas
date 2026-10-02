@@ -191,6 +191,9 @@ class NodeConfig:
     message_retention_days: float = 30
     artifact_max_mb: float = 2048         # upload cap for the NATS object store backend
     escalate_to: list[str] = field(default_factory=list)   # copied on follow-ups (overdue reply, session gone)
+    # may interrupt or pause any post of this node (D-089); others pause / resume only what they asked for. A soft
+    # boundary: the nodes share one bus credential (DEPLOYMENT 8a). The leader's word comes relayed by the secretary.
+    trusted_controllers: list[str] = field(default_factory=list)
     coordinators: list[str] = field(default_factory=list)  # may see every task's status layer (visibility.py)
     # A request that needs a reply but names no deadline gets this one (seconds from sending), so the overdue
     # follow-up can chase it (no-stall design, G3). 0 = no default.
