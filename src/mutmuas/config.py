@@ -199,6 +199,9 @@ class NodeConfig:
     # None = no limit. A run stopped at a limit without a result is a failed run (R5.4: run once more).
     worker_max_turns: int | None = None
     worker_max_cost_usd: float | None = None
+    # A post's brain batch (D-073) ends after this long without a brain run (and with no sub running or job waited
+    # on); the next run starts a new conversation. Provisional default: to be set from measured costs.
+    brain_batch_idle_s: float = 1800
     agents: list[AgentConfig] = field(default_factory=list)
     path: Path | None = None              # where this config was loaded from
 

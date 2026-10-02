@@ -43,6 +43,12 @@ class TaskContext:
     git_branch: str | None = None
     on_spawn: Any = None                 # called with the process id once the agent process exists
     jobs: list[dict[str, Any]] = field(default_factory=list)   # background jobs of this task that have ended
+    resume: str | None = None            # a brain batch's conversation to continue (D-073)
+
+    @property
+    def internal(self) -> bool:
+        """An internal subtask (D-073): a brain's own long work, run by its worker."""
+        return bool(self.request.body.get("internal"))
 
     @property
     def home(self) -> Path:
@@ -114,6 +120,8 @@ class SubprocessRuntime:
         log_path = runs / f"{ctx.task_id}.{stamp}.attempt{ctx.attempt}.log"
         workdir = self.start_dir(ctx)
         workdir.mkdir(parents=True, exist_ok=True)
+        if ctx.internal:
+            (ctx.home / "runs" / ctx.task_id).mkdir(parents=True, exist_ok=True)     # a sub's outputs (D-073)
         log.info("task %s: starting %s in %s", ctx.task_id, argv[0], workdir)
         with open(log_path, "wb") as logf:
             logf.write(f"$ {' '.join(argv)}\n".encode())
@@ -178,7 +186,35 @@ def extra_dirs(ctx: TaskContext) -> list[Path]:
     return dirs + (ctx.agent.code_paths if ctx.agent.code_mode == "direct" else [])
 
 
+def sub_prompt(ctx: TaskContext) -> str:
+    """An internal subtask (D-073): one piece of its brain's work, no mail, no plan of its own."""
+    req = ctx.request
+    out = ctx.home / "runs" / ctx.task_id
+    return f"""You are a sub-worker of {ctx.address} in the mutmuas multi-agent system (project "{ctx.node.project}",
+node {ctx.node.node}). Your brain gave you one piece of its work.
+
+Task id: {ctx.task_id}   (attempt {ctx.attempt})
+TASK:
+{json.dumps(req.body, indent=2, ensure_ascii=False)}
+
+You have the MCP server "mutmuas" with three tools, all for this task only: report_progress, submit_result, add_job.
+Rules:
+1. Work in {llm_start_dir(ctx)}. Write your outputs (files, logs, results) under {out}.
+2. Do not edit PLAN.md or HANDOFF.md: the node marks your line on your brain's plan when you report progress
+   and when you finish. Do not write worker-log.md either.
+3. Call report_progress for meaningful milestones of long work.
+4. Finish by calling submit_result exactly once, as the very last step. status must be honest: complete = every
+   acceptance criterion met; partial = some output but not all; failed = nothing usable. Put the paths of your
+   outputs and the key numbers in it; how you did it in `how`, anything worth noting in `notes`.
+5. Work that runs long (e.g. training): start it detached, `nohup <command> > <log> 2>&1 < /dev/null &` (on a GPU
+   machine through gpu-run), register it with add_job (pid and done_file, log, a one-line note) and end this run
+   without submit_result. You are started again when the job ends.
+"""
+
+
 def worker_prompt(ctx: TaskContext) -> str:
+    if ctx.internal:
+        return sub_prompt(ctx)
     req = ctx.request
     code = extra_dirs(ctx)
     git_note = (f"\nThe code for this task is in an isolated git worktree{' at ' + str(ctx.workdir) if code else ''} "
@@ -211,7 +247,9 @@ submit_result, list_agents, find_agent, send_request, wait_for_result, check_tas
 Rules:
 1. Work only inside your working directory ({llm_start_dir(ctx)}){' and ' + ', '.join(map(str, code)) if code else ''}
    unless the request says otherwise. Keep PLAN.md and HANDOFF.md there up to date as a session would
-   (R7.11, D-066). Do not write worker-log.md: the node writes the line when the task is delivered.
+   (R7.11, D-066). Before every run ends (before submit_result, and before ending to wait on a job or on
+   subtasks), rewrite HANDOFF.md's current state: what you did, what comes next and whom you wait for. A later
+   run may start afresh from it. Do not write worker-log.md: the node writes the line when the task is delivered.
 2. Never paste large data into text. Put files/datasets/logs into artifacts with publish_artifact
    and pass the returned references to submit_result.
 3. Call report_progress for meaningful milestones of long work.
@@ -233,6 +271,10 @@ Rules:
 
 class ClaudeCodeRuntime(SubprocessRuntime):
     name = "claude-code"
+
+    @staticmethod
+    def request_model(ctx: TaskContext) -> str | None:
+        return ctx.request.body.get("model")
 
     def start_dir(self, ctx: TaskContext) -> Path:
         return llm_start_dir(ctx)
@@ -259,8 +301,11 @@ class ClaudeCodeRuntime(SubprocessRuntime):
                 "--tools", ",".join(available), "--allowedTools", ",".join(tools)]
         for d in extra_dirs(ctx):
             argv += ["--add-dir", str(d)]
-        if self.agent.model:
-            argv += ["--model", self.agent.model]
+        model = (self.request_model(ctx) or "sonnet") if ctx.internal else self.agent.model   # a sub: latest Sonnet
+        if model:
+            argv += ["--model", model]
+        if ctx.resume:
+            argv += ["--resume", ctx.resume]
         # Worker limits (D-066): the agent's own, else the node's default; --max-turns is accepted by claude -p
         # although its --help does not list it (checked in the 2.1.285 binary)
         turns = self.agent.max_turns if self.agent.max_turns is not None else ctx.node.worker_max_turns
@@ -300,8 +345,9 @@ class CodexRuntime(SubprocessRuntime):
                 # exec mode cannot prompt; pre-approve only our own server's tools
                 "-c", 'mcp_servers.mutmuas.default_tools_approval_mode="approve"',
                 *(["-c", "sandbox_workspace_write.network_access=true"] if writable and self.agent.network else [])]
-        if self.agent.model:
-            argv += ["-m", self.agent.model]
+        model = ctx.request.body.get("model") if ctx.internal else None
+        if model or self.agent.model:
+            argv += ["-m", model or self.agent.model]
         return argv + list(self.agent.extra_args) + ["-"], worker_prompt(ctx).encode()
 
 

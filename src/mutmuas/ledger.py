@@ -116,6 +116,15 @@ CREATE TABLE IF NOT EXISTS failures (
     error           TEXT NOT NULL            -- "<ExceptionType>: <message>"
 );
 
+-- A post's brain batch (D-073): worker runs of (agent, project) resume this conversation until an idle spell.
+CREATE TABLE IF NOT EXISTS brains (
+    local_agent     TEXT NOT NULL,
+    project         TEXT NOT NULL,           -- "" for the post directory itself
+    session_id      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    PRIMARY KEY (local_agent, project)
+);
+
 -- Background jobs a task waits on (D-050): the heartbeat wakes the post when one ends. No time limit.
 CREATE TABLE IF NOT EXISTS jobs (
     job_id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -274,10 +283,12 @@ class Ledger:
     def _project_filter(project: tuple[str, str] | None) -> tuple[str, tuple]:
         """project = (the session's project, the post's default project): leave out requests of other projects,
         which the worker takes (D-072). A request without `project` belongs to the default project."""
+        # a brain's internal subtasks (D-073) are its own work for its worker, never mail for the session
+        internal = " AND NOT (type = 'REQUEST' AND json_extract(envelope, '$.body.internal') IS 1)"
         if not project:
-            return "", ()
-        return (" AND NOT (type = 'REQUEST' AND COALESCE(json_extract(envelope, '$.body.project'), ?) IS NOT ?)",
-                (project[1], project[0]))
+            return internal, ()
+        return (internal + " AND NOT (type = 'REQUEST' AND COALESCE(json_extract(envelope, '$.body.project'), ?)"
+                " IS NOT ?)", (project[1], project[0]))
 
     def unseen(self, local_agent: str, limit: int = 50, mark: bool = True,
                types: tuple[str, ...] | None = None, since: str | None = None,
@@ -512,6 +523,22 @@ class Ledger:
                               " children) VALUES (?,?,?,?,?,?,?,?,?)",
                               (task_id, owner, pid, pid_start, done_file, log, note, now_iso(), int(children)))
         return cur.lastrowid
+
+    def brain_session(self, local_agent: str, project: str | None) -> str | None:
+        row = self.db.execute("SELECT session_id FROM brains WHERE local_agent=? AND project=?",
+                              (local_agent, project or "")).fetchone()
+        return row["session_id"] if row else None
+
+    def set_brain_session(self, local_agent: str, project: str | None, session_id: str) -> None:
+        self.db.execute("INSERT INTO brains (local_agent, project, session_id, updated_at) VALUES (?,?,?,?)"
+                        " ON CONFLICT(local_agent, project) DO UPDATE SET session_id=excluded.session_id,"
+                        " updated_at=excluded.updated_at", (local_agent, project or "", session_id, now_iso()))
+
+    def forget_brain(self, local_agent: str, project: str | None) -> None:
+        self.db.execute("DELETE FROM brains WHERE local_agent=? AND project=?", (local_agent, project or ""))
+
+    def brains(self) -> list[dict[str, Any]]:
+        return [dict(r) for r in self.db.execute("SELECT * FROM brains")]
 
     def children(self, task_id: str) -> list[dict[str, Any]]:
         """The tasks this node requested on behalf of task_id (their parent_task), oldest first."""

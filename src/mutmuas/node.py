@@ -214,6 +214,9 @@ class NodeDaemon:
         # (0 = the leader's task, task created_at, tie-break, task_id): the leader's tasks first, the rest in the
         # order they came (D-049). created_at is the ledger's, so recover() (newest first) keeps that order too.
         self._queues: dict[str, asyncio.PriorityQueue[tuple[int, str, int, str]]] = {}
+        # internal subtasks of an auto_worker post (D-073): their own pool (max_concurrent), so the brain's queue
+        # (one at a time: one conversation) never waits behind a long sub
+        self._internal: dict[str, asyncio.PriorityQueue[tuple[int, str, int, str]]] = {}
         self._arrivals = itertools.count()
         self._queued: dict[str, set[str]] = {}               # task ids queued or running, per agent
         self._running: dict[str, asyncio.Task] = {}          # task_id -> runner task
@@ -240,8 +243,13 @@ class NodeDaemon:
             self._spawn(self._dispatcher(agent, addr), f"dispatch:{addr}")
             if agent.mode == "worker" or agent.auto_worker:
                 self._queues[addr] = asyncio.PriorityQueue()
-                for i in range(max(1, agent.max_concurrent)):
-                    self._spawn(self._runner(agent, addr), f"run:{addr}:{i}")
+                brains = 1 if agent.auto_worker else max(1, agent.max_concurrent)   # a brain runs one at a time
+                for i in range(brains):
+                    self._spawn(self._runner(agent, addr, self._queues[addr]), f"run:{addr}:{i}")
+                if agent.auto_worker:
+                    self._internal[addr] = asyncio.PriorityQueue()
+                    for i in range(max(1, agent.max_concurrent)):
+                        self._spawn(self._runner(agent, addr, self._internal[addr]), f"sub:{addr}:{i}")
         self._spawn(self._heartbeat(), "heartbeat")
         self._spawn(self._outbox_loop(), "outbox")
         await self.recover()
@@ -544,7 +552,8 @@ class NodeDaemon:
                                        body={"reason": denial})
             return "rejected"
         await hub.publish_task_record(env.task_id)
-        if agent.mode == "worker" or (agent.auto_worker and not self._session_takes(agent, env.to, env.task_id)):
+        if (agent.mode == "worker" or env.body.get("internal")
+                or (agent.auto_worker and not self._session_takes(agent, env.to, env.task_id))):
             await self._accept(env.task_id)
             self._enqueue(env.to, env.task_id)
             await self._notify(agent, env.to, env.task_id,      # status layer only: the lead is no participant
@@ -562,6 +571,16 @@ class NodeDaemon:
         needed = REQUEST_KINDS[env.body.get("kind", "query")]
         if not agent.has(needed):
             return f"permission denied: {env.to} lacks {needed} required for kind={env.body.get('kind', 'query')}"
+        if env.body.get("internal"):
+            if env.sender != env.to:
+                return "refused: an internal subtask is sent by an agent to itself (D-073)"
+            if not agent.auto_worker:
+                # a brain, its batch and its sub pool are a post's (Codex review of 09456a9)
+                return f"refused: internal subtasks are for a post with auto_worker; {env.to} has none"
+            parent = self.hub.ledger.task(env.body.get("parent_task") or "", "owner")
+            if parent and agent.project_of(env.body) != agent.project_of(parent.get("request")):
+                return (f"refused: an internal subtask belongs to its parent's project "
+                        f"({agent.project_of(parent.get('request'))}), not {agent.project_of(env.body)}")
         if project := agent.project_of(env.body):
             try:
                 check_token(str(project), "project")
@@ -652,11 +671,11 @@ class NodeDaemon:
             return
         self._queued[addr].add(task_id)
         task = self.hub.ledger.task(task_id, "owner")
-        self._queues[addr].put_nowait((0 if task["request"].get("leader") else 1, task["created_at"],
-                                       next(self._arrivals), task_id))
+        queue = self._internal.get(addr) if task["request"].get("internal") else None
+        (queue or self._queues[addr]).put_nowait((0 if task["request"].get("leader") else 1, task["created_at"],
+                                                  next(self._arrivals), task_id))
 
-    async def _runner(self, agent: AgentConfig, addr: str) -> None:
-        queue = self._queues[addr]
+    async def _runner(self, agent: AgentConfig, addr: str, queue: asyncio.PriorityQueue) -> None:
         while True:
             *_, task_id = await queue.get()
             try:
@@ -688,8 +707,10 @@ class NodeDaemon:
             # Claim it for the worker in one transaction with the session check: never done twice, and while
             # the leader's session is there, a task that has not started yet is his to decide (D-032a).
             addr = task["owner"]
+            internal = (task.get("request") or {}).get("internal")         # a sub is never the session's
             refused = hub.ledger.claim_task(task_id, "worker", ("ACCEPTED", "RUNNING"),
-                                            refuse_if=lambda: self._session_takes(agent, addr, task_id))
+                                            refuse_if=None if internal else
+                                            lambda: self._session_takes(agent, addr, task_id))
             if refused:
                 if "session" in refused and task["status"] == "ACCEPTED":
                     # Release the claim first: a stop between the two steps leaves ACCEPTED + no runner, which
@@ -708,8 +729,13 @@ class NodeDaemon:
         request = hub.ledger.request_envelope(task_id)
         timeout = float(request.body.get("timeout_s") or agent.task_timeout_s)
         hub.ledger.update_task(task_id, "owner", result_draft=None)
+        # a post's brain (D-073): its runs share one conversation per project while work keeps coming (claude-code;
+        # Codex starts afresh each run until its session id can be read back)
+        brain = agent.auto_worker and not request.body.get("internal") and agent.runtime == "claude-code"
+        project = agent.project_of(request.body)
         ctx = TaskContext(task_id, request, agent, self.cfg, attempt,
-                          jobs=[j for j in hub.ledger.jobs(task_id, open_only=False) if j["ended_at"]])
+                          jobs=[j for j in hub.ledger.jobs(task_id, open_only=False) if j["ended_at"]],
+                          resume=hub.ledger.brain_session(task["owner"], project) if brain else None)
         if agent.auto_worker:
             ctx.on_spawn = lambda pid: self._record_worker(task_id, pid)
         wt = None
@@ -741,6 +767,11 @@ class NodeDaemon:
             await self._run_failed(agent, task_id, attempt, result_body("failed", f"runtime error: {e!r}"))
             return
 
+        if brain:
+            if outcome.exit_code != 0 and ctx.resume:
+                hub.ledger.forget_brain(task["owner"], project)      # e.g. the conversation is gone: next run afresh
+            elif outcome.session_id:
+                hub.ledger.set_brain_session(task["owner"], project, outcome.session_id)
         current = hub.ledger.task(task_id, "owner")
         if current["status"] in TERMINAL_STATES:
             return      # the agent already closed the task through its tools
@@ -827,6 +858,7 @@ class NodeDaemon:
                 await self._auto_dispatch()
                 await self._check_jobs()
                 await self._fire_reminders()
+                await self._expire_brains()
                 for task_id in list(self._recheck):         # old workers still running at the last look
                     task = self.hub.ledger.task(task_id, "owner")
                     if task and task["status"] not in TERMINAL_STATES:
@@ -920,6 +952,26 @@ class NodeDaemon:
         wake = Envelope(type="UPDATE", sender=owner, to=owner, task_id=task_id, body={"message": text, "next": owner})
         hub.ledger.ingest(wake)
         hub.ledger.mark_handled(wake.message_id)
+
+    async def _expire_brains(self) -> None:
+        """End a brain batch (D-073) after brain_batch_idle_s without a brain run, unless one of the post's subs
+        still runs or one of its tasks waits on a job: the next run then starts a new conversation and picks up
+        from HANDOFF/PLAN. The brain updates those every run, so nothing is lost by forgetting the id."""
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=self.cfg.brain_batch_idle_s)
+        ledger = self.hub.ledger
+        for row in ledger.brains():
+            agent = self._agent_cfg(row["local_agent"])
+            if agent is None or parse_iso(row["updated_at"]) > cutoff:
+                continue
+            # busy, per project (Codex review of 09456a9): a sub of it still open, a task waiting on a job, or a
+            # brain run under way or queued
+            busy = [t for t in ledger.tasks(role="owner", local_agent=row["local_agent"], statuses=OPEN_STATES,
+                                            limit=None)
+                    if (agent.project_of(t.get("request")) or "") == row["project"]
+                    and ((t.get("request") or {}).get("internal") or ledger.jobs(t["task_id"])
+                         or t["status"] in ("RUNNING", "ACCEPTED"))]
+            if not busy:
+                ledger.forget_brain(row["local_agent"], row["project"])
 
     async def _fire_reminders(self) -> None:
         """Due reminders (D-066) become a note in the agent's own inbox that hands it the baton: it wakes a session

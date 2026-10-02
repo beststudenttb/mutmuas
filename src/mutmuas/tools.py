@@ -8,13 +8,14 @@ Codex (via MCP) and from scripts/humans (via ``agentctl``).
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from .hub import Hub
-from .ids import parse_iso
+from .ids import Address, parse_iso
 from .visibility import acl, artifact_visible, is_participant, message_visible, short
 from .protocol import OPEN_STATES, TERMINAL_STATES, ArtifactRef, Envelope, request_body, result_body
 
@@ -51,7 +52,8 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                        deadline: str | None = None, artifacts: list[dict] | None = None,
                        parent_task: str | None = None, priority: str = "normal",
                        reply: str | None = None, observers: list[str] | None = None,
-                       leader: bool = False, project: str | None = None) -> dict[str, Any]:
+                       leader: bool = False, project: str | None = None, internal: bool = False,
+                       model: str | None = None) -> dict[str, Any]:
     default_deadline = None
     if not deadline and reply != "none" and hub.cfg.default_reply_deadline_s > 0:
         # Without a deadline nothing ever chases a missing reply (no-stall design, G3): take the node's default,
@@ -66,6 +68,23 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                         deadline=deadline or default_deadline, timeout_s=timeout_s, reply=reply, observers=observers,
                         deadline_default=bool(default_deadline),  # the owner can tell it from a chosen one
                         leader=leader)
+    if internal:
+        # D-073: a brain's own long work, run by its worker (never the session); sent to itself, in its project
+        if await hub.resolve(to) != str(hub.local_agent(me)[0]):
+            raise ValueError("an internal subtask is sent to yourself (to = your own address)")
+        body["internal"] = True
+        if model:
+            body["model"] = model
+        parent = parent_task or _current_task()
+        owner = hub.ledger.task(parent, "owner") if parent else None
+        if owner:
+            # a sub belongs to its parent's project (its brain's plan is there; Codex review of 09456a9)
+            agent = hub.local_agent(me)[1]
+            inherited = agent.project_of(owner.get("request"))
+            if project and project != inherited:
+                raise ValueError(f"an internal subtask belongs to its parent's project ({inherited}), "
+                                 f"not {project}")
+            project = inherited
     if project:
         body["project"] = project                    # D-069: the recipient routes it to that project's directory
     sender = str(hub.local_agent(me)[0])
@@ -312,6 +331,7 @@ async def report_progress(hub: Hub, me: str, message: str, task_id: str | None =
             and any(c["status"] not in TERMINAL_STATES for c in hub.ledger.children(task_id))):
         # Waiting with open child tasks is waiting on them: the node wakes this task when they are done (D-066)
         hub.ledger.add_job(task_id, task["owner"], None, None, None, None, "child tasks", children=True)
+    hub.mark_sub_on_plan(task_id, "!" if new_state == "BLOCKED" else ">", message if new_state == "BLOCKED" else None)
     return {"task_id": task_id, "state": new_state, "sent": ok}
 
 
@@ -540,3 +560,36 @@ def _owned(hub: Hub, me: str, task_id: str) -> dict[str, Any]:
         raise PermissionError(f"{task_id} is not owned by {addr}")
     return task
 
+
+
+def internal_caller(hub: Hub) -> str | None:
+    """The internal subtask (D-073) whose worker the calling process descends from, if any. Decided from the
+    process tree (the worker's pid and start time are recorded when the daemon starts it), as for the lease and
+    _check_actor; MUTMUAS_TASK_ID can only add the restriction, never lift it (Codex review of 09456a9)."""
+    from .node import _ancestors, worker_tasks_of
+    chain = {os.getpid(), *_ancestors(os.getpid())}
+    ids = {t for a in hub.cfg.agents for t in worker_tasks_of(hub.ledger, str(Address(hub.cfg.node, a.id)), chain)}
+    if os.environ.get("MUTMUAS_TASK_ID"):
+        ids.add(os.environ["MUTMUAS_TASK_ID"])
+    for task_id in ids:
+        task = hub.ledger.task(task_id, "owner")
+        if ((task or {}).get("request") or {}).get("internal"):
+            return task_id
+    return None
+
+
+def _not_for_subs(fn):
+    """An internal subtask's worker sees no mail and sends none (D-073)."""
+    @functools.wraps(fn)
+    async def guarded(hub: Hub, *args, **kwargs):
+        if sub := internal_caller(hub):
+            raise PermissionError(f"{sub} is an internal subtask (D-073): its worker may only report progress, "
+                                  "register a job and submit its result")
+        return await fn(hub, *args, **kwargs)
+    return guarded
+
+
+for _name in ("send_request", "check_task", "wait_for_result", "inbox", "clear_inbox", "remind_me",
+              "cancel_reminder", "accept_task", "ask_question", "answer", "cancel_task", "add_observer",
+              "list_tasks", "history"):
+    globals()[_name] = _not_for_subs(globals()[_name])
