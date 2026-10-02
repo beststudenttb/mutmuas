@@ -347,6 +347,9 @@ Known risks (protections removed on purpose; one line each):
 - A task waiting on child tasks whose owners never answer and that have no deadline waits forever (sends normally
   get the node's default reply deadline, so this needs `reply: none` or a removed deadline).
 - A limit-stopped run that is laid out again usually stops at the same limit: the retry costs one more run.
+- The node and the brain may write the same PLAN.md at the same moment; the node rewrites only the sub's line
+  (write to a temporary file, then rename), and a brain write in between can be lost (D-073).
+- Two brain runs of one post never overlap, so different projects of a post wait for each other's brain runs.
 - A session started in any real subdirectory of the post directory (other than memory/ and hidden ones) counts
   as working on a project of that name, and with auto_worker takes only that project's requests (D-072).
   Cancelling such a task does not stop the job: the node knows no process for it.

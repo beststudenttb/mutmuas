@@ -345,6 +345,23 @@ class Hub:
         log.info("task %s -> %s (%s)", task_id, status, message)
         return True
 
+    def mark_sub_on_plan(self, task_id: str, marker: str, note: str | None = None) -> None:
+        """An internal subtask (D-073) does not write PLAN.md: the node marks its line on its brain's plan, in the
+        project directory the sub belongs to (the brain's own)."""
+        task = self.ledger.task(task_id, "owner")
+        request = (task or {}).get("request") or {}
+        if not request.get("internal"):
+            return
+        agent = self.local_agent(task["owner"])[1]
+        board = agent.home(agent.project_of(request)) / "PLAN.md"
+        if board.is_file():
+            text = board.read_text()
+            marked = mark_plan_line(text, task_id, marker, note)
+            if marked != text:
+                tmp = board.with_suffix(".md.tmp")
+                tmp.write_text(marked)
+                tmp.replace(board)
+
     async def finish(self, task_id: str, result: dict[str, Any], artifacts: list[ArtifactRef] | None = None,
                      record: bool = True) -> bool:
         """Send the RESULT for an owned task and close it. Refuses to finish a task twice.
@@ -373,6 +390,9 @@ class Hub:
         await self.try_publish(env)
         await self.publish_task_record(task_id)
         log.info("task %s finished: %s", task_id, result["status"])
+        if (task.get("request") or {}).get("internal"):
+            # a sub's line on its brain's plan (D-073); the brain itself adds and rearranges the lines
+            self.mark_sub_on_plan(task_id, "!" if result["status"] == "failed" else "x", result.get("summary"))
         if workdir:
             if section:
                 board.write_text(drop_plan_section(board.read_text(), task_id))
@@ -380,6 +400,14 @@ class Hub:
             with open(workdir / "worker-log.md", "a") as f:
                 f.write(log_line(task, result) + "\n")
         return True
+
+
+def mark_plan_line(text: str, task_id: str, marker: str, note: str | None = None) -> str:
+    """The first checklist line naming task_id gets the marker ([>] [x] [!] ...) and, if given, a note."""
+    pattern = re.compile(rf"^(\s*[-*]\s*)\[[ >xw!]\](.*\b{re.escape(task_id)}\b.*?)(\s+— .*)?$", re.M)
+    note = " ".join(str(note).split())[:200] if note else ""
+    return pattern.sub(lambda m: f"{m.group(1)}[{marker}]{m.group(2)}" + (f" — {note}" if note else ""), text,
+                       count=1)
 
 
 _HEADING = re.compile(r" {0,3}(#{1,6})(?:\s|$)")

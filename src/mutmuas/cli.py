@@ -72,6 +72,12 @@ async def _with_hub(args, fn, *, require_bus: bool = True, watch: bool = False):
             delay = min(delay * 2, 30)
     try:
         command = getattr(getattr(args, "fn", None), "__name__", "")
+        sub = os.environ.get("MUTMUAS_TASK_ID")
+        if sub and command not in SUB_COMMANDS:
+            task = hub.ledger.task(sub, "owner")
+            if ((task or {}).get("request") or {}).get("internal"):
+                raise SystemExit(f"error: {sub} is an internal subtask (D-073): its worker sees no mail and sends "
+                                 "none; it may only report progress, register a job and submit its result")
         if command not in LEASE_FREE and not (command == "cmd_watch" and getattr(args, "headers_only", False)):
             from .node import lease_refusal
             refusal = lease_refusal(hub.ledger, str(hub.local_agent(_me(args))[0]))
@@ -85,6 +91,7 @@ async def _with_hub(args, fn, *, require_bus: bool = True, watch: bool = False):
 # Commands that only read public state: allowed while another session holds the agent. Not `watch`: it shows mail content (objective, summary, ...), so a second session could read the
 # holder's mail through it (Codex review of dfdd719). `watch --headers-only` shows no content (count, type,
 # sender) and stays lease-free, for notifier services that run outside the session.
+SUB_COMMANDS = {"cmd_update", "cmd_job", "cmd_submit", "cmd_status"}      # all an internal subtask may run
 LEASE_FREE = {"cmd_status", "cmd_agents", "cmd_find"}      # not whoami: MCP whoami is exempt in the MCP layer
                                                           # only (Codex review of 8c018ee)
 

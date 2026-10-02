@@ -96,6 +96,18 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   takes all of them, as before. Which project a session is in is found by file identity, so a case variant of
   the directory or a link into it counts as that project. An agent without `auto_worker` has nobody to hand
   the rest to, so its session takes and sees all work wherever it was started.
+- **Brain and subs** (D-073): a post's worker runs are its *brain*. With claude-code, its runs for one project
+  share one conversation (`claude -p --resume`) while work keeps coming; after `brain_batch_idle_s` (node.yaml,
+  default 1800) with no brain run, no sub running and no job waited on, the node forgets the conversation and the
+  next run starts afresh from HANDOFF/PLAN (the brain updates them every run). Brain runs of a post are serial.
+  Codex brains start afresh each run for now. A brain's long work goes to *internal subtasks*:
+  `send_request(to=<itself>, internal=true, model=…)`. The owner's node refuses one from anyone else; it is
+  always run by the worker (never the session, even one online), from its own pool (`max_concurrent`), on the
+  requested model or the latest Sonnet, and it inherits the parent's project. It is left out of the session's
+  inbox. Its worker gets only `report_progress`, `submit_result` and `add_job` (agentctl refuses its other
+  commands too), writes its outputs under `runs/<task>/` and does not write PLAN/HANDOFF: the node marks the line
+  naming it on the brain's PLAN.md (`[>]` on progress, `[x] — summary` when done, `[!] — why` when failed or
+  blocked). The brain waits for its subs with `add_job(children=True)`.
 - **Waiting on child tasks** (D-066): requests an owner sends while working on a task carry `parent_task` (set
   automatically inside a worker run). `add_job(children=True)` makes the task wait on its direct children; so does
   reporting `state: WAITING` while a child is open. The wait ends once every child has a result, was refused or
