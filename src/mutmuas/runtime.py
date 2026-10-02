@@ -419,8 +419,15 @@ def _group_gone(pgid: int, sig: int) -> bool:
 
 
 def _group_states(pgid: int) -> list[str]:
-    """The process states (ps STAT) of the members of a process group."""
-    out = subprocess.run(["/bin/ps", "-axo", "pgid=,stat="], capture_output=True, text=True).stdout
+    """The process states (ps STAT) of the members of a process group; ["?"] (unknown, not a zombie) when ps
+    cannot run or fails (a sandbox): then the group is not shown gone and the stop counts as failed."""
+    try:
+        done = subprocess.run(["/bin/ps", "-axo", "pgid=,stat="], capture_output=True, text=True)
+    except (OSError, subprocess.SubprocessError):
+        return ["?"]
+    if done.returncode != 0:
+        return ["?"]
+    out = done.stdout
     return [stat for line in out.splitlines() if len(parts := line.split()) == 2 and parts[0] == str(pgid)
             for stat in [parts[1]]]
 

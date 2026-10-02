@@ -541,3 +541,29 @@ def test_trusted_controllers_must_be_a_list_of_full_addresses(tmp_path, value):
                                     "agents": [{"id": "desk", "mode": "interactive"}]}))
     with pytest.raises(ConfigError, match="trusted_controllers"):
         load_config(path)
+
+
+async def test_a_group_whose_states_cannot_be_read_counts_as_not_stopped(monkeypatch):
+    """EPERM, and /bin/ps cannot run (a sandbox): the group cannot be shown gone, so the stop failed."""
+    from mutmuas import runtime
+
+    def eperm(pgid, sig):
+        raise PermissionError(1, "Operation not permitted")
+
+    def no_ps(*args, **kwargs):
+        raise PermissionError(1, "ps is not allowed here")
+    monkeypatch.setattr(runtime.os, "killpg", eperm)
+    monkeypatch.setattr(runtime.subprocess, "run", no_ps)
+    assert await runtime.stop_group(4242, grace_s=0.1) is False
+
+
+async def test_a_failing_ps_does_not_make_a_group_look_gone(monkeypatch):
+    import subprocess
+    from mutmuas import runtime
+
+    def eperm(pgid, sig):
+        raise PermissionError(1, "Operation not permitted")
+    monkeypatch.setattr(runtime.os, "killpg", eperm)
+    monkeypatch.setattr(runtime.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a, 1, stdout="", stderr="ps: not allowed"))
+    assert await runtime.stop_group(4242, grace_s=0.1) is False
