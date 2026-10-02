@@ -306,13 +306,16 @@ class NodeDaemon:
             task.cancel()
         await asyncio.gather(*background, return_exceptions=True)
         self._background.clear()
-        if self.hub:
-            with contextlib.suppress(Exception):
-                await self._publish_cards(state_override="offline")
-            await self.hub.close()
-        if (lock := getattr(self, "_daemon_lock", None)) is not None:
-            self._daemon_lock = None
-            lock.__exit__(None, None, None)
+        try:
+            if self.hub:
+                with contextlib.suppress(Exception):
+                    await self._publish_cards(state_override="offline")
+                await self.hub.close()
+        finally:
+            # its loops have ended: the lock goes even if going offline is cancelled or fails (Codex third review)
+            if (lock := getattr(self, "_daemon_lock", None)) is not None:
+                self._daemon_lock = None
+                lock.__exit__(None, None, None)
         log.info("node %s stopped", self.cfg.node)
 
     async def run_forever(self) -> None:

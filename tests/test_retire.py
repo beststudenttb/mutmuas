@@ -421,3 +421,49 @@ async def test_a_daemon_that_fails_to_start_lets_go_of_its_lock(tmp_path):
         await daemon.run_forever()
     with daemon_lock(cfg):
         pass
+
+
+# --------------------------------------------------------------------------- Codex third review (88b6720)
+
+
+async def test_undo_refuses_when_the_post_directory_is_gone_before_it_was_archived(tmp_path, bus):
+    path, post = _small(tmp_path)
+    bus["bus"] = FakeBus(fail=True)                      # fails at the mailbox, before the archive step
+    with pytest.raises(OSError):
+        await retire(path, "vision")
+    [manifest] = list(tmp_path.glob("RETIRED-vision-*.json"))
+    record = json.loads(manifest.read_text())
+    assert record["archive_to"] and "archiving" not in record["steps"]
+    post.rename(tmp_path / "moved-away")                 # someone moved it elsewhere meanwhile
+    with pytest.raises(FileNotFoundError, match="neither"):
+        await undo(manifest)
+    ledger = Ledger(load_config(path).db_path)
+    try:
+        assert ledger.retiring("C:vision") and "id: vision" not in path.read_text()      # nothing changed
+    finally:
+        ledger.close()
+
+
+async def test_a_stop_cancelled_while_going_offline_still_lets_go_of_the_lock(tmp_path):
+    import asyncio
+    from mutmuas.hub import Hub
+    from mutmuas.node import NodeDaemon, daemon_lock
+    path, post = _small(tmp_path)
+    cfg = load_config(path)
+    daemon = NodeDaemon(cfg)
+    lock = daemon_lock(cfg)
+    lock.__enter__()
+    daemon._daemon_lock = lock
+    daemon.hub = Hub(cfg, None, Ledger(cfg.db_path))
+    publishing = asyncio.Event()
+
+    async def slow_offline(**_kwargs):
+        publishing.set()
+        await asyncio.Event().wait()                    # the network is slow
+    daemon._publish_cards = slow_offline
+    stopping = asyncio.create_task(daemon.stop())
+    await asyncio.wait_for(publishing.wait(), 3)
+    stopping.cancel()                                   # stop itself is cancelled (a second ctrl-c, a timeout)
+    await asyncio.gather(stopping, return_exceptions=True)
+    with daemon_lock(cfg):
+        pass

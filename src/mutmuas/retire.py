@@ -267,7 +267,6 @@ async def undo(manifest: Path | str, dry_run: bool = False) -> dict[str, Any]:
 
 def _undo(path: Path, done: dict[str, Any], dry_run: bool) -> dict[str, Any]:
     agent_id = done["agent"].split(":", 1)[1]
-    steps = done.get("steps") or []
     out: dict[str, Any] = {"agent": done["agent"], "dry_run": dry_run, "config": None, "directory": None}
     text = path.read_text()
     candidate = None
@@ -280,8 +279,9 @@ def _undo(path: Path, done: dict[str, Any], dry_run: bool) -> dict[str, Any]:
     except KeyError:
         candidate = _insert(text, done)
         out["config"] = f"block goes back as item {done['index']} of agents"
-    # the directory: where it was archived, or was being archived when the manifest stopped
-    archive = done.get("archived_to") or (done.get("archive_to") if "archiving" in steps else None)
+    # the directory, if retiring was to archive it: at its archive (moved, whether or not the manifest got to say
+    # so), or still in its place; neither changes nothing (Codex third review: it was restored as "done" without it)
+    archive = done.get("archived_to") or done.get("archive_to")
     workdir = Path(done["workdir"])
     if archive and Path(archive).exists():
         if workdir.exists():
