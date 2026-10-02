@@ -567,9 +567,10 @@ class NodeDaemon:
                 check_token(str(project), "project")
             except InvalidAddress as e:
                 return f"refused: {e}"
-            if not agent.home(project).is_dir():
-                return (f"project {project} is not set up on {env.to} ({agent.home(project)} does not exist): "
-                        "run post-init for it first, or send without project")
+            if agent.project_entry(project) is None:
+                return (f"project {project} is not set up on {env.to}: {agent.home(project)} is not a directory "
+                        "(by that exact name, not a link) under the post directory; run post-init for it first, "
+                        "or send without project")
         return None
 
     def _session_takes(self, agent: AgentConfig, addr: str, task_id: str) -> str | None:

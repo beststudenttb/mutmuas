@@ -143,7 +143,8 @@ async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, 
     from .node import session_alive
     session = hub.ledger.session_of(str(addr))
     mine = agent.session_project(session["cwd"]) if session and session_alive(session) else None
-    project = (mine, agent.default_project) if mine else None      # a project's session: only its requests (D-072)
+    # a project's session: only its requests (D-072); the rest go to the worker, so only when there is one
+    project = (mine, agent.default_project) if mine and agent.auto_worker else None
     # A message that hands me the baton (body.next == me) needs me as much as a REQUEST does.
     # (a notifier's ACTIONABLE view too: Codex's watch, which then sees a background job's wake-up)
     next_to = str(addr) if types in (WAKE, ACTIONABLE) else None

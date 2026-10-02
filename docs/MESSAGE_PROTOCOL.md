@@ -89,11 +89,13 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
 - **Projects** (D-069/D-072): one address per post, one directory per project under the post directory
   (`work/<post>/<project>/`). A REQUEST may name its `project` (`send_request(project=…)`, `agentctl ask
   --project`); without one it belongs to the post's `default_project` (node.yaml), or to the post directory
-  itself when that is unset. The owner's node refuses a request whose project directory does not exist ("run
-  post-init first"). A worker starts in the project directory, and delivery reads that directory's PLAN.md and
+  itself when that is unset. The owner's node refuses a request whose project is not a real directory by that
+  exact name right under the post directory (missing, a link, or another spelling of it: "run post-init first"). A worker starts in the project directory, and delivery reads that directory's PLAN.md and
   appends to its worker-log.md. A session started in a project directory takes only that project's requests
   (its inbox and wake-ups leave out the others, and the worker runs them); a session in the post directory
-  takes all of them, as before.
+  takes all of them, as before. Which project a session is in is found by file identity, so a case variant of
+  the directory or a link into it counts as that project. An agent without `auto_worker` has nobody to hand
+  the rest to, so its session takes and sees all work wherever it was started.
 - **Waiting on child tasks** (D-066): requests an owner sends while working on a task carry `parent_task` (set
   automatically inside a worker run). `add_job(children=True)` makes the task wait on its direct children; so does
   reporting `state: WAITING` while a child is open. The wait ends once every child has a result, was refused or

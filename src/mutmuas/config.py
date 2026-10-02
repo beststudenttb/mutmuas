@@ -108,18 +108,40 @@ class AgentConfig:
         """Where work for `project` happens: work/<post>/<project>/, or the post directory without a project."""
         return self.workdir_path / project if project else self.workdir_path
 
+    def project_entry(self, name: str) -> str | None:
+        """`name` if it is exactly the on-disk name of a real directory (not a link) right under the post
+        directory, else None. One identity for a project everywhere (Codex review of fe64cee): a case variant on a
+        case-insensitive file system or a link is not a second name for it."""
+        home = self.workdir_path
+        try:
+            entries = os.listdir(home)
+        except OSError:
+            return None
+        path = home / name
+        return name if name in entries and path.is_dir() and not path.is_symlink() else None
+
     def session_project(self, cwd: str | None) -> str | None:
-        """The project a session works on: the directory right under the post directory it was started in
-        (D-072). None for a session in the post directory itself (the coordinator: it takes all work) or outside
-        it. memory/ and hidden directories are not projects."""
+        """The project a session works on (D-072): the real directory right under the post directory that its cwd
+        is in, by its on-disk name, found by file identity (samefile), so a case variant or a link into it counts
+        as that directory. None for a session in the post directory itself (the coordinator: it takes all work)
+        or outside it. memory/ and hidden directories are not projects."""
         if not cwd:
             return None
-        home = Path(os.path.realpath(self.workdir_path))
-        here = Path(os.path.realpath(cwd))
-        if here == home or not here.is_relative_to(home):
+        home = self.workdir_path
+        try:
+            here = Path(os.path.realpath(cwd))
+            if os.path.samefile(here, home):
+                return None
+            top = next((a for a in here.parents if os.path.samefile(a.parent, home)), None)
+            if top is None and os.path.samefile(here.parent, home):
+                top = here
+            if top is None:
+                return None
+            name = next((e for e in os.listdir(home) if not (home / e).is_symlink() and (home / e).is_dir()
+                         and os.path.samefile(home / e, top)), None)
+        except OSError:
             return None
-        first = here.relative_to(home).parts[0]
-        return None if first == "memory" or first.startswith(".") else first
+        return None if name is None or name == "memory" or name.startswith(".") else name
 
     @property
     def copies_code(self) -> bool:

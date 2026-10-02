@@ -153,3 +153,52 @@ async def test_the_worker_picks_up_other_projects_work_left_pending(tmp_path, se
         assert refused is None                                      # _execute's claim lets the worker run it
     finally:
         ledger.close()
+
+
+# --------------------------------------------------------------------------- Codex light review of fe64cee
+
+
+async def test_without_a_worker_a_project_session_still_sees_and_takes_other_projects_work(tmp_path, session):
+    """auto_worker off: nobody else would take it, so it is neither filtered from the session nor left hidden."""
+    agent, ledger, hub, daemon = _node(tmp_path)
+    agent.auto_worker = False
+    ledger.session_beat("B:desk", session.pid, str(agent.workdir_path / "robo"), session_pid=session.pid)
+    try:
+        await _arrive(daemon, agent, _request("T-m", "mutmuas"))
+        assert [m["task_id"] for m in await tools.inbox(hub, "B:desk", peek=True, types=tools.WAKE)] == ["T-m"]
+        assert ledger.task("T-m", "owner")["status"] == "PENDING"
+    finally:
+        ledger.close()
+
+
+async def test_a_linked_project_directory_is_refused(tmp_path):
+    """A project is a real directory right under the post directory: a link inside or out is not one."""
+    agent, ledger, _, daemon = _node(tmp_path)
+    (agent.workdir_path / "alias").symlink_to(agent.workdir_path / "robo", target_is_directory=True)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (agent.workdir_path / "linked").symlink_to(outside, target_is_directory=True)
+    try:
+        for task_id, project in (("T-a", "alias"), ("T-l", "linked")):
+            await _arrive(daemon, agent, _request(task_id, project))
+            assert ledger.task(task_id, "owner")["status"] == "FAILED"
+        assert agent.session_project(str(agent.workdir_path / "alias")) == "robo"    # the real directory
+    finally:
+        ledger.close()
+
+
+async def test_a_session_in_a_case_variant_of_its_project_directory_is_that_project(tmp_path, session):
+    agent, ledger, hub, daemon = _node(tmp_path)
+    variant = agent.workdir_path / "ROBO"
+    if not variant.is_dir():
+        pytest.skip("case-sensitive file system")
+    ledger.session_beat("B:desk", session.pid, str(variant), session_pid=session.pid)
+    try:
+        assert agent.session_project(str(variant)) == "robo"
+        await _arrive(daemon, agent, _request("T-r", "robo"))
+        assert ledger.task("T-r", "owner")["status"] == "PENDING"                      # the session's
+        assert [m["task_id"] for m in await tools.inbox(hub, "B:desk", peek=True, types=tools.WAKE)] == ["T-r"]
+        await _arrive(daemon, agent, _request("T-R", "ROBO"))                          # not the on-disk name
+        assert ledger.task("T-R", "owner")["status"] == "FAILED"
+    finally:
+        ledger.close()
