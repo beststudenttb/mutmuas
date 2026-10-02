@@ -312,6 +312,24 @@ ls ~/.mutmuas/visual_rl/B/runs/  # per-task agent output (<task>.<UTC start time
 | Reset one node completely | Stop its daemon and delete its `data_dir`. Its durable mailbox on the server still holds unacknowledged messages, which are delivered again. |
 | Rotate a node's password | Delete `<out>/<NODE>.env`, re-run `server-config`, reload the server, copy the new file to the node, and restart the node. |
 
+## 8b. Retire a post (D-085/D-089)
+
+`agent-node retire-agent <id> [--hand-over <addr>]` shows what it would do; add `-y` to do it, on the node
+that has the post:
+
+1. refuses while the post's session is online or its worker runs a task (stop them first);
+2. node.yaml: a timestamped backup (`node.yaml.bak-<time>-retire-<id>`), then only that agent's block is taken
+   out; the rest of the file (other agents, comments) is kept as written, and the result must load;
+3. its open work is refused back to each requester ("retired; ask <hand-over> instead"); what it asked others
+   for is withdrawn (their nodes cascade further down);
+4. its registry card is removed now when the bus is reachable, else at the node's next start;
+5. its post directory is moved whole to `work/_archive/<post>-<time>/`. Nothing in it is deleted, since it may
+   hold the leader's files. A directory another agent uses is left in place;
+6. everything done goes into `RETIRED.json` in the archive (or next to node.yaml).
+
+Restart the node afterwards to stop the post's loops. `agent-node retire-agent --undo <RETIRED.json>` puts the
+block and the directory back (then restart); refused and withdrawn tasks stay so.
+
 ## 8a. Supervision and known risks
 
 Errors are skipped and recorded rather than defended against (D-039, D-040); patches follow once the records
@@ -356,6 +374,8 @@ Known risks (protections removed on purpose; one line each):
   without the lock can lose its edit or the node's line (D-073 batch 2).
 - An eta lives on the requester's node only (not on the public card): another node's coordinator sees it only
   through check_task on a task it may see.
+- Retiring a post cannot take back the refusals and withdrawals it sent; `--undo` restores only the config
+  block and the directory (D-085).
 - Two brain runs of one post never overlap, so different projects of a post wait for each other's brain runs.
 - A session started in any real subdirectory of the post directory (other than memory/ and hidden ones) counts
   as working on a project of that name, and with auto_worker takes only that project's requests (D-072).
