@@ -288,11 +288,13 @@ async def cmd_inbox(args, hub: Hub):
                                  types=types, since=args.since)
     else:
         # a look at the mail: the newest page, and what it left out (D-074)
-        page = await tools.inbox_page(hub, _me(args), peek=args.peek, types=types, before_seq=args.before_seq)
+        page = await tools.inbox_page(hub, _me(args), peek=args.peek, types=types, before_seq=args.before_seq,
+                                      leader_before_seq=args.leader_before_seq)
         rows = page["messages"]
-        if page.get("more"):
+        if page.get("next"):
+            key, value = next(iter(page["next"].items()))
             more = (f"{page['unread']} unread, {page['listed']} listed; {page['older_unlisted']} older not listed: "
-                    f"agentctl inbox --before-seq {page['before_seq']}")
+                    f"agentctl inbox --{key.replace('_', '-')} {value}")
     if args.json:
         _print(rows, True)
     elif not rows:
@@ -789,7 +791,9 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--wait", type=float, nargs="?", const=3600, metavar="SECONDS",
                    help="block until a message arrives (default up to 3600 s); exit code 3 on timeout")
     p.add_argument("--before-seq", type=int, metavar="SEQ",
-                   help="page back: unread mail older than this seq (the listing says which seq to use)")
+                   help="page back: unread mail older than this seq (the listing says which cursor to use)")
+    p.add_argument("--leader-before-seq", type=int, metavar="SEQ",
+                   help="page back through the leader's mail first (the listing says when)")
     p.add_argument("--clear-before", type=int, metavar="SEQ",
                    help="mark all unread mail up to this seq as read (after looking at it with --all/--peek)")
     p = add("watch", cmd_watch, "run forever: desktop notification per new actionable message (launchd/systemd)")

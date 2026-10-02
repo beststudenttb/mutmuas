@@ -273,10 +273,13 @@ class Ledger:
     def unseen(self, local_agent: str, limit: int = 50, mark: bool = True,
                types: tuple[str, ...] | None = None, since: str | None = None,
                next_to: str | None = None, show: bool = True, own_results: bool = False,
-               leader_first: bool = False, before_seq: int | None = None) -> list[Envelope]:
+               leader_first: bool = False, before_seq: int | None = None,
+               leader_before_seq: int | None = None) -> list[Envelope]:
         """Inbound messages an interactive agent has not looked at yet.
         Without `since` (a session looking at its mail) the page holds the newest (D-074): the leader's mail first
-        (body.leader, D-049, when leader_first), then newest to oldest; before_seq pages back to older mail.
+        (body.leader, D-049, when leader_first), then newest to oldest. Paging back has two stages (Codex review of
+        374be94): leader_before_seq continues the leader's mail older than it (then fills up with the newest other
+        mail); before_seq pages through the other mail only.
         With `since` (a notifier's cursor, advanced to the last row) it stays in arrival order, oldest first, so
         nothing is skipped.
 
@@ -294,7 +297,7 @@ class Ledger:
             else:
                 order = "json_extract(envelope, '$.body.leader') IS NOT 1, rowid DESC" if leader_first \
                     else "rowid DESC"
-            before_sql, before_arg = (" AND rowid < ?", (int(before_seq),)) if before_seq is not None else ("", ())
+            before_sql, before_arg = self._page_filter(before_seq, leader_before_seq)
             rows = db.execute("SELECT message_id, envelope FROM messages WHERE direction='in' AND seen=0"
                               f" AND state='handled' AND local_agent=?{type_sql}{since_sql}{before_sql}"
                               f" ORDER BY {order} LIMIT ?",
@@ -310,13 +313,28 @@ class Ledger:
     def mark_seen(self, task_id: str) -> None:
         self.db.execute("UPDATE messages SET seen=1 WHERE direction='in' AND task_id=?", (task_id,))
 
-    def unseen_count(self, local_agent: str, types: tuple[str, ...] | None = None, since: str | None = None,
-                     next_to: str | None = None, own_results: bool = False, before_seq: int | None = None) -> int:
-        sql = "SELECT COUNT(*) FROM messages WHERE direction='in' AND seen=0 AND state='handled' AND local_agent=?"
-        args: list[Any] = [local_agent]
+    _LEADER = "json_extract(envelope, '$.body.leader') IS 1"
+
+    def _page_filter(self, before_seq: int | None, leader_before_seq: int | None,
+                     leader_only: bool = False) -> tuple[str, tuple]:
+        """The part of the unread mail a page cursor still covers (D-074): before_seq = the other mail older than
+        it; leader_before_seq = the leader's mail older than it plus all other mail; neither = everything."""
+        sql, args = (f" AND {self._LEADER}", []) if leader_only else ("", [])
         if before_seq is not None:
-            sql += " AND rowid < ?"
+            sql += f" AND NOT ({self._LEADER}) AND rowid < ?"
             args.append(int(before_seq))
+        elif leader_before_seq is not None:
+            sql += f" AND (NOT ({self._LEADER}) OR rowid < ?)"
+            args.append(int(leader_before_seq))
+        return sql, tuple(args)
+
+    def unseen_count(self, local_agent: str, types: tuple[str, ...] | None = None, since: str | None = None,
+                     next_to: str | None = None, own_results: bool = False, before_seq: int | None = None,
+                     leader_before_seq: int | None = None, leader_only: bool = False) -> int:
+        sql = "SELECT COUNT(*) FROM messages WHERE direction='in' AND seen=0 AND state='handled' AND local_agent=?"
+        page_sql, page_args = self._page_filter(before_seq, leader_before_seq, leader_only)
+        sql += page_sql
+        args: list[Any] = [local_agent, *page_args]
         if since:
             sql += " AND rowid > ?" if str(since).isdigit() else " AND created_at > ?"
             args.append(int(since) if str(since).isdigit() else since)

@@ -79,9 +79,58 @@ async def test_agentctl_inbox_pages_back_and_tells_what_is_left(tmp_path, monkey
     async def fake_page(hub, me, **kw):
         calls.append(kw)
         return {"messages": [], "unread": 60, "listed": 0, "older_unlisted": 10, "before_seq": 7,
-                "more": "10 older unread: inbox(before_seq=7)"}
+                "next": {"before_seq": 7}, "more": "10 older unread: inbox(before_seq=7)"}
     monkeypatch.setattr(tools, "inbox_page", fake_page)
     args = cli.agentctl_parser().parse_args(["inbox", "--peek", "--before-seq", "11", "--as", "B:desk"])
     await cli.cmd_inbox(args, None)
     assert calls[0]["before_seq"] == 11 and calls[0]["peek"] is True
     assert "before-seq 7" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- Codex light review of 374be94: paging
+
+
+async def _walk(daemon, peek=True):
+    """Page from the first page back to the oldest, always with the cursor the page gives."""
+    pages, cursor = [], {}
+    while True:
+        page = await tools.inbox_page(daemon.hub, "B:desk", peek=peek, **cursor)
+        if not page["messages"]:
+            break
+        pages.append(page)
+        cursor = page.get("next") or {}
+        if not cursor:
+            break
+    return pages
+
+
+async def test_paging_back_with_an_old_leader_message_lists_each_once(tmp_path):
+    _, ledger, daemon = _node(tmp_path, mode="interactive")
+    _mail(ledger, 60, leader_at=3)
+    try:
+        pages = await _walk(daemon)
+        ids = [r["message_id"] for p in pages for r in p["messages"]]
+        assert len(ids) == len(set(ids)) == 60 and [p["listed"] for p in pages] == [50, 10]
+    finally:
+        ledger.close()
+
+
+async def test_a_first_page_of_leader_mail_pages_on_to_the_rest(tmp_path):
+    import json
+    _, ledger, daemon = _node(tmp_path, mode="interactive")
+    _mail(ledger, 110)
+    for row in ledger.db.execute("SELECT message_id, envelope FROM messages WHERE direction='in' ORDER BY rowid"
+                                 " LIMIT 55").fetchall():                     # 55 leader messages: > one page
+        envelope = json.loads(row["envelope"])
+        envelope["body"]["leader"] = True
+        ledger.db.execute("UPDATE messages SET envelope=? WHERE message_id=?", (json.dumps(envelope), row["message_id"]))
+    try:
+        for peek in (True, False):
+            pages = await _walk(daemon, peek=peek)
+            ids = [r["message_id"] for p in pages for r in p["messages"]]
+            assert len(ids) == len(set(ids)) == 110, peek
+            first = [r["task_id"] for r in pages[0]["messages"]]
+            assert first[0] == "T-54" and all(r["body"].get("leader") for r in pages[0]["messages"])
+        assert ledger.unseen_count("B:desk") == 0
+    finally:
+        ledger.close()
