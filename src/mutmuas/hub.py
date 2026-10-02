@@ -400,6 +400,9 @@ class Hub:
             raise KeyError(f"task {task_id} is not owned by this node")
         if task["status"] in TERMINAL_STATES:
             return False                                         # finished already: the board is not touched
+        # an invalid RESULT is refused before anything changes, the board included (Codex review of ea40b88)
+        Envelope(type="RESULT", sender=task["owner"], to=task["requester"], body=result, task_id=task_id,
+                 artifacts=artifacts or []).validate()
         agent = self.local_agent(task["owner"])[1]
         workdir = agent.home(agent.project_of(task.get("request"))) if record else None   # its project (D-069)
         board = workdir / "PLAN.md" if workdir else None
