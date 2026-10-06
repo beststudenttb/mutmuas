@@ -110,9 +110,12 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
     it. `priority: high` and `leader: true` grant nothing: they only order what is allowed.
   - Sent with the MCP tool `control_task(task_id, pause|resume|interrupt, message)`: an UPDATE from the task's
     requester to its owner, so a trusted controller too controls the tasks it requested (the secretary relays
-    the leader's requests); `interrupt` then stops whatever that post runs.
+    the leader's requests); it acts on that task only. A script worker finds the messages in its task JSON
+    (`interrupts`); an LLM worker's prompt starts with them.
   - An UPDATE or ANSWER from a trusted controller interrupts a worker in the middle of a run when it is about
-    the task that worker runs, or carries `interrupt: true` (then it stops whatever the post's worker runs). The
+    the task that worker runs, or carries `interrupt: true`. About a task of the post, `interrupt: true` acts on
+    that task alone (its run is stopped if it runs; it is laid out again with the message either way); about
+    anything else (the secretary, as owner, on a task the post asked it for) it stops whatever the post runs. The
     owner's node stops the run (the whole process group: what ignores SIGTERM gets SIGKILL), keeps the message
     on the task (`tasks.interrupts`) and lays the task out again; the next run's prompt starts with it, and a
     brain resumes the same conversation. The node names a new brain conversation itself (`claude -p

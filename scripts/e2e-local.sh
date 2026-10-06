@@ -8,7 +8,8 @@
 #   TEST 2  A delegates an experiment to B -> ACK/RUNNING/UPDATE/RESULT + artifact
 #   TEST 3  B's brain (auto_worker, no session) reports BLOCKED; A answers naming it next (by its alias)
 #           -> it runs again and finishes
-#   TEST 4  A pauses, resumes and interrupts B's running experiment (control_task)
+#   TEST 4  A pauses and resumes B's experiment; interrupts its own task without touching another one running
+#           on the same post, and the next run gets the message (control_task)
 #   TEST 5  B retires its post B:data (daemon stopped) and undoes it
 #
 # Usage: scripts/e2e-local.sh [--keep]     (work dir: .local/e2e/, kept with --keep)
@@ -36,7 +37,7 @@ trap cleanup EXIT
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 json() { "$PY" -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
 # check '<python condition on d>' '<label>': exits non-zero (and so fails the script) when false
-check() { "$PY" -c "import json,sys; d=json.load(sys.stdin); assert $1, d; print('PASS: $2')"; }
+check() { "$PY" -c "import json,sys; d=json.load(sys.stdin); assert $1, d; print('PASS:', sys.argv[1])" "$2"; }
 
 rm -rf "$W" && mkdir -p "$W/B-disk/representation_exp082" "$W/A-disk"
 
@@ -64,6 +65,11 @@ agents:
     role: lead-researcher
     workdir: ./work
     permissions: [READ, REQUEST_TASK, PUBLISH_ARTIFACT]
+  - id: aux
+    mode: interactive
+    role: assistant
+    workdir: ./work-aux
+    permissions: [READ, REQUEST_TASK]
 YAML
 cat >"$W/B/node.yaml" <<YAML
 project: demo
@@ -107,22 +113,24 @@ YAML
 
 # what has no agentctl command (MCP tools only): wait for a result, control a task, answer; as A:main
 cat >"$W/ctl.py" <<'PY'
-import asyncio, json, sys
+import asyncio, json, os, sys
 from mutmuas import tools
 from mutmuas.config import load_config
 from mutmuas.hub import Hub
+
+ME = os.environ.get("CTL_AS", "A:main")
 
 async def main(cmd, task_id, *rest):
     hub = await Hub.open(load_config(sys.argv[-1]), "cli")
     try:
         if cmd == "wait":
-            out = await tools.wait_for_result(hub, task_id, 60, me="A:main")
+            out = await tools.wait_for_result(hub, task_id, 60, me=ME)
         elif cmd == "status":
-            out = await hub.task_view(task_id, "A:main")
+            out = await hub.task_view(task_id, ME)
         elif cmd == "control":
-            out = await tools.control_task(hub, "A:main", task_id, rest[0], rest[1])
+            out = await tools.control_task(hub, ME, task_id, rest[0], rest[1])
         elif cmd == "answer":
-            out = await tools.answer(hub, "A:main", task_id, rest[0], next=rest[1])
+            out = await tools.answer(hub, ME, task_id, rest[0], next=rest[1])
         print(json.dumps(out, default=str))
     finally:
         await hub.close()
@@ -151,7 +159,7 @@ start_node B
 for _ in $(seq 50); do
   n=$("${AGENTCTL[@]}" agents --json --config "$W/A/node.yaml" 2>/dev/null \
       | json "sum(1 for a in d if a['online'])" 2>/dev/null || echo 0)
-  [ "$n" = "4" ] && break
+  [ "$n" = "5" ] && break
   sleep 0.2
 done
 "${AGENTCTL[@]}" status --config "$W/A/node.yaml"
@@ -201,41 +209,54 @@ ctl wait "$TASK2" \
 step "audit: why did B run that experiment? (asked from node B's side)"
 "${AGENTCTL[@]}" task "$TASK2" --as B:experimenter --config "$W/B/node.yaml" | sed -n '1,5p'
 
-step "TEST 3: B:c1 (a brain without a session) reports BLOCKED; A answers and names it next"
-OUT=$("${AGENTCTL[@]}" ask B:c1 "Plan the next dataset" --reason "wake test" \
+step "TEST 3: B:c1 (a brain without a session) reports BLOCKED; A:aux (not trusted) answers and names it next"
+OUT=$("${AGENTCTL[@]}" ask B:c1 "Plan the next dataset" --reason "wake test" --as A:aux \
   --input action=block_once --input "flag=$W/answered" --json --config "$W/A/node.yaml")
 TASK3=$(echo "$OUT" | json "d['task_id']")
-wait_status "$TASK3" "d['status']=='BLOCKED'" "the worker is blocked and its run has ended"
+CTL_AS=A:aux wait_status "$TASK3" "d['status']=='BLOCKED'" "the worker is blocked and its run has ended"
 touch "$W/answered"
-ctl answer "$TASK3" "the dataset is in /data/v2" B:c1 >/dev/null
-ctl wait "$TASK3" | check "d['status']=='COMPLETED' and d['result']['summary']=='unblocked'" "named next, the blocked task ran again and finished"
+CTL_AS=A:aux ctl answer "$TASK3" "the dataset is in /data/v2" B:c1 >/dev/null
+CTL_AS=A:aux ctl wait "$TASK3" \
+  | check "d['status']=='COMPLETED' and d['result']['summary']=='unblocked'" "named next, the blocked task ran again and finished"
 
-step "TEST 4: A pauses, resumes and interrupts B:b1's experiment"
+step "TEST 4a: A pauses and resumes B:b1's experiment"
 OUT=$("${AGENTCTL[@]}" ask B:b1 "Long ablation" --reason "control test" --kind experiment \
-  --input action=experiment --input steps=30 --input step_s=0.2 --json --config "$W/A/node.yaml")
+  --input action=experiment --input steps=15 --input step_s=0.2 --json --config "$W/A/node.yaml")
 TASK4=$(echo "$OUT" | json "d['task_id']")
 wait_status "$TASK4" "d['status']=='RUNNING'" "the experiment runs"
 ctl control "$TASK4" pause "hold on: the GPU is needed" >/dev/null
 wait_status "$TASK4" "d['status']=='WAITING'" "paused: the run is stopped, the task waits"
 ctl control "$TASK4" resume "go on" >/dev/null
 wait_status "$TASK4" "d['status']=='RUNNING'" "resumed: it runs again"
-ctl control "$TASK4" interrupt "use seed 9 from now on" >/dev/null
-ctl wait "$TASK4" | check "d['result_status']=='complete'" "interrupted, laid out again, finished"
+ctl wait "$TASK4" | check "d['result_status']=='complete'" "the resumed experiment finished"
 RUNS=$(ls "$W/B/data/runs/" | grep -c "^$TASK4\..*\.log$")
-[ "$RUNS" = "3" ] && echo "PASS: three runs: before the pause, after resume, after the interrupt" \
-  || { echo "FAIL: $RUNS runs"; exit 1; }
+[ "$RUNS" = "2" ] && echo "PASS: two runs: before the pause and after resume" || { echo "FAIL: $RUNS runs"; exit 1; }
+
+step "TEST 4b: A interrupts its own queued task; A:aux's task running on the same post is left alone"
+OUT=$("${AGENTCTL[@]}" ask B:b1 "Someone else's run" --reason "bystander" --kind experiment --as A:aux \
+  --input action=experiment --input steps=15 --input step_s=0.2 --json --config "$W/A/node.yaml")
+OTHER=$(echo "$OUT" | json "d['task_id']")
+CTL_AS=A:aux wait_status "$OTHER" "d['status']=='RUNNING'" "A:aux's experiment runs"
+OUT=$("${AGENTCTL[@]}" ask B:b1 "Short check" --reason "interrupt test" --kind experiment \
+  --input action=experiment --input steps=2 --input step_s=0.1 --json --config "$W/A/node.yaml")
+MINE=$(echo "$OUT" | json "d['task_id']")
+ctl control "$MINE" interrupt "use seed 9 from now on" >/dev/null
+CTL_AS=A:aux ctl wait "$OTHER" \
+  | check "d['result_status']=='complete' and d['result']['outputs']['told']==[]" "the running bystander was neither stopped nor told"
+RUNS=$(ls "$W/B/data/runs/" | grep -c "^$OTHER\..*\.log$")
+[ "$RUNS" = "1" ] && echo "PASS: the bystander ran once" || { echo "FAIL: bystander ran $RUNS times"; exit 1; }
+ctl wait "$MINE" \
+  | check "d['result_status']=='complete' and any('use seed 9' in t for t in d['result']['outputs']['told'])" "the next run of the interrupted task got the message"
 
 step "TEST 5: retire B:data (B's daemon stopped), then undo"
 kill "$PID_B"; wait "$PID_B" 2>/dev/null || true
 "${AGENT_NODE[@]}" retire-agent data --config "$W/B/node.yaml" --hand-over B:b1 -y >"$W/retire.out"
 grep -q "id: data" "$W/B/node.yaml" && { echo "FAIL: B:data still configured"; exit 1; } || echo "PASS: B:data out of node.yaml"
-start_node B
-sleep 3
 "${AGENTCTL[@]}" agents --json --config "$W/A/node.yaml" \
-  | check "not any(a['address']=='B:data' and a['online'] for a in d)" "A no longer sees B:data online"
-kill "$PID_B"; wait "$PID_B" 2>/dev/null || true
+  | check "not any(a['address']=='B:data' for a in d)" "the card of B:data is gone from the registry"
 MANIFEST=$(ls "$W"/B/RETIRED-data-*.json)
 "${AGENT_NODE[@]}" retire-agent --undo "$MANIFEST" --config "$W/B/node.yaml" -y >/dev/null
+grep -q "id: data" "$W/B/node.yaml" && echo "PASS: undo put B:data back into node.yaml" || { echo "FAIL: not restored"; exit 1; }
 start_node B
 for _ in $(seq 50); do
   "${AGENTCTL[@]}" agents --json --config "$W/A/node.yaml" \
@@ -243,6 +264,6 @@ for _ in $(seq 50); do
   sleep 0.2
 done
 "${AGENTCTL[@]}" agents --json --config "$W/A/node.yaml" \
-  | check "any(a['address']=='B:data' and a['online'] for a in d)" "undone: B:data is back online"
+  | check "any(a['address']=='B:data' and a['online'] for a in d)" "B's daemon started again: B:data is back online"
 
 step "all end-to-end checks passed"

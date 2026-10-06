@@ -434,8 +434,9 @@ CONTROLS = ("pause", "resume", "interrupt")
 
 
 async def control_task(hub: Hub, me: str, task_id: str, action: str, message: str) -> dict[str, Any]:
-    """Pause, resume or interrupt a task I requested (D-089): an UPDATE to its owner. The owner's node decides what
-    it may do: pause and resume for the requester, interrupt only for an address in its trusted_controllers."""
+    """Pause, resume or interrupt a task I requested (D-089): an UPDATE to its owner about that task, which is the
+    only one it affects. The owner's node decides what it may do: pause and resume for the requester, interrupt
+    only for an address in its trusted_controllers."""
     if action not in CONTROLS:
         raise ValueError(f"action={action!r}: one of {', '.join(CONTROLS)}")
     addr, _ = hub.local_agent(me)

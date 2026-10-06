@@ -69,7 +69,8 @@ elif action == "experiment":
         out = Path.cwd() / f"{task['task_id']}-metrics.json"
         out.write_text(json.dumps({"losses": losses, "seed": inputs.get("seed", 0)}))
         ref = await tools.publish_artifact(hub, me, str(out), id="METRICS")
-        await tools.submit_result(hub, me, "complete", f"ran {steps} steps", outputs={"final_loss": losses[-1]},
+        await tools.submit_result(hub, me, "complete", f"ran {steps} steps",
+                                  outputs={"final_loss": losses[-1], "told": task.get("interrupts", [])},
                                   artifacts=[ref], evidence=[f"{len(losses)} loss values recorded"])
 
     asyncio.run(with_hub(run))

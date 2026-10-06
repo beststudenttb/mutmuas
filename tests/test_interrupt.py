@@ -867,3 +867,59 @@ async def test_the_requester_pauses_resumes_and_interrupts_with_control_task(tmp
         await asyncio.gather(runner, return_exceptions=True)
         ledger.close()
         a_ledger.close()
+
+
+async def test_control_task_interrupt_does_not_hit_someone_elses_running_task(tmp_path, blocking):
+    agent, cfg, ledger, hub, daemon = _node(tmp_path)
+    cfg.trusted_controllers = ["A:main"]
+    a_ledger, a_hub = _requester_node(tmp_path)
+    owned_task(ledger, "T-y", "ACCEPTED", ingest=True)            # another requester's task, running now
+    runner = await _running(daemon, agent, "T-y")
+    try:
+        x = (await tools.send_request(a_hub, "A:main", "B:desk", "my task", "test"))["task_id"]
+        await _deliver(daemon, agent, [e for e in a_ledger.outbox() if e.type == "REQUEST"][-1])
+        await asyncio.sleep(0.2)
+        n = len(blocking.runs)
+        await tools.control_task(a_hub, "A:main", x, "interrupt", "use env v2")
+        await _deliver(daemon, agent, [e for e in a_ledger.outbox() if e.type == "UPDATE"][-1])
+        await asyncio.sleep(0.5)
+        y = ledger.task("T-y", "owner")
+        xr = ledger.task(x, "owner")
+        assert xr.get("interrupts"), "A:main's message never reached its own task X"
+        assert not y.get("interrupts"), f"T-y was interrupted by A:main's control of {x}: {y.get('interrupts')}"
+        assert len(blocking.runs) == n
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        ledger.close()
+        a_ledger.close()
+
+
+async def test_untrusted_requester_cannot_interrupt(tmp_path, blocking):
+    agent, cfg, ledger, hub, daemon = _node(tmp_path)              # trusts only B:secretary
+    a_ledger, a_hub = _requester_node(tmp_path)
+    x = (await tools.send_request(a_hub, "A:main", "B:desk", "my task", "test"))["task_id"]
+    await _deliver(daemon, agent, [e for e in a_ledger.outbox() if e.type == "REQUEST"][-1])
+    runner = await _running(daemon, agent, x)
+    try:
+        await tools.control_task(a_hub, "A:main", x, "interrupt", "stop")
+        await _deliver(daemon, agent, [e for e in a_ledger.outbox() if e.type == "UPDATE"][-1])
+        await asyncio.sleep(0.5)
+        assert len(blocking.runs) == 1 and not ledger.task(x, "owner").get("interrupts")
+        assert ledger.task(x, "owner")["status"] in ("ACCEPTED", "RUNNING")
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        ledger.close()
+        a_ledger.close()
+
+
+def test_a_script_worker_finds_the_interrupt_in_its_task_json(tmp_path):
+    from mutmuas.runtime import TaskContext
+    agent, cfg, ledger, hub, daemon = _node(tmp_path)
+    request = owned_task(ledger, "T-r", "ACCEPTED", ingest=True)
+    try:
+        ctx = TaskContext("T-r", request, agent, cfg, 1, interrupts=["UPDATE from B:secretary on T-r: use env v2"])
+        assert ctx.payload()["interrupts"] == ["UPDATE from B:secretary on T-r: use env v2"]
+    finally:
+        ledger.close()

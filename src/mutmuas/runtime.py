@@ -81,7 +81,8 @@ class TaskContext:
 
     def payload(self) -> dict[str, Any]:
         return {"task_id": self.task_id, "agent": self.address, "attempt": self.attempt,
-                "workdir": str(self.cwd), "git_branch": self.git_branch, "request": self.request.to_dict()}
+                "workdir": str(self.cwd), "git_branch": self.git_branch, "request": self.request.to_dict(),
+                "interrupts": self.interrupts}
 
 
 @dataclass

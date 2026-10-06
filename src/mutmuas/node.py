@@ -1121,11 +1121,13 @@ class NodeDaemon:
 
     async def _control(self, agent: AgentConfig, env: Envelope, kind: str) -> None:
         """D-089 pause / resume / interrupt, in one place: the wish goes into the ledger (paused, and the message for
-        the next run), the run doing the task is stopped, and _settle decides the rest from the ledger. interrupt:
-        true reaches every running task of the post."""
+        the next run), the run doing the task is stopped, and _settle decides the rest from the ledger. A control about
+        a task of this post acts on that task only; interrupt: true about anything else (a trusted controller's word
+        on a task the post asked it for) stops every task the post runs."""
         hub, addr = self.hub, env.to
         text = f"{env.type} from {env.sender} on {env.task_id}: {short(env.body.get('message') or env.body.get('answer') or '', 400)}"
-        if kind == "interrupt" and env.body.get("interrupt"):
+        own = hub.ledger.task(env.task_id, "owner")
+        if kind == "interrupt" and env.body.get("interrupt") and not (own and own["owner"] == addr):
             targets = [t["task_id"] for t in hub.ledger.tasks(role="owner", local_agent=addr,
                                                               statuses=("ACCEPTED", "RUNNING", "WAITING"), limit=None)
                        if t["task_id"] in self._running or self._old_worker(t)]
