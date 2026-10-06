@@ -877,11 +877,8 @@ class NodeDaemon:
     async def _notify(self, agent: AgentConfig, sender: str, task_id: str, text: str) -> None:
         """Copy a node's lead (agent.notify) on work its workers take on. Best effort, informational only."""
         for target in agent.notify:
-            try:
-                await self.hub.send(Envelope(type="UPDATE", sender=sender, to=target, task_id=task_id,
-                                             body={"message": text, "fyi": True}))
-            except Exception as e:
-                self._failed("notify", e, address=target, task_id=task_id)
+            await self.hub.send(Envelope(type="UPDATE", sender=sender, to=target, task_id=task_id,
+                                         body={"message": text, "fyi": True}))
 
     async def _attach_git(self, wt: Worktree, agent: AgentConfig, task_id: str, body: dict[str, Any],
                           refs: list[ArtifactRef]) -> None:
@@ -1281,12 +1278,9 @@ class NodeDaemon:
         """Tell the requester (wakes it: next = requester), and copy the escalation addresses (FYI only)."""
         requester = task["local_agent"]
         for target, extra in ((requester, {"next": requester}), *((a, {}) for a in self.cfg.escalate_to)):
-            try:
-                await self.hub.send(Envelope(type="UPDATE", sender=requester, to=target, task_id=task["task_id"],
-                                             body={"message": f"follow-up ({reason}): {text}", "fyi": True,
-                                                   "follow_up": reason, **extra}))
-            except Exception as e:
-                self._failed("follow-up", e, address=target, task_id=task["task_id"])
+            await self.hub.send(Envelope(type="UPDATE", sender=requester, to=target, task_id=task["task_id"],
+                                         body={"message": f"follow-up ({reason}): {text}", "fyi": True,
+                                               "follow_up": reason, **extra}))
 
     def _record_worker(self, task_id: str, pid: int) -> None:
         self.hub.ledger.set_runner_pid(task_id, pid, proc_start(pid))

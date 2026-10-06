@@ -525,12 +525,10 @@ async def add_observer(hub: Hub, me: str, task_id: str, observer: str) -> dict[s
     # An observer does not send copies itself: a node that never saw the task could only check the sender against the
     # task record, which names requester and owner. The owner relays them when it hears of the new observer below.
     for other in sorted({base["requester"], base["owner"]} - {me_s}):
-        try:          # so the requester's side forwards a later RESULT, and every side knows the ACL
-            await hub.send(Envelope(type="UPDATE", sender=me_s, to=other, task_id=task_id,
-                                    body={"message": f"{me_s} added observer {observer}", "fyi": True,
-                                          "observers_add": [observer]}))
-        except Exception:
-            pass
+        # so the requester's side forwards a later RESULT, and every side knows the ACL
+        await hub.send(Envelope(type="UPDATE", sender=me_s, to=other, task_id=task_id,
+                                body={"message": f"{me_s} added observer {observer}", "fyi": True,
+                                      "observers_add": [observer]}))
     out = {"task_id": task_id, "observer": observer, "copies_sent": copies}
     if not copies and me_s not in (base["requester"], base["owner"]):
         out["copies_relayed_by"] = base["owner"]

@@ -23,8 +23,7 @@ from .config import AgentConfig, NodeConfig
 from .ids import Address, new_task_id, parse_iso
 from .ledger import Ledger
 from .visibility import acl, is_coordinator, is_participant, status_layer
-from .protocol import (REQUEST_KINDS, TERMINAL_STATES, ArtifactRef, Envelope, ProtocolError,
-                       task_state_for_result)
+from .protocol import TERMINAL_STATES, ArtifactRef, Envelope, task_state_for_result
 
 log = logging.getLogger(__name__)
 
@@ -178,8 +177,6 @@ class Hub:
         addr, agent = self.local_agent(sender)
         if not agent.has("REQUEST_TASK"):
             raise PermissionDenied(f"{addr} lacks REQUEST_TASK permission")
-        if body.get("kind", "query") not in REQUEST_KINDS:
-            raise ProtocolError(f"kind must be one of {sorted(REQUEST_KINDS)}")
         if parent_task:
             body = {**body, "parent_task": parent_task}
         env = Envelope(type="REQUEST", sender=str(addr), to=await self.resolve(to), body=body,
@@ -199,16 +196,13 @@ class Hub:
         for observer in observers:
             if observer in (original.sender, original.to):
                 continue
-            try:
-                await self.send(Envelope(
-                    type="UPDATE", sender=sender, to=observer, task_id=original.task_id,
-                    conversation_id=original.conversation_id, artifacts=original.artifacts, body={
-                        "message": f"observer copy: {original.type} {original.sender} -> {original.to}",
-                        "fyi": True, "participants": people,
-                        "copy_of": {"type": original.type, "from": original.sender, "to": original.to,
-                                    "body": original.body}}))
-            except Exception as e:
-                log.warning("copy to observer %s failed: %r", observer, e)
+            await self.send(Envelope(
+                type="UPDATE", sender=sender, to=observer, task_id=original.task_id,
+                conversation_id=original.conversation_id, artifacts=original.artifacts, body={
+                    "message": f"observer copy: {original.type} {original.sender} -> {original.to}",
+                    "fyi": True, "participants": people,
+                    "copy_of": {"type": original.type, "from": original.sender, "to": original.to,
+                                "body": original.body}}))      # a failed publish stays in the outbox
 
     async def reply(self, local: str, task_id: str, type: str, body: dict[str, Any] | None = None,
                     artifacts: list[ArtifactRef] | None = None, to: str | None = None) -> str:
