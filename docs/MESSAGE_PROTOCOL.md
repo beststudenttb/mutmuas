@@ -114,13 +114,14 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
     on the task (`tasks.interrupts`) and lays the task out again; the next run's prompt starts with it, and a
     brain resumes the same conversation. The node names a new brain conversation itself (`claude -p
     --session-id`) before the run, so a run stopped midway can still be resumed. The requester is told
-    ("interrupted"). The attempt is not counted as a failed one. A stop that lands before the run started
-    (while its worktree is made) lays the task out the same way; a worker from before a node restart is
+    ("interrupted"). The attempt is not counted as a failed one. A worker from before a node restart is
     stopped by its process group too.
   - `pause: true` stops a running worker and keeps the task WAITING and `paused` until `resume: true`; nothing
     restarts a paused task (heartbeat, recover, the end of a background job: that news waits on the task for
-    the run after resume). A resume that arrives while the paused run is still stopping lays it out again. A
-    session's task is marked the same way and the session reads the message.
+    the run after resume). A session's task is marked the same way and the session reads the message.
+  - One place decides (D-102): a control writes its wish into the ledger (`paused`, the message) and stops the
+    run; what the task does next is decided from the ledger alone, when the stopped run has ended, so the order
+    in which a stop, a resume and the run's end arrive does not matter.
   - Pause and resume travel down `parent_task` to the open child tasks on whatever node they run, and from
     there further down; CANCEL already did (D-066). They go as the child's requester, so no trust is needed
     for that.

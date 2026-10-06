@@ -203,7 +203,7 @@ class NodeDaemon:
         self._retry: set[str] = set()                        # failed runs to lay out once more (D-040)
         self._recheck: set[str] = set()                      # recovered tasks whose old worker still ran
         self._cancel_requested: set[str] = set()
-        self._interrupted: dict[str, str] = {}               # task_id -> "interrupt" | "pause": a run stopped on purpose
+        self._stopped_runs: dict[str, str] = {}              # task -> why: runs a control stopped (D-089), settled at their end
         self._background: set[asyncio.Task] = set()          # e.g. observer-copy checks against the task KV
         self._outbox_wake = asyncio.Event()
         self.started = asyncio.Event()
@@ -314,6 +314,7 @@ class NodeDaemon:
             if agent is not None and task.get("paused"):
                 # paused until resumed (D-089); a worker that outlived the old node is stopped
                 await self._stop_old_worker(task)
+                await self._settle(task["task_id"], "paused")
                 continue
             if agent is None:
                 continue                # gone from the config
@@ -471,7 +472,7 @@ class NodeDaemon:
         if env.type == "UPDATE" and env.body.get("nudge"):
             self._on_nudge(agent, env)                   # then kept in the inbox below: it wakes the session
         if env.type in ("UPDATE", "ANSWER") and (kind := self._interrupt_kind(env)):
-            await self._interrupt(agent, env, kind)      # then kept in the inbox below like any message
+            await self._control(agent, env, kind)        # then kept in the inbox below like any message
         if env.type == "REQUEST":
             return await self._on_request(agent, env)
         elif env.type == "CANCEL":
@@ -726,14 +727,16 @@ class NodeDaemon:
                     if asyncio.current_task().cancelling():
                         # this runner itself is stopped, just as its run ended: stop, never back to the queue
                         raise
-                    # else the run was stopped on purpose (interrupt, pause): settled below, laid out again
+                    # else the run was stopped by a control: settled below
             finally:
                 self._running.pop(task_id, None)
-                if (why := self._interrupted.pop(task_id, None)) is not None:
-                    # stopped before its runtime ran (in Worktree.create, in the RUNNING transition): settled here, or
-                    # the stop was lost
-                    await self._settle_stopped(task_id, why)
                 self._queued[addr].discard(task_id)
+                if (why := self._stopped_runs.pop(task_id, None)) is not None:
+                    # stopped by a control, wherever it was (before its runtime, in it, while ending): the run does not
+                    # count as an attempt, and the ledger says what comes next
+                    task = self.hub.ledger.task(task_id, "owner")
+                    self.hub.ledger.update_task(task_id, "owner", attempts=max(0, task["attempts"] - 1))
+                    await self._settle(task_id, why)
                 if task_id in self._retry:
                     self._retry.discard(task_id)
                     self._enqueue(addr, task_id)
@@ -816,9 +819,8 @@ class NodeDaemon:
             return
         except asyncio.CancelledError:
             self._mark_unstopped(task_id, spawned)
-            if (why := self._interrupted.pop(task_id, None)) is not None:
-                await self._settle_stopped(task_id, why)
-                return
+            if task_id in self._stopped_runs:
+                return                                   # a control stopped it: the runner settles it
             if task_id in self._cancel_requested:
                 self._cancel_requested.discard(task_id)
                 await hub.owner_transition(task_id, "CANCELLED", "cancelled by requester; process stopped")
@@ -936,21 +938,31 @@ class NodeDaemon:
             except Exception as e:
                 self._failed("heartbeat", e)
 
-    async def _settle_stopped(self, task_id: str, why: str) -> None:
-        """A run stopped on purpose (D-089): paused, or laid out again with the message for the next run. The run
-        does not count as an attempt. A pause resumed while the run was still stopping goes on as an interrupt
-."""
+    async def _settle(self, task_id: str, why: str = "laid out again") -> None:
+        """What a task does next, decided from the ledger alone (D-089/D-102): the one place where controls,
+        stopped runs and recovered tasks end up, so it does not matter in which order they came. A closed or
+        BLOCKED task stays; one whose run is still going waits for that run to end; nothing runs beside an earlier
+        run that still lives (rechecked each heartbeat); a paused task waits; one waiting on a job keeps waiting;
+        a worker's task is laid out again; a session's task is the session's again. why: what the requester is told."""
         hub = self.hub
         task = hub.ledger.task(task_id, "owner")
-        if task is None or task["status"] in TERMINAL_STATES:
+        if not task or task["status"] in TERMINAL_STATES or task["status"] == "BLOCKED" or task_id in self._running:
             return
-        hub.ledger.update_task(task_id, "owner", attempts=max(0, task["attempts"] - 1))
-        if why == "pause" and task.get("paused"):
-            await hub.owner_transition(task_id, "WAITING", "paused: the run was stopped; waits for resume")
-        else:
-            await hub.owner_transition(task_id, "ACCEPTED", "interrupted: the run was stopped and is laid "
-                                                            "out again with the new message")
-            self._retry.add(task_id)
+        if self._worker_alive(task):
+            self._recheck.add(task_id)
+            return
+        agent = self._agent_cfg(task["owner"])
+        if task.get("paused"):
+            if task["status"] != "WAITING":
+                await hub.owner_transition(task_id, "WAITING", f"{why}; waits for resume")
+        elif hub.ledger.jobs(task_id):
+            pass                                          # waits on a background job: its end wakes the task
+        elif agent and (agent.mode == "worker" or agent.auto_worker) and task.get("runner") != "session":
+            if task["status"] != "ACCEPTED":
+                await hub.owner_transition(task_id, "ACCEPTED", why)
+            self._enqueue(task["owner"], task_id)
+        elif task["status"] == "WAITING":
+            await hub.owner_transition(task_id, "RUNNING", why)
 
     def _worker_alive(self, task: dict[str, Any]) -> bool:
         """An earlier run of this task still runs: its leader (pid and start time), or its process group when a
@@ -1093,65 +1105,42 @@ class NodeDaemon:
             return "interrupt"
         return None
 
-    async def _interrupt(self, agent: AgentConfig, env: Envelope, kind: str) -> None:
+    async def _control(self, agent: AgentConfig, env: Envelope, kind: str) -> None:
+        """D-089 pause / resume / interrupt, in one place: the wish goes into the ledger (paused, and the message for
+        the next run), the run doing the task is stopped, and _settle decides the rest from the ledger. interrupt:
+        true reaches every running task of the post."""
         hub, addr = self.hub, env.to
         text = f"{env.type} from {env.sender} on {env.task_id}: {short(env.body.get('message') or env.body.get('answer') or '', 400)}"
-        if kind == "interrupt":
-            targets = [t for t, r in self._running.items() if not r.done()
-                       and (hub.ledger.task(t, "owner") or {}).get("owner") == addr
-                       and (t == env.task_id or env.body.get("interrupt"))]
-            for task_id in targets:
-                self._note_interrupt(task_id, text)
-                self._interrupted[task_id] = "interrupt"
-                self._running[task_id].cancel()
-            # workers from before a restart: of this task, or of every task of the post (interrupt: true)
-            olds = (hub.ledger.tasks(role="owner", local_agent=addr, statuses=("ACCEPTED", "RUNNING"), limit=None)
-                    if env.body.get("interrupt") else [hub.ledger.task(env.task_id, "owner")])
-            for task in olds:
-                if not (task and task["owner"] == addr and self._old_worker(task)):
-                    continue
-                self._note_interrupt(task["task_id"], text)
-                if await self._stop_old_worker(task) != "stopped":
-                    continue                                            # rechecked, nothing runs beside it
-                if hub.ledger.task(task["task_id"], "owner").get("paused"):
-                    # paused: stopped, and still waits for resume; the message waits on the task (Codex fourth
-                    # review: it was laid out without a resume)
-                    if task["status"] != "WAITING":
-                        await hub.owner_transition(task["task_id"], "WAITING", f"paused; interrupted by "
-                                                                               f"{env.sender}: its old run stopped")
-                    continue
-                hub.ledger.update_task(task["task_id"], "owner", attempts=0)
-                await hub.owner_transition(task["task_id"], "ACCEPTED", f"interrupted by {env.sender}: the run "
-                                                                       "from before the restart was stopped")
-                self._enqueue(addr, task["task_id"])
-            return
-        task = hub.ledger.task(env.task_id, "owner")
-        if task is None or task["status"] in TERMINAL_STATES:
-            return
-        if kind == "pause":
-            hub.ledger.update_task(env.task_id, "owner", paused=1)
-            self._note_interrupt(env.task_id, "paused by " + text)
-            runner = self._running.get(env.task_id)
-            if runner and not runner.done():
-                self._interrupted[env.task_id] = "pause"
-                runner.cancel()
-            elif await self._stop_old_worker(task) != "failed":
-                await hub.owner_transition(env.task_id, "WAITING", f"paused by {env.sender}")
+        if kind == "interrupt" and env.body.get("interrupt"):
+            targets = [t["task_id"] for t in hub.ledger.tasks(role="owner", local_agent=addr,
+                                                              statuses=("ACCEPTED", "RUNNING"), limit=None)
+                       if t["task_id"] in self._running or self._old_worker(t)]
         else:
-            hub.ledger.update_task(env.task_id, "owner", paused=0)
-            self._note_interrupt(env.task_id, "resumed by " + text)
-            if env.task_id in self._running:
-                # its stopped run is still settling (and still queued): laid out once it has left (Codex re-review
-                # of cb77a33: a resume during the pause's WAITING notice was lost)
-                self._retry.add(env.task_id)
-            if hub.ledger.jobs(env.task_id):
-                pass        # still waits on a background job: its end wakes the task
-            elif (agent.mode == "worker" or agent.auto_worker) and task.get("runner") != "session":
-                await hub.owner_transition(env.task_id, "ACCEPTED", f"resumed by {env.sender}")
-                self._enqueue(addr, env.task_id)
-            else:
-                await hub.owner_transition(env.task_id, "RUNNING", f"resumed by {env.sender}")
-        await self._cascade(env, kind)
+            targets = [env.task_id]
+        for task_id in targets:
+            task = hub.ledger.task(task_id, "owner")
+            if not task or task["owner"] != addr or task["status"] in TERMINAL_STATES:
+                continue
+            if kind != "interrupt":
+                hub.ledger.update_task(task_id, "owner", paused=int(kind == "pause"))
+            self._note_interrupt(task_id, {"pause": "paused by ", "resume": "resumed by "}.get(kind, "") + text)
+            why = {"pause": f"paused by {env.sender}", "resume": f"resumed by {env.sender}"}.get(
+                kind, f"interrupted by {env.sender}: the run was stopped and is laid out again with the new message")
+            if kind != "resume":
+                await self._stop_run(task, why)
+            await self._settle(task_id, why)
+        if kind != "interrupt":
+            await self._cascade(env, kind)
+
+    async def _stop_run(self, task: dict[str, Any], why: str) -> None:
+        """Stop what does a task now: a run of ours (cancelled; the runner settles it when it ends), or a worker
+        from before a restart (its process group)."""
+        runner = self._running.get(task["task_id"])
+        if runner and not runner.done():
+            self._stopped_runs[task["task_id"]] = why
+            runner.cancel()
+        else:
+            await self._stop_old_worker(task)
 
     def _note_interrupt(self, task_id: str, text: str) -> None:
         task = self.hub.ledger.task(task_id, "owner")
@@ -1311,15 +1300,7 @@ class NodeDaemon:
         if task.get("runner") == "session":
             return
         if task.get("paused"):
-            # paused: its old worker is stopped (again, while it runs); then it waits for resume
-            if await self._stop_old_worker(task) == "failed":
-                return
-            task = hub.ledger.task(task_id, "owner")    # as it is now: a resume may have come while it stopped
-            if task.get("paused"):
-                self._recheck.discard(task_id)
-                if task["status"] != "WAITING":
-                    await hub.owner_transition(task_id, "WAITING", "paused: its old worker has stopped")
-                return
+            await self._stop_old_worker(task)            # paused: its old worker is stopped (again, while it runs)
         if task["status"] == "PENDING":
             if task.get("runner") == "worker":
                 hub.ledger.release_task(task_id, "worker")
@@ -1336,9 +1317,7 @@ class NodeDaemon:
         if await self._deliver_draft(task_id):
             return
         hub.ledger.set_runner_pid(task_id, None)
-        if task["status"] != "ACCEPTED":
-            await hub.owner_transition(task_id, "ACCEPTED", f"node {self.cfg.node} restarted; task will be run again")
-        self._enqueue(task["owner"], task_id)
+        await self._settle(task_id, f"node {self.cfg.node} restarted; the task is run again")   # paused: waits
 
     async def _deliver_draft(self, task_id: str) -> bool:
         """A worker that submitted its result and ended while the daemon was down: deliver that result rather
