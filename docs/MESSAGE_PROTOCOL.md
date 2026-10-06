@@ -64,10 +64,13 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
 - `reply` on a REQUEST: `required` (the default) means the owner owes a RESULT. `none` makes it a notice.
   The receiving session reading it, with a plain `inbox` and not `--peek`, closes the task with a read receipt
   (`RESULT complete "read by X (no reply requested)"`).
-- `deadline` (ISO 8601 with a timezone) says when the reply is needed. Use `agentctl ask --due +2h`.
+- `deadline` (ISO 8601 with a timezone, or relative: `+30m`, `+2h`, `+1d`, more than zero) says when the reply is
+  needed. One already past is refused (D-098); a relative one on a request held for `depends_on` counts from its
+  release. Use `agentctl ask --due +2h`.
   - A REQUEST that wants a reply but names no deadline gets one from the requester's node:
-    `default_reply_deadline_s` in node.yaml (default 4 h; `0` = no default). With `timeout_s` it is never
-    earlier than `timeout_s` + 30 min, so a long task is not chased while it still runs.
+    `default_reply_deadline_s` in node.yaml (default 4 h; `0` = no default), and for `kind` experiment or code
+    `long_reply_deadline_s` (default 24 h; D-098). With `timeout_s` it is never earlier than `timeout_s` +
+    30 min, so a long task is not chased while it still runs.
   - Such a filled-in deadline is marked `deadline_default: true` in the REQUEST body, so the owner can tell it
     from one the requester chose. An explicit `deadline` is kept as given; notices (`reply: none`) get none.
 - `leader: true` on a REQUEST: the leader asked for this task (D-049). The session sending it on his behalf sets it
@@ -100,6 +103,28 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   takes all of them, as before. Which project a session is in is found by file identity, so a case variant of
   the directory or a link into it counts as that project. An agent without `auto_worker` has nobody to hand
   the rest to, so its session takes and sees all work wherever it was started.
+- **Interrupt, pause, resume** (D-089: "my instruction can interrupt directly"):
+  - Who may do it (Codex review of 9f39ff0): a node lists in node.yaml `trusted_controllers` the addresses that
+    may interrupt or pause any of its posts (at first only the secretary: the leader's word comes relayed by
+    the secretary). Anyone else may pause and resume only a task it requested, sent to the address that owns
+    it. `priority: high` and `leader: true` grant nothing: they only order what is allowed.
+  - An UPDATE or ANSWER from a trusted controller interrupts a worker in the middle of a run when it is about
+    the task that worker runs, or carries `interrupt: true` (then it stops whatever the post's worker runs). The
+    owner's node stops the run (the whole process group: what ignores SIGTERM gets SIGKILL), keeps the message
+    on the task (`tasks.interrupts`) and lays the task out again; the next run's prompt starts with it, and a
+    brain resumes the same conversation. The node names a new brain conversation itself (`claude -p
+    --session-id`) before the run, so a run stopped midway can still be resumed. The requester is told
+    ("interrupted"). The attempt is not counted as a failed one. A stop that lands before the run started
+    (while its worktree is made) lays the task out the same way; a worker from before a node restart is
+    stopped by its process group too.
+  - `pause: true` stops a running worker and keeps the task WAITING and `paused` until `resume: true`; nothing
+    restarts a paused task (heartbeat, recover, the end of a background job: that news waits on the task for
+    the run after resume). A resume that arrives while the paused run is still stopping lays it out again. A
+    session's task is marked the same way and the session reads the message.
+  - Pause and resume travel down `parent_task` to the open child tasks on whatever node they run, and from
+    there further down; CANCEL already did (D-066). They go as the child's requester, so no trust is needed
+    for that. A child held until its dependencies are done (depends_on) is paused where it waits and is not
+    sent until resumed.
 - **Follow-up and receipts** (D-073 batch 2, D-076):
   - *Arriving work goes on the plan*: the owner's node adds `- [ ] <task> from <sender>: <first line>` to the
     `## 收件` section of the project's PLAN.md, and the receipt (the PENDING UPDATE, or a worker's ACK) says its
@@ -155,6 +180,18 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
 
 ### Waking, presence and follow-ups
 
+- **A post with no session** (auto_worker, its session not there): nothing can be pushed to it, so the node runs
+  its brain again when a message names it `next` (a child's QUESTION or BLOCKED, an ANSWER, a nudge) or when a
+  reminder it set comes due (D-098). The task woken is the one the message is about, or, for a child task it
+  asked for, the parent it belongs to (`parent_task`); a reminder set in a worker run wakes that run's task, one
+  without a task (a session's) only lands in the inbox. A child's RESULT does not wake the parent by itself (the
+  children wait does, once all are done), nor does a pause / resume / interrupt (control). A task waiting on a job has the wait ended with the reason (the run
+  adds the job again if it still waits); a BLOCKED one is laid out again; a paused, running, queued or closed one
+  is left alone. Whether a session takes the work is decided per task as for the worker's claim: a session
+  switched off, or one in another project, leaves it to the worker, so the brain is woken.
+- **ACKs and progress** (an ACK, or an UPDATE that names nobody next and is not a nudge, copy, follow-up or FYI)
+  are read as they arrive: they stay in `inbox --all` / check_task but never count as unread, and `clear_inbox`
+  clears an older backlog of them even if no listing showed it (D-098).
 - **Wake view.** What wakes a session (`inbox --only wake`, a waiting watcher, the push): REQUEST, QUESTION,
   ANSWER, BLOCKED, REJECT, CANCEL, ERROR, and any message whose `next` names the agent. The RESULT of one's own
   request does not, unless the agent has `wake_on_own_results: true` in node.yaml (per agent, default off); then
@@ -194,7 +231,9 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
 - **Follow-ups.** Every 30 s the requester's daemon checks the tasks it is owed. Each follow-up is sent
   once: an UPDATE to the requester with `next` set to the requester (so it wakes), copied as an FYI to
   `escalate_to` in node.yaml (e.g. the secretary). There are two:
-  - `overdue`: a reply is required, the deadline has passed, and there is no RESULT yet;
+  - `overdue`: a reply is required, the deadline has passed, and there is no RESULT yet; not when the owner
+    gave an eta: then the eta is chased instead (D-098);
+  - `eta_after_deadline`: the owner's eta is later than the deadline (once per eta; D-098);
   - `session_offline`: the owner is interactive, its node is up, its session is offline, and the request
     is still PENDING.
 

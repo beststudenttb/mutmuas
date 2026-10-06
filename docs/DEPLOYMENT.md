@@ -312,6 +312,39 @@ ls ~/.mutmuas/visual_rl/B/runs/  # per-task agent output (<task>.<UTC start time
 | Reset one node completely | Stop its daemon and delete its `data_dir`. Its durable mailbox on the server still holds unacknowledged messages, which are delivered again. |
 | Rotate a node's password | Delete `<out>/<NODE>.env`, re-run `server-config`, reload the server, copy the new file to the node, and restart the node. |
 
+## 8b. Retire a post (D-085/D-089)
+
+`agent-node retire-agent <id> [--hand-over <addr>]` shows what it would do; add `-y` to do it, on the node
+that has the post, **with the node daemon stopped** (Codex review of c46cfb9):
+
+1. refuses while the node daemon runs (it holds `data/daemon.lock`; the command holds it to the end, so the
+   daemon cannot start meanwhile), while the post's session is online, or while a worker of it runs a task;
+   refuses also while unread mail waits in its mailbox, unless `--keep-mailbox` (the mailbox is then kept and
+   listed under `todo`; nothing unread is deleted);
+2. writes the manifest `RETIRED-<id>-<time>.json` next to node.yaml **before the first change** (if it cannot,
+   nothing is done), and again after every step, an intent before the directory move (state planned / started /
+   done / failed, the steps done, the error);
+3. fences the post in the same ledger transaction as the session check: from then on no session takes it and no
+   tool (MCP or agentctl) acts as it;
+4. node.yaml: a timestamped backup (`node.yaml.bak-<time>-retire-<id>`), then only that agent's list item is
+   taken out, found from the parsed YAML's own positions (a comment inside the item goes with it; comments after
+   it stay). The result is checked to differ from the original by that one agent and nothing else, and written
+   atomically;
+5. its open work is refused back to each requester ("retired; ask <hand-over> instead"); what it asked others
+   for is withdrawn (their nodes cascade further down);
+6. its registry card and mailbox are removed now when the bus is reachable, else listed under `todo` (the node
+   removes the card at its next start);
+7. its post directory is moved whole to `work/_archive/<post>-<time>/`. Nothing in it is deleted, since it may
+   hold the leader's files. A directory another agent uses, or one inside it, is left in place, judged by file
+   identity (a case variant or a link of the path is the same directory).
+
+Start the node again afterwards: it forgets the address. `agent-node retire-agent --undo <manifest>` (also with
+`--dry-run`) works from the manifest of a finished or a failed run, also with the node daemon stopped: the block
+goes back to its old place in the agents list (checked the same way), the directory back from wherever it is on
+disk, the fence is lifted; then start the node. It changes nothing when the post directory exists again (both
+directories are named: merge them by hand), when a different agent now has the same id, or when neither the
+directory nor its archive is there. Refused and withdrawn tasks stay so.
+
 ## 8a. Supervision and known risks
 
 Errors are skipped and recorded rather than defended against (D-039, D-040); patches follow once the records
@@ -352,10 +385,37 @@ Known risks (protections removed on purpose; one line each):
   between can be lost (D-073).
 - An internal subtask's worker is kept from mail by its tools, not by the operating system: it runs as the same
   user with the post's Read/Bash, so it could read the node's ledger file directly (D-073).
+- Who may interrupt is decided by the sender address (node.yaml `trusted_controllers`, a list of full addresses,
+  checked at load; D-089). Each node has its own bus credential and may publish only as its own node, but the
+  agents of one node share it: any process on node B can send as B:claude-secretary. The list is a soft
+  boundary between honest senders, not a guard against a forger on that node; that needs per-daemon identity or
+  credentials, or signed relays (not built). The list is a node.yaml change the leader makes. `leader: true`
+  and priority high order work, they grant nothing.
+- Pause and interrupt stop the worker's process group only. A process that left the group (its own setsid), a
+  job on another machine, or a training started elsewhere keeps running: a task shown paused does not mean its
+  GPU training stopped or its GPU locks were released. A group that cannot be shown stopped (still alive after
+  SIGKILL, EPERM from a member that is not a zombie, or a ps answer that cannot be read) is recorded on the task
+  (`stuck_pgid`) and watched as a group, also after its leader has ended; nothing runs for the task while it
+  lives, and the heartbeat lays the task out once it has gone. The node knows a run's process only from the
+  runtime's spawn report, and a group id is checked by its live members (a reused id is not told apart).
+- Pause is not reliable for every open child task: a held child (depends_on) is paused where it waits, and a
+  child its owner node has already recorded is paused there, but a pause that reaches the owner node before the
+  child's REQUEST was handled is dropped (no persistent order or tombstone for unknown tasks).
+- A run stopped while its worktree is made (code tasks) is not known to be safe: the git process may go on and
+  the next run reuses a half-made worktree as it finds it. Not verified; do not count on interrupting a code
+  task at that stage.
+- An interrupted run is killed midway: work it had not saved, and side effects it had started (a training
+  process it launched without add_job), are not undone; the next run is told it was interrupted (D-089).
 - The 收件 section is rewritten by the node under the PLAN lock; an agent editing PLAN.md at the same moment
   without the lock can lose its edit or the node's line (D-073 batch 2).
 - An eta lives on the requester's node only (not on the public card): another node's coordinator sees it only
   through check_task on a task it may see.
+- Retiring a post cannot take back the refusals and withdrawals it sent; `--undo` restores only the config
+  block and the directory (D-085).
+- A retired post's fence lives in the ledger: a session started while it stands gets "being retired" and no mail;
+  a run that failed before node.yaml changed keeps the fence until `--undo` lifts it.
+- `retire-agent` trusts `data/daemon.lock`: a daemon started from another data directory for the same node is not
+  seen.
 - Two brain runs of one post never overlap, so different projects of a post wait for each other's brain runs.
 - A session started in any real subdirectory of the post directory (other than memory/ and hidden ones) counts
   as working on a project of that name, and with auto_worker takes only that project's requests (D-072).

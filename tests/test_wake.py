@@ -7,7 +7,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from conftest import eventually, interactive
+from conftest import backdate_deadline, eventually, interactive
 
 from mutmuas import tools
 from mutmuas.mcp_server import SUMMARY_CHARS, channel_notice
@@ -114,8 +114,10 @@ async def _card(hub, address, session):
 async def test_follow_ups_for_overdue_replies_and_missing_sessions(make_config, cluster):
     a, b, hub_a, hub_b = await _pair(make_config, cluster, escalate_to=["A:desk2"])
     past = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
-    late = await tools.send_request(hub_a, "A:main", "B:desk", "report", "overdue test", deadline=past)
-    fyi = await tools.send_request(hub_a, "A:main", "B:desk", "notice", "no reply wanted", deadline=past, reply="none")
+    late = await tools.send_request(hub_a, "A:main", "B:desk", "report", "overdue test", deadline="+1h")
+    fyi = await tools.send_request(hub_a, "A:main", "B:desk", "notice", "no reply wanted", deadline="+1h", reply="none")
+    for sent in (late, fyi):
+        backdate_deadline(hub_a.ledger, sent["task_id"], past)                    # time has passed
     hub_b.ledger.session_beat("B:desk", 999999, "/nowhere")                    # a session that has gone away
     hub_b.ledger.session_end("B:desk", 999999)
     await eventually(lambda: _card(hub_a, "B:desk", "offline"), what="B:desk session offline")

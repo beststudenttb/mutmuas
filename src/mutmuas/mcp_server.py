@@ -126,7 +126,12 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         me = os.getpid()
         while True:
             holder = hub.ledger.session_claim(addr, me, os.getcwd(), session_alive, session_pid=os.getppid())
-            if holder != me and state.get("duplicate_of") != holder:
+            if holder == -1 and state.get("duplicate_of") != holder:
+                state["duplicate_of"] = holder
+                await push_now({"content": f"mutmuas: {addr} is being retired (agent-node retire-agent): this "
+                                           "session gets no mail and must not act as it.",
+                                "meta": {"session": "retired"}})
+            elif holder != me and state.get("duplicate_of") != holder:
                 state["duplicate_of"] = holder
                 await push_now(duplicate_notice(addr, holder))
             elif holder == me:
@@ -306,7 +311,7 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         """Come back to something later: at (ISO time with timezone, or +10m / +2h) the node puts the text into
         your inbox, which wakes you like new mail (and waits there if no session runs). every (e.g. "5h") repeats
         it until cancel_reminder. Use it instead of promising to "check again in a while"."""
-        return dump(await tools.remind_me(hub(), state["me"], at, text, every=every))
+        return dump(await tools.remind_me(hub(), state["me"], at, text, every=every, task_id=worker_task))
 
     @server.tool()
     async def cancel_reminder(reminder: int) -> str:

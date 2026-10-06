@@ -116,6 +116,13 @@ CREATE TABLE IF NOT EXISTS failures (
     error           TEXT NOT NULL            -- "<ExceptionType>: <message>"
 );
 
+-- A post being retired (agent-node retire-agent): no session may take its lease from the check on (Codex review
+-- of c46cfb9). Cleared by --undo.
+CREATE TABLE IF NOT EXISTS retiring (
+    local_agent     TEXT PRIMARY KEY,
+    at              TEXT NOT NULL
+);
+
 -- Requests held by their sender until the tasks they depend on are done (D-073 batch 2, depends_on).
 CREATE TABLE IF NOT EXISTS held (
     task_id         TEXT PRIMARY KEY,
@@ -149,8 +156,21 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 """
 
-TASK_JSON_FIELDS = ("request", "result", "result_draft", "input_refs", "output_refs")
+TASK_JSON_FIELDS = ("request", "result", "result_draft", "input_refs", "output_refs", "interrupts")
 
+
+# Informational inbound mail (D-098): an ACK, or an UPDATE that names nobody next and is none of the special kinds
+# (nudge, observer copy or grant, follow-up, an FYI copy to a node lead). It is read as it is handled, so it
+# never piles up as unread.
+INFO_KEYS = ("next", "nudge", "copy_of", "observers_add", "follow_up", "fyi", "pause", "resume", "interrupt")
+# A key counts when it holds something: absent, null, false, "", [] and {} are all "not set", in SQL as in Python.
+INFO_SQL = ("(type='ACK' OR (type='UPDATE' AND "
+            + " AND ".join(f"COALESCE(json_extract(envelope,'$.body.{k}'), 0) IN (0, '', '[]', '{{}}')"
+                           for k in INFO_KEYS) + "))")
+
+
+def is_info(env) -> bool:
+    return env.type == "ACK" or (env.type == "UPDATE" and not any(env.body.get(k) for k in INFO_KEYS))
 
 class Ledger:
     def __init__(self, path: Path):
@@ -171,10 +191,13 @@ class Ledger:
         self._add_column("tasks", "runner", "TEXT")
         self._add_column("tasks", "runner_pid", "INTEGER")
         self._add_column("tasks", "runner_start", "TEXT")          # the process's start time: pids get reused
+        # D-089: the process group of a run whose stop failed; nothing runs for the task while it lives
+        self._add_column("tasks", "stuck_pgid", "INTEGER")
         # D-066: a job that waits on the task's direct child tasks (parent_task) instead of a process or file
         self._add_column("jobs", "children", "INTEGER NOT NULL DEFAULT 0")
         self._add_column("reminders", "every_s", "REAL")             # repeat after this many seconds
         self._add_column("reminders", "cancelled_at", "TEXT")
+        self._add_column("reminders", "task_id", "TEXT")             # set in a worker run: the task it wakes
         # D-073 batch 2: push state per message (spec §5.1), the owner's eta (D-076), the last nudge (requester
         # side), and a session that is online but takes no work (`off`)
         self._add_column("messages", "pushed", "INTEGER NOT NULL DEFAULT 0")
@@ -182,6 +205,9 @@ class Ledger:
         self._add_column("tasks", "eta", "TEXT")
         self._add_column("tasks", "nudged_at", "TEXT")
         self._add_column("sessions", "accepting", "INTEGER NOT NULL DEFAULT 1")
+        # D-089: messages that interrupted a worker's run, for its next run; a task paused until resumed
+        self._add_column("tasks", "interrupts", "TEXT")
+        self._add_column("tasks", "paused", "INTEGER NOT NULL DEFAULT 0")
 
     def _add_column(self, table: str, column: str, decl: str) -> None:
         if column not in [r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")]:
@@ -394,20 +420,39 @@ class Ledger:
 
     def session_beat(self, local_agent: str, pid: int, cwd: str | None, session_pid: int | None = None) -> None:
         now = now_iso()
-        self.db.execute(self._BEAT_SQL, (local_agent, pid, session_pid, cwd, now, now))
+        with self.tx() as db:
+            if not db.execute("SELECT 1 FROM retiring WHERE local_agent=?", (local_agent,)).fetchone():
+                db.execute(self._BEAT_SQL, (local_agent, pid, session_pid, cwd, now, now))
 
     def session_claim(self, local_agent: str, pid: int, cwd: str | None, holder_alive,
                       session_pid: int | None = None) -> int:
         """One agent, one session: beat as the holder if the lease is free, stale or already ours; otherwise return
-        the holder's pid. The check and the write are one transaction (BEGIN IMMEDIATE), so two sessions starting
-        together cannot both win."""
+        the holder's pid, or -1 while the agent is being retired. The check and the write are one transaction
+        (BEGIN IMMEDIATE), so two sessions starting together cannot both win."""
         now = now_iso()
         with self.tx() as db:
+            if db.execute("SELECT 1 FROM retiring WHERE local_agent=?", (local_agent,)).fetchone():
+                return -1
             row = db.execute("SELECT * FROM sessions WHERE local_agent=?", (local_agent,)).fetchone()
             if row is not None and row["pid"] not in (0, pid) and holder_alive(dict(row)):
                 return row["pid"]
             db.execute(self._BEAT_SQL, (local_agent, pid, session_pid, cwd, now, now))
         return pid
+
+    def begin_retire(self, local_agent: str, refuse_if) -> str | None:
+        """Fence an agent for retirement, or say why not: refuse_if() (e.g. its session is there) is checked in the
+        same transaction that sets the fence, so no session can take the lease in between."""
+        with self.tx() as db:
+            if (why := refuse_if()):
+                return why
+            db.execute("INSERT OR REPLACE INTO retiring (local_agent, at) VALUES (?,?)", (local_agent, now_iso()))
+        return None
+
+    def retiring(self, local_agent: str) -> bool:
+        return self.db.execute("SELECT 1 FROM retiring WHERE local_agent=?", (local_agent,)).fetchone() is not None
+
+    def end_retire(self, local_agent: str) -> None:
+        self.db.execute("DELETE FROM retiring WHERE local_agent=?", (local_agent,))
 
     def claim_task(self, task_id: str, runner: str, statuses: tuple[str, ...],
                    refuse_if=None) -> str | None:
@@ -458,10 +503,11 @@ class Ledger:
     def mark_seen_before(self, local_agent: str, before_seq: int) -> list[Envelope]:
         """Mark everything up to a rowid as read (the session's explicit 'clear the backlog') that an inbox
         listing has shown: never mail the session has not seen (STANDARD item 8; Codex review of dfdd719).
+        Informational messages (ACKs, progress) are cleared whether listed or not (D-098).
         Returns what was marked, so receipts can follow."""
         with self.tx() as db:
             rows = db.execute("SELECT message_id, envelope FROM messages WHERE direction='in' AND local_agent=?"
-                              " AND seen=0 AND shown=1 AND state='handled' AND rowid <= ?",
+                              f" AND seen=0 AND (shown=1 OR {INFO_SQL}) AND state='handled' AND rowid <= ?",
                               (local_agent, before_seq)).fetchall()
             db.executemany("UPDATE messages SET seen=1 WHERE message_id=? AND direction='in'",
                            [(r["message_id"],) for r in rows])
@@ -491,16 +537,21 @@ class Ledger:
     def unshown_count(self, local_agent: str, before_seq: int) -> int:
         """Unread mail up to a rowid that no foreground inbox listing has shown (clear_inbox leaves it)."""
         return self.db.execute("SELECT COUNT(*) FROM messages WHERE direction='in' AND local_agent=? AND seen=0"
-                               " AND shown=0 AND state='handled' AND rowid <= ?",
+                               f" AND shown=0 AND NOT {INFO_SQL} AND state='handled' AND rowid <= ?",
                                (local_agent, before_seq)).fetchone()[0]
+
+    def mark_info_read(self, message_id: str) -> None:
+        """An informational message (ACK, progress) is read as it is handled: it does not count as unread."""
+        self.db.execute("UPDATE messages SET seen=1 WHERE message_id=? AND direction='in'", (message_id,))
 
     def record_published(self, uri: str, local_agent: str) -> None:
         self.db.execute("INSERT OR IGNORE INTO artifact_publishers (uri, local_agent, published_at) VALUES (?,?,?)",
                         (uri, local_agent, now_iso()))
 
-    def add_reminder(self, local_agent: str, due: str, text: str, every_s: float | None = None) -> int:
-        cur = self.db.execute("INSERT INTO reminders (local_agent, due, text, created_at, every_s) VALUES (?,?,?,?,?)",
-                              (local_agent, due, text, now_iso(), every_s))
+    def add_reminder(self, local_agent: str, due: str, text: str, every_s: float | None = None,
+                     task_id: str | None = None) -> int:
+        cur = self.db.execute("INSERT INTO reminders (local_agent, due, text, created_at, every_s, task_id)"
+                              " VALUES (?,?,?,?,?,?)", (local_agent, due, text, now_iso(), every_s, task_id))
         return cur.lastrowid
 
     def due_reminders(self, now: str) -> list[dict[str, Any]]:

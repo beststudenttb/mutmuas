@@ -7,7 +7,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from conftest import owned_task
+from conftest import backdate_deadline, owned_task
 from test_job_wake import _node
 
 from mutmuas import tools
@@ -19,8 +19,12 @@ def _iso(delta_s: float) -> str:
 
 
 async def _child(daemon, parent: str, to: str, deadline: str | None = None) -> str:
+    """A child task; a deadline already past is sent as a future one and moved back (D-098 refuses a past one)."""
+    past = deadline and deadline < _iso(0)
     sent = await tools.send_request(daemon.hub, "B:desk", to, f"part of {parent}", "split", parent_task=parent,
-                                    deadline=deadline)
+                                    deadline="+1h" if past else deadline)
+    if past:
+        backdate_deadline(daemon.hub.ledger, sent["task_id"], deadline)
     return sent["task_id"]
 
 

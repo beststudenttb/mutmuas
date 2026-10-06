@@ -241,3 +241,10 @@ def thread_types(hub: Hub, task_id: str) -> list[str]:
 
 
 sys.path.insert(0, str(Path(__file__).parent))
+
+
+def backdate_deadline(ledger, task_id: str, deadline: str) -> None:
+    """A request's deadline that has since passed: sending one already past is refused (D-098), so a test sends a
+    future one and moves it, as time would."""
+    task = ledger.task(task_id, "requester")
+    ledger.update_task(task_id, "requester", request={**task["request"], "deadline": deadline})

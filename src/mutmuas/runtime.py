@@ -14,11 +14,14 @@ MUTMUAS_CONFIG / MUTMUAS_AGENT / MUTMUAS_TASK_ID from the environment, so
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import signal
+import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +47,8 @@ class TaskContext:
     on_spawn: Any = None                 # called with the process id once the agent process exists
     jobs: list[dict[str, Any]] = field(default_factory=list)   # background jobs of this task that have ended
     resume: str | None = None            # a brain batch's conversation to continue (D-073)
+    interrupts: list[str] = field(default_factory=list)   # what interrupted the previous run (D-089)
+    session_id: str | None = None        # a new brain conversation's id, chosen by the node before the run
 
     @property
     def internal(self) -> bool:
@@ -133,10 +138,13 @@ class SubprocessRuntime:
                 ctx.on_spawn(proc.pid)
             tail = bytearray()
             try:
-                if stdin is not None:
-                    proc.stdin.write(stdin)
-                    await proc.stdin.drain()
-                proc.stdin.close()
+                # a command that does not read its input may close it first: not an error, its exit code says how
+                # it went (C's Linux runs: `true` made a run fail with ConnectionResetError now and then)
+                with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                    if stdin is not None:
+                        proc.stdin.write(stdin)
+                        await proc.stdin.drain()
+                    proc.stdin.close()
                 while chunk := await proc.stdout.read(65536):
                     logf.write(chunk)
                     logf.flush()
@@ -212,7 +220,20 @@ Rules:
 """
 
 
+def interrupt_note(ctx: TaskContext) -> str:
+    """The messages that interrupted (or paused and resumed) this task's previous run (D-089): first thing to read."""
+    if not ctx.interrupts:
+        return ""
+    lines = "".join(f"\n- {text}" for text in ctx.interrupts)
+    return (f"\nYour previous run of this task was interrupted (D-089) by the message(s) below. Act on them first: "
+            f"they may stop or change what you were doing.{lines}\n")
+
+
 def worker_prompt(ctx: TaskContext) -> str:
+    return interrupt_note(ctx) + _worker_prompt(ctx)
+
+
+def _worker_prompt(ctx: TaskContext) -> str:
     if ctx.internal:
         return sub_prompt(ctx)
     req = ctx.request
@@ -265,7 +286,10 @@ Rules:
    PLAN.md what you wait for, and end this run without submit_result. You are started again when the job ends.
 8. Parts you delegate with send_request are this task's child tasks (parent_task is set for you). To wait for
    them, call add_job(children=True) and end this run without submit_result: you are started again once
-   each has a result, was refused or cancelled, or is past its deadline, and told how each ended.
+   each has a result, was refused or cancelled, or is past its deadline, and told how each ended. Wait on
+   children=True, not a done_file: nobody writes a done_file when a child task ends. You are also started
+   again when a child asks a question or reports it is blocked, when a message names you next, and when a
+   reminder you set comes due (the wait then ends: add the job again if you still wait).
 """
 
 
@@ -306,6 +330,8 @@ class ClaudeCodeRuntime(SubprocessRuntime):
             argv += ["--model", model]
         if ctx.resume:
             argv += ["--resume", ctx.resume]
+        elif ctx.session_id:
+            argv += ["--session-id", ctx.session_id]       # named up front: a stopped run can still be resumed
         # Worker limits (D-066): the agent's own, else the node's default; --max-turns is accepted by claude -p
         # although its --help does not list it (checked in the 2.1.285 binary)
         turns = self.agent.max_turns if self.agent.max_turns is not None else ctx.node.worker_max_turns
@@ -371,16 +397,66 @@ def _last_json(text: str) -> dict[str, Any] | None:
     return None
 
 
-async def _kill_group(proc: asyncio.subprocess.Process) -> None:
-    if proc.returncode is not None:
-        return
-    for sig, wait in ((signal.SIGTERM, 5), (signal.SIGKILL, 5)):
-        try:
-            os.killpg(proc.pid, sig)
-        except ProcessLookupError:
-            return
-        try:
-            await asyncio.wait_for(asyncio.shield(proc.wait()), wait)
-            return
-        except asyncio.TimeoutError:
-            continue
+async def stop_group(pgid: int, grace_s: float = 5.0) -> bool:
+    """Stop a run's whole process group: SIGTERM, then SIGKILL to whatever is left after grace_s. The group is
+    waited on, not just its leader: a child that ignores SIGTERM would keep running and keep its locks (a GPU
+    flock) (Codex review of 9f39ff0). True once the group is gone."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if _group_gone(pgid, sig):
+            return True
+        deadline = time.monotonic() + grace_s
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+            if _group_gone(pgid, 0):
+                return True
+    return False
+
+
+def group_alive(pgid: int) -> bool:
+    """Something of this process group still runs (zombies do not count; an unreadable state counts as alive)."""
+    return not _group_gone(pgid, 0)
+
+
+def _group_gone(pgid: int, sig: int) -> bool:
+    """Whether the group is gone after sending it sig. Members that are zombies (dead, not yet reaped by their
+    parent) count as gone: Linux lets kill() reach a zombie, macOS answers EPERM for a group of zombies only
+    (secretary's run on B, Codex re-review of cb77a33). A live member we may not signal is not gone."""
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return _all_zombies(_group_states(pgid))
+    return sig == 0 and _all_zombies(_group_states(pgid))
+
+
+def _all_zombies(states: list[str]) -> bool:
+    # the group answered a signal, so ps must show members: none shown says nothing (Codex third review)
+    return bool(states) and all(state.startswith("Z") for state in states)
+
+
+def _group_states(pgid: int) -> list[str]:
+    """The process states (ps STAT) of the members of a process group; ["?"] (unknown, not a zombie) when ps
+    cannot run or fails (a sandbox): then the group is not shown gone and the stop counts as failed."""
+    try:
+        ps = next(p for p in ("/bin/ps", "/usr/bin/ps") if os.path.exists(p))       # by absolute path, as node.py
+        done = subprocess.run([ps, "-A", "-o", "pgid=,stat="], capture_output=True, text=True)       # POSIX flags
+    except (OSError, subprocess.SubprocessError, StopIteration):
+        return ["?"]
+    if done.returncode != 0:
+        return ["?"]
+    states = []
+    for line in done.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 2 or not parts[0].isdigit():
+            return ["?"]                                # a line we cannot read: unknown, never "gone"
+        if parts[0] == str(pgid):
+            states.append(parts[1])
+    return states
+
+
+async def _kill_group(proc: asyncio.subprocess.Process, grace_s: float = 5.0) -> None:
+    if not await stop_group(proc.pid, grace_s):  # the run starts its own session: its group id is its pid
+        log.error("could not stop process group %s: some of it still runs", proc.pid)
+    with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(proc.wait()), grace_s)

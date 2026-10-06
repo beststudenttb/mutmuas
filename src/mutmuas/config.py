@@ -179,6 +179,14 @@ class NatsConfig:
         return self.token or (os.environ.get(self.token_env) if self.token_env else None)
 
 
+def _is_address(text: str) -> bool:
+    try:
+        Address.parse(text)
+    except ValueError:
+        return False
+    return True
+
+
 @dataclass
 class NodeConfig:
     project: str
@@ -191,10 +199,15 @@ class NodeConfig:
     message_retention_days: float = 30
     artifact_max_mb: float = 2048         # upload cap for the NATS object store backend
     escalate_to: list[str] = field(default_factory=list)   # copied on follow-ups (overdue reply, session gone)
+    # may interrupt or pause any post of this node (D-089); others pause / resume only what they asked for. A soft
+    # boundary: the nodes share one bus credential (DEPLOYMENT 8a). The leader's word comes relayed by the secretary.
+    trusted_controllers: list[str] = field(default_factory=list)
     coordinators: list[str] = field(default_factory=list)  # may see every task's status layer (visibility.py)
     # A request that needs a reply but names no deadline gets this one (seconds from sending), so the overdue
     # follow-up can chase it (no-stall design, G3). 0 = no default.
     default_reply_deadline_s: float = 4 * 3600
+    # ... and for experiment and code requests, which take longer (D-098). 0 = the one above.
+    long_reply_deadline_s: float = 24 * 3600
     # Defaults for every worker run of this node (an agent's max_turns / max_cost_usd overrides them; D-066).
     # None = no limit. A run stopped at a limit without a result is a failed run (R5.4: run once more).
     worker_max_turns: int | None = None
@@ -208,6 +221,11 @@ class NodeConfig:
     def validate(self) -> NodeConfig:
         check_token(self.project, "project")
         check_token(self.node, "node id")
+        # a control permission: a list of full addresses, or a scalar would authorize by substring (Codex review)
+        if not isinstance(self.trusted_controllers, list) or not all(
+                isinstance(a, str) and _is_address(a) for a in self.trusted_controllers):
+            raise ConfigError(f"trusted_controllers must be a list of addresses like [B:claude-secretary], "
+                              f"not {self.trusted_controllers!r}")
         seen = set()
         for agent in self.agents:
             agent.validate()
