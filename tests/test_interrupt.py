@@ -807,3 +807,25 @@ async def test_an_interrupt_of_a_paused_task_stops_its_group_and_leaves_it_pause
         assert "T-r" not in daemon._queued["B:desk"] and task["interrupts"]          # kept for after resume
     finally:
         ledger.close()
+
+
+async def test_a_runner_cancelled_as_its_run_ends_stops_instead_of_waiting_forever(tmp_path, monkeypatch):
+    """C's Linux runs (hangdiag): the runner's own cancel (a daemon stop, a test's cleanup) landing as the run it
+    awaited ended was swallowed - `runner.done()` was already true - and the runner went back to its empty queue
+    for good. Made certain here: the run cancels the runner on its last step."""
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-r", "ACCEPTED", ingest=True)
+    outer = {}
+
+    async def run_that_ends_as_the_runner_is_cancelled(agent_, task_id):
+        outer["runner"].cancel()                        # the stop arrives now; this run ends normally anyway
+    monkeypatch.setattr(daemon, "_execute", run_that_ends_as_the_runner_is_cancelled)
+    daemon._enqueue("B:desk", "T-r")
+    outer["runner"] = asyncio.create_task(daemon._runner(agent, "B:desk", daemon._queues["B:desk"]))
+    try:
+        done, _ = await asyncio.wait({outer["runner"]}, timeout=3)
+        assert done and outer["runner"].cancelled()
+    finally:
+        outer["runner"].cancel()
+        await asyncio.gather(outer["runner"], return_exceptions=True)
+        ledger.close()
