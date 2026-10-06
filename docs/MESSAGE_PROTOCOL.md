@@ -64,9 +64,9 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
 - `reply` on a REQUEST: `required` (the default) means the owner owes a RESULT. `none` makes it a notice.
   The receiving session reading it, with a plain `inbox` and not `--peek`, closes the task with a read receipt
   (`RESULT complete "read by X (no reply requested)"`).
-- `deadline` (ISO 8601 with a timezone, or relative: `+30m`, `+2h`, `+1d`, more than zero) says when the reply is
-  needed. One already past is refused (D-098); a relative one on a request held for `depends_on` counts from its
-  release. Use `agentctl ask --due +2h`.
+- `deadline` says when the reply is needed, always from now: `+30m`, `+2h`, `+1d` (D-102: so one in the past
+  cannot be given). The requester's node turns it into an ISO time. Use `agentctl ask --due +2h`. Etas and
+  reminders are given the same way.
   - A REQUEST that wants a reply but names no deadline gets one from the requester's node:
     `default_reply_deadline_s` in node.yaml (default 4 h; `0` = no default), and for `kind` experiment or code
     `long_reply_deadline_s` (default 24 h; D-098). With `timeout_s` it is never earlier than `timeout_s` +
@@ -108,23 +108,32 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
     may interrupt or pause any of its posts (at first only the secretary: the leader's word comes relayed by
     the secretary). Anyone else may pause and resume only a task it requested, sent to the address that owns
     it. `priority: high` and `leader: true` grant nothing: they only order what is allowed.
+  - Sent with the MCP tool `control_task(task_id, pause|resume|interrupt, message)`: an UPDATE about that one
+    task to its owner. From the requester it goes the usual way; from anyone else (the secretary, on a task
+    another post asked for) to the owner the shared task record names. The owner's node acts on that task only
+    (there is no post-wide interrupt, D-102): pause and resume from its requester or a trusted controller,
+    interrupt from a trusted controller. A control from anyone else who is not its requester is not acted on
+    and not shown, only logged; an untrusted requester's interrupt reaches the owner as a plain message. A
+    script worker finds the messages in its task JSON (`interrupts`); an LLM worker's prompt starts with them.
   - An UPDATE or ANSWER from a trusted controller interrupts a worker in the middle of a run when it is about
-    the task that worker runs, or carries `interrupt: true` (then it stops whatever the post's worker runs). The
+    the task that worker runs, or carries `interrupt: true` (its run is stopped if it runs; it is laid out again
+    with the message either way). A control about a task the owner's node does not know yet (it came before
+    the REQUEST) does nothing, and is not applied to that REQUEST when it arrives. The
     owner's node stops the run (the whole process group: what ignores SIGTERM gets SIGKILL), keeps the message
     on the task (`tasks.interrupts`) and lays the task out again; the next run's prompt starts with it, and a
     brain resumes the same conversation. The node names a new brain conversation itself (`claude -p
     --session-id`) before the run, so a run stopped midway can still be resumed. The requester is told
-    ("interrupted"). The attempt is not counted as a failed one. A stop that lands before the run started
-    (while its worktree is made) lays the task out the same way; a worker from before a node restart is
+    ("interrupted"). The attempt is not counted as a failed one. A worker from before a node restart is
     stopped by its process group too.
   - `pause: true` stops a running worker and keeps the task WAITING and `paused` until `resume: true`; nothing
     restarts a paused task (heartbeat, recover, the end of a background job: that news waits on the task for
-    the run after resume). A resume that arrives while the paused run is still stopping lays it out again. A
-    session's task is marked the same way and the session reads the message.
+    the run after resume). A session's task is marked the same way and the session reads the message.
+  - One place decides (D-102): a control writes its wish into the ledger (`paused`, the message) and stops the
+    run; what the task does next is decided from the ledger alone, when the stopped run has ended, so the order
+    in which a stop, a resume and the run's end arrive does not matter.
   - Pause and resume travel down `parent_task` to the open child tasks on whatever node they run, and from
     there further down; CANCEL already did (D-066). They go as the child's requester, so no trust is needed
-    for that. A child held until its dependencies are done (depends_on) is paused where it waits and is not
-    sent until resumed.
+    for that.
 - **Follow-up and receipts** (D-073 batch 2, D-076):
   - *Arriving work goes on the plan*: the owner's node adds `- [ ] <task> from <sender>: <first line>` to the
     `## 收件` section of the project's PLAN.md, and the receipt (the PENDING UPDATE, or a worker's ACK) says its
@@ -134,39 +143,22 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
     (opening a session, /mcp reconnect) every unread one again, oldest first. It does not push again and again
     while the session works; the Stop hook has the agent look before it ends a turn. Each push is counted
     (`messages.pushed`, `pushed_at`); `whoami` shows `inbox_unread`, `oldest_unread_s` and `last_push_at`.
-  - *eta*: `accept_task(eta=…)` and `report_progress(eta=…)` (ISO time with timezone) send the owner's estimate;
+  - *eta*: `accept_task(eta=…)` and `report_progress(eta=…)` (from now: `+2h`) send the owner's estimate;
     the requester's node keeps it (`check_task` shows it). When it has passed, the requester's node reminds the
     owner once (an UPDATE with `next`, asking for a new eta). No new eta within an hour: the requester is told,
     and the node's `escalate_to` addresses (the secretary) get a copy. A new eta starts over. WAITING (on a job
-    or subtasks) and BLOCKED work is not chased; an owner whose node is offline is not chased; a session that is
-    gone with no worker behind it is reported instead of chased.
-  - *depends_on*: `send_request(depends_on=[…])` names tasks this node knows. The request is held on the
-    sender's node (`delivery: held`) and sent once they are all done, with their summaries in
-    `body.dependencies` and their artifacts attached. Only tasks the sender takes part in can be named, and
-    only artifacts it may see travel with it (checked again when it is sent). If one failed, was refused or
-    withdrawn, it is not sent: it fails and its sender is told. Withdrawing a held request drops it (no CANCEL
-    goes out). While held it is not chased, and its default reply deadline starts when it is sent.
-  - *nudge*: `nudge(task_id, note)` reminds the owner of a task we requested: it is woken (`next`) and must
-    answer what it does, where it is stuck and a new eta. At most once in three hours per task. The owner's
-    node lays out again a worker's task that is neither running nor queued.
+    or child tasks) and BLOCKED work is not chased; an owner whose node is offline is not chased; a session that is
+    gone with no worker behind it is reported instead of chased. The chase also lays out again a worker's task
+    that is neither running nor queued (a stalled worker).
   - *off*: `agentctl session off` (the launcher's `mutmuas <post> off`) keeps the session online but gives
     it no work: the worker takes new requests and the session's inbox leaves them out; `session on` undoes it.
     A post without a worker (auto_worker) cannot switch off: nobody else would take the work.
-- **Brain and subs** (D-073): a post's worker runs are its *brain*. With claude-code, its runs for one project
+- **Brain** (D-073): a post's worker runs are its *brain*. With claude-code, its runs for one project
   share one conversation (`claude -p --resume`) while work keeps coming; after `brain_batch_idle_s` (node.yaml,
-  default 1800) with no brain run, no sub running and no job waited on, the node forgets the conversation and the
-  next run starts afresh from HANDOFF/PLAN (the brain updates them every run). Brain runs of a post are serial.
-  Codex brains start afresh each run for now. A brain's long work goes to *internal subtasks*:
-  `send_request(to=<itself>, internal=true, model=…)`, only for a post with `auto_worker`. The owner's node
-  refuses one from anyone else, for a plain worker address, or for another project than its parent's (it always
-  belongs to its parent's project). It is always run by the worker (never the session, even one online), from
-  its own pool (`max_concurrent`), on the requested model or the latest Sonnet. It is left out of the session's
-  inbox. Its worker, recognised by the process tree like the lease, gets only `report_progress`,
-  `submit_result` and `add_job`: MCP, agentctl and the mail functions underneath refuse the rest. This is a
-  division of work, not a sandbox: the worker runs as the same user and could read the node's files directly.
-  It writes its outputs under `runs/<task>/` and does not write PLAN/HANDOFF: the node marks the line
-  naming it on the brain's PLAN.md (`[>]` on progress, `[x] — summary` when done, `[!] — why` when failed or
-  blocked). The brain waits for its subs with `add_job(children=True)`.
+  default 1800) with no brain run and no job waited on, the node forgets the conversation and the next run starts
+  afresh from HANDOFF/PLAN (the brain updates them every run). Brain runs of a post are serial. Codex brains start
+  afresh each run for now. A brain's long work runs as a background job (`add_job`) or as child tasks it waits on
+  (`add_job(children=True)`).
 - **Waiting on child tasks** (D-066): requests an owner sends while working on a task carry `parent_task` (set
   automatically inside a worker run). `add_job(children=True)` makes the task wait on its direct children; so does
   reporting `state: WAITING` while a child is open. The wait ends once every child has a result, was refused or
@@ -181,7 +173,7 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
 ### Waking, presence and follow-ups
 
 - **A post with no session** (auto_worker, its session not there): nothing can be pushed to it, so the node runs
-  its brain again when a message names it `next` (a child's QUESTION or BLOCKED, an ANSWER, a nudge) or when a
+  its brain again when a message names it `next` (a child's QUESTION or BLOCKED, an ANSWER) or when a
   reminder it set comes due (D-098). The task woken is the one the message is about, or, for a child task it
   asked for, the parent it belongs to (`parent_task`); a reminder set in a worker run wakes that run's task, one
   without a task (a session's) only lands in the inbox. A child's RESULT does not wake the parent by itself (the
@@ -211,23 +203,23 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   registry card of an interactive agent then shows one of:
   - `session: online`, or `offline` (no heartbeat for 50 s, or the process has gone);
   - `unknown` (no mutmuas MCP server has ever run for it);
-  - `session_warning` when the session was started outside the agent's workdir. Claude Code keeps memory
-    per start directory, so a wrong start directory means an empty memory.
 - **One agent, one session.** The first session's MCP process holds the agent (a lease in the node
   ledger). The check and the write are one transaction, so two sessions starting together cannot both win.
-  - A second session acting as the same agent is told at once and receives no mail pushes.
-  - Its MCP tools (all but `whoami`) refuse to act.
-  - `agentctl` commands for that agent are refused too, unless they run inside the holding session: a
-    descendant of the session process, such as its shell. The ancestry comes from `/proc` or `ps` by absolute
-    path, and no environment variable exempts a process.
-  - Exceptions, because they show no mail content: `status`, `agents`, `find`, and `watch --headers-only`
-    (a notifier service outside the session: count, type and sender only). `whoami` is exempt only as an MCP
-    tool; `agentctl whoami` needs the session.
+  - A second session acting as the same agent is told at once and receives no mail pushes; its MCP tools (all
+    but `whoami`) refuse to act. When the holder closes, the other session takes over at its next heartbeat.
+  - Who acts is decided by how a process was started (D-102): the session's own MCP process holds the lease;
+    a worker the daemon started carries MUTMUAS_TASK_ID (its MCP server inherits it) and acts on its own task,
+    holding no lease. The variable is checked against the ledger: it names a task of this agent whose worker
+    process (the pid and start time the daemon recorded) still runs; otherwise the process is no worker.
+  - `agentctl` beside the holding session (a shell, a hook) may only read: `status`, `agents`, `find`,
+    `whoami`, `tasks`, `task`, `failures`, `inbox --peek`, `watch --headers-only`, and switch the session's own
+    work (`session off|on`). Anything that acts as the agent goes through the session's MCP tools: `agentctl
+    update`, `submit`, `artifact` and the like from the session's own shell are refused (D-102); a running
+    worker's processes may use them for its own task.
   - Only a foreground `inbox` listing counts as having shown a message; `clear_inbox` marks read only messages
-    shown that way. Notifier reads (`watch`, pushes) do not count.
-  - The holder is told about the contender. When the holder closes, the other session takes over at its
-    next heartbeat. Two projects on one machine are two agents (e.g. `C:paper` and
-  `C:course`), not two sessions of one agent.
+    shown that way (ACKs and progress excepted, D-098). Notifier reads (`watch`, pushes) and a shell's
+    `agentctl inbox --peek` do not count.
+  - Two projects on one machine are two agents (e.g. `C:paper` and `C:course`), not two sessions of one agent.
 - **Follow-ups.** Every 30 s the requester's daemon checks the tasks it is owed. Each follow-up is sent
   once: an UPDATE to the requester with `next` set to the requester (so it wakes), copied as an FYI to
   `escalate_to` in node.yaml (e.g. the secretary). There are two:
@@ -268,26 +260,24 @@ There are four layers (`src/mutmuas/visibility.py`):
   inbox counts or session directory; the agent reads those itself with `whoami`. The task KV has no reason,
   inputs, thread, result or artifact references.
 - Every tool filters by viewer:
-  - `task`, `result` and MCP `check_task` return nothing to non-participants, and the status layer to
-    coordinators;
+  - `task` and MCP `check_task` return nothing to non-participants, and the status layer to coordinators;
   - `tasks --all` lists the viewer's own tasks, or every status record for a coordinator;
-  - `history` lists only messages the viewer sent or received;
   - `artifact list` and `fetch` cover only artifacts the viewer published or was sent.
 - `coordinators` is set in the HR-issued node.yaml, e.g. `[B:claude-secretary]`; an agent cannot make
   itself one.
 - **Participants** come from what the node persisted for the task: its requester, its owner, the `observers`
   listed on its request, and agents holding an observer row. Sending mail on a task makes nobody a
-  participant. Only the requester or owner may send on a task: `reply`, `question`, `answer`, and `send`
-  with `--task`.
+  participant. Only the requester or owner may send on a task: `reply`, `question`, `answer`.
 - `observers` go on a REQUEST (`agentctl ask --observer`), or any participant adds them later with
-  `add_observer` / `agentctl observe`.
+  `add_observer`.
   - Observers receive FYI copies of the REQUEST and RESULT. The copies never wake them.
   - Each copy lists the task's participants. The observer's node keeps a copy only if both the sender and
-    the recipient are on that list.
+    the recipient are on that list, and the sender is the task's requester or owner: from its own records, or
+    from the shared task record. The owner's node forwards the REQUEST's copies after it has written that
+    record (a node writes only its own task records), and RESULT copies come after it too (D-102).
   - Every other participant is told `observers_add`, so the requester's side also forwards a later RESULT.
 - A worker's `notify` lead gets the status layer only: task id, a short objective, status.
 - Artifacts: the object store keeps no description (it travels in the participants' ArtifactRef).
-- A session started outside its workdir is reported to the agent and to the coordinators, not on the card.
 - **Not a security boundary.** Every process holding the node credential can still read:
   - the message stream;
   - the object-store bytes;

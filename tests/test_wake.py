@@ -95,7 +95,7 @@ async def test_channel_push_and_session_presence(make_config, cluster, tmp_path)
         listed = {c["address"]: c for c in await tools.list_agents(hub_a)}
         assert listed["B:desk"]["session"] == "online"                          # visible in `agents`, not only raw
 
-        await tools.remind_me(hub_b, "B:desk", "+0m", "check C's reply to T3")
+        await tools.remind_me(hub_b, "B:desk", "+1s", "check C's reply to T3")
         # the node delivers it into the inbox (D-066), and the session is woken like by any mail that needs it
         reminder = await read_until(lambda m: m.get("method") == "notifications/claude/channel"
                                     and m["params"]["meta"].get("task_id", "").startswith("reminder-"))
@@ -149,14 +149,13 @@ def test_session_card_fields(tmp_path):
     assert session_fields({"pid": 0, "cwd": "/", "last_seen": now})["session"] == "offline"
 
 
-def test_due_parsing():
-    from mutmuas.cli import _parse_due
-    soon = datetime.fromisoformat(_parse_due("+90m"))
-    assert timedelta(minutes=89) < soon - datetime.now(timezone.utc) < timedelta(minutes=91)
-    assert _parse_due("2026-09-25T18:00:00+09:00") == "2026-09-25T18:00:00+09:00"
-    for bad in ("+90", "tomorrow", "2026-09-25T18:00:00"):
-        with pytest.raises(SystemExit):
-            _parse_due(bad)
+def test_times_are_given_from_now():
+    from mutmuas.tools import from_now
+    soon = datetime.fromisoformat(from_now("+90m", "deadline"))
+    assert timedelta(minutes=89) < soon - datetime.now(timezone.utc) <= timedelta(minutes=90)
+    for bad in ("+90", "+0m", "tomorrow", "2026-09-25T18:00:00", "2026-09-25T18:00:00+09:00"):
+        with pytest.raises(ValueError, match="from now"):
+            from_now(bad, "deadline")
 
 
 async def test_clear_inbox_marks_a_backlog_read(make_config, cluster):
@@ -239,8 +238,6 @@ async def _pushed(notes, task_id):
     return next((n for n in notes if n["meta"].get("task_id") == task_id), None)
 
 
-# ---- A:codex review of the lease (dfacc41): reproduced first, then fixed ----
-
 def test_codex_lease_claim_has_no_race(tmp_path, monkeypatch):
     """Two processes claiming at once must not both end up holding the agent."""
     import threading
@@ -286,7 +283,7 @@ async def test_codex_second_session_cannot_use_the_agent(make_config, cluster, t
     import signal
     holder_pid = hub_b.ledger.session_of("B:desk")["pid"]
     os.kill(holder_pid, signal.SIGSTOP)
-    await tools.remind_me(hub_b, "B:desk", "+0m", "holder's reminder")
+    await tools.remind_me(hub_b, "B:desk", "+1s", "holder's reminder")
     await asyncio.sleep(2.5)
     assert not await _find(second_out, lambda m: "holder's reminder" in json.dumps(m))
     os.kill(holder_pid, signal.SIGCONT)
@@ -303,13 +300,14 @@ async def test_codex_second_session_cannot_use_the_agent(make_config, cluster, t
                            what="reminder reaches the holder")
     assert got and not await _find(second_out, lambda m: "holder's reminder" in json.dumps(m))
 
-    # the CLI from outside the holder's session is refused too; from inside it (a descendant) it works
+    # the CLI beside the holder may read (--peek, as hooks do) but not act as it: reading for real is refused
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
-    outside = await asyncio.create_subprocess_exec(
-        sys.executable, "-m", "mutmuas.cli", "inbox", "--peek", "--config", str(b.path), "--as", "B:desk",
-        env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    out, err = await outside.communicate()
-    assert outside.returncode != 0 and b"session" in err
+    for argv, refused in ((["inbox"], True), (["inbox", "--peek"], False)):
+        outside = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "mutmuas.cli", *argv, "--config", str(b.path), "--as", "B:desk",
+            env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, err = await outside.communicate()
+        assert (outside.returncode != 0 and b"session" in err) is refused, (argv, err)
     for proc, pump in ((first, p1), (second, p2)):
         proc.stdin.close()
         await asyncio.wait_for(proc.wait(), 15)
@@ -347,22 +345,6 @@ async def _find(out, pred):
     return next((m for m in out if pred(m)), None)
 
 
-async def test_lease_holder_from_older_code_still_lets_its_own_session_act(tmp_path):
-    """C, 2026-09-25: the holder's MCP ran e2fb5d1 (no session_pid); the session's own agentctl was refused."""
-    from mutmuas.ledger import Ledger
-    from mutmuas.node import lease_refusal
-    ledger = Ledger(tmp_path / "l.sqlite3")
-    mcp = await asyncio.create_subprocess_exec(sys.executable, "-c", "import time; time.sleep(30)")
-    try:
-        ledger.session_beat("B:desk", mcp.pid, "/x")                     # old code: no session_pid recorded
-        assert ledger.session_of("B:desk")["session_pid"] is None
-        assert lease_refusal(ledger, "B:desk") is None                  # we are that MCP process's parent
-    finally:
-        mcp.kill()
-        await mcp.wait()
-        ledger.close()
-
-
 async def test_tool_errors_say_why(make_config, cluster):
     """C's review: a failing MCP tool only said 'Error executing tool remind_me'; the reason was lost."""
     a, b, hub_a, hub_b = await _pair(make_config, cluster)
@@ -372,7 +354,7 @@ async def test_tool_errors_say_why(make_config, cluster):
     await eventually(lambda: _card(hub_a, "B:desk", "online"), what="session up")
     await _call(proc, 21, "remind_me", {"at": "tomorrow", "text": "x"})
     reply = await eventually(lambda: _find(out, lambda m: m.get("id") == 21), what="tool reply")
-    assert "ValueError" in json.dumps(reply) and "timezone" in json.dumps(reply)
+    assert "ValueError" in json.dumps(reply) and "from now" in json.dumps(reply)
     await _call(proc, 22, "remind_me", {"at": "+30s", "text": "seconds work too"})
     ok = await eventually(lambda: _find(out, lambda m: m.get("id") == 22), what="tool reply")
     assert '\\"reminder\\"' in json.dumps(ok)
@@ -392,3 +374,21 @@ async def test_clear_inbox_closes_notices_without_claiming_they_were_read(make_c
     summary = result["result"]["summary"]
     assert result["status"] == "COMPLETED"
     assert "cleared by B:desk without reading" in summary and "read by" not in summary
+
+
+async def test_next_given_as_a_display_alias_names_the_post_by_its_address(tmp_path, monkeypatch):
+    """The receiving node wakes a post only when `next` is its address; an alias (B:b1) is resolved when sent,
+    like `to`, or nothing would ever wake it."""
+    from conftest import auto_worker_node, owned_task
+    _, _, ledger, hub, _ = auto_worker_node(tmp_path)
+    owned_task(ledger, "T-n", "RUNNING", ingest=True)
+
+    async def resolve(target):
+        return {"A:a1": "A:sender"}.get(target, target)
+    monkeypatch.setattr(hub, "resolve", resolve)
+    try:
+        await tools.ask_question(hub, "B:desk", "T-n", "which dataset?", next="A:a1")
+        [question] = [e for e in ledger.outbox() if e.type == "QUESTION"]
+        assert question.body["next"] == "A:sender"
+    finally:
+        ledger.close()

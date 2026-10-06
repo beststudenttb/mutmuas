@@ -111,8 +111,8 @@ async def test_invalid_message_does_not_break_the_node(make_config, cluster):
     await hub.bus.js.publish(subject, json.dumps(bad).encode())        # missing 'reason'
 
     # recorded and dropped on the receiving node (D-040); no ERROR is sent back
-    bad_ones = await eventually(lambda: [r for r in daemon_b.hub.ledger.failures() if r["stage"] == "receive"][1:],
-                                what="both invalid messages recorded")
+    await eventually(lambda: [r for r in daemon_b.hub.ledger.failures() if r["stage"] == "receive"][1:],
+                     what="both invalid messages recorded")
     assert any("reason" in r["error"] for r in daemon_b.hub.ledger.failures())
     ok = await tools.wait_for_result(hub, await _request(hub, "B:lab", {"action": "echo", "text": "still alive"}), 30)
     assert ok["result"]["summary"] == "echo: still alive"

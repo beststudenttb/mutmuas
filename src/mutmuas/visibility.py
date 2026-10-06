@@ -41,11 +41,6 @@ def status_layer(record: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def observer_role(agent: str) -> str:
-    """Task-row role for an observer (one row per observing agent: the table's key is (task_id, role))."""
-    return f"observer:{agent}"
-
-
 def acl(ledger: Ledger, task_id: str) -> set[str]:
     """Who takes part in a task, from what this node persisted about it: requester, owner, the observers
     listed on the request, and agents holding an observer row. Never inferred from who sent mail on it."""
@@ -80,8 +75,7 @@ def accepts_kinds(permissions: list[str]) -> list[str]:
 def artifact_visible(ledger: Ledger, viewer: str, uri: str) -> bool:
     """An artifact is for whoever published it (recorded when it was published on this node) and whoever received
     exactly that ArtifactRef in their inbound mail. Not the URI's path (the publisher picks it), not a substring
-    of the message text (LIKE wildcards), not outgoing mail (anyone can send any URI): Codex reviews of dfdd719
-    and 8c018ee."""
+    of the message text (LIKE wildcards), not outgoing mail (anyone can send any URI)."""
     if ledger.db.execute("SELECT 1 FROM artifact_publishers WHERE uri=? AND local_agent=?", (uri, viewer)).fetchone():
         return True
     row = ledger.db.execute(
@@ -91,6 +85,3 @@ def artifact_visible(ledger: Ledger, viewer: str, uri: str) -> bool:
     return row is not None
 
 
-def message_visible(viewer: str, env: dict[str, Any]) -> bool:
-    """A message's body is for its sender and its recipient (observers get their own copies)."""
-    return viewer in (env.get("from"), env.get("to"))

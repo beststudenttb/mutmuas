@@ -1,3 +1,7 @@
+"""The envelope, request bodies and the contract documented in MESSAGE_PROTOCOL.md."""
+
+from pathlib import Path
+
 import pytest
 
 from mutmuas.ids import Address, InvalidAddress
@@ -63,3 +67,17 @@ def test_reply_threads_conversation():
     ack = Envelope.reply(original, "ACK", {"state": "ACCEPTED"})
     assert (ack.sender, ack.to, ack.task_id, ack.conversation_id, ack.reply_to) == (
         "B:lab", "A:main", "T-1", original.conversation_id, original.message_id)
+
+
+PROTOCOL_DOC = (Path(__file__).parents[1] / "docs" / "MESSAGE_PROTOCOL.md").read_text()
+
+
+def test_default_deadline_marker_is_part_of_the_documented_request_contract():
+    """The owner-visible wire field must be discoverable in the protocol contract."""
+    assert "`deadline_default`" in PROTOCOL_DOC
+    assert "default_reply_deadline_s" in PROTOCOL_DOC
+
+
+def test_conditional_own_result_wake_is_part_of_the_documented_wake_contract():
+    """Operators must be able to discover the per-seat exception to WAKE's RESULT rule."""
+    assert "wake_on_own_results" in PROTOCOL_DOC

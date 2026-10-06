@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import re
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,7 +17,7 @@ from typing import Any
 
 from .hub import Hub
 from .ids import Address, parse_iso
-from .visibility import acl, artifact_visible, is_participant, message_visible, short
+from .visibility import acl, artifact_visible, is_participant, short
 from .protocol import OPEN_STATES, TERMINAL_STATES, ArtifactRef, Envelope, request_body, result_body
 
 
@@ -52,57 +53,49 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                        deadline: str | None = None, artifacts: list[dict] | None = None,
                        parent_task: str | None = None, priority: str = "normal",
                        reply: str | None = None, observers: list[str] | None = None,
-                       leader: bool = False, project: str | None = None, internal: bool = False,
-                       model: str | None = None, depends_on: list[str] | None = None) -> dict[str, Any]:
+                       leader: bool = False, project: str | None = None) -> dict[str, Any]:
     default_deadline = None
-    after_s = None
-    if depends_on and deadline and deadline.startswith("+"):
-        _deadline(deadline)                                       # checked now, counted from the release
-        after_s, deadline = _interval_s(deadline), None
-    deadline = _deadline(deadline)
-    if not deadline and reply != "none" and not depends_on:      # a held request gets it when it is sent
+    for observer in observers or []:
+        Address.parse(observer)        # before anything goes out: a bad one is refused, not half sent
+    deadline = from_now(deadline, "deadline")
+    if not deadline and reply != "none":
         default_deadline = default_reply_deadline(hub, timeout_s, kind)
     body = request_body(objective, reason, kind=kind, inputs=inputs, expected_outputs=expected_outputs,
                         constraints=constraints, acceptance_criteria=acceptance_criteria,
                         deadline=deadline or default_deadline, timeout_s=timeout_s, reply=reply, observers=observers,
                         deadline_default=bool(default_deadline),  # the owner can tell it from a chosen one
                         leader=leader)
-    if after_s:
-        body["deadline_after_s"] = after_s        # held (depends_on): the deadline is set on release
     return await _send_request(hub, me, to, body, artifacts=artifacts, parent_task=parent_task, priority=priority,
-                               project=project, internal=internal, model=model, depends_on=depends_on)
+                               project=project)
 
 
 LONG_KINDS = ("experiment", "code")       # their default deadline is long_reply_deadline_s (D-098)
 
 
-def _deadline(text: str | None) -> str | None:
-    """A deadline as given: an ISO time with timezone, or relative (+30m, +2h, +1d); one already past is refused
-    (D-098: it used to be taken and reported overdue at once)."""
-    if not text:
+UNITS_S = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def _interval_s(text: str) -> float | None:
+    """'30s' / '10m' / '5h' / '1d' (a leading + is allowed) in seconds; None if it is not one."""
+    m = re.fullmatch(r"\+?(\d+(?:\.\d+)?)([smhd])", text or "")
+    return float(m[1]) * UNITS_S[m[2]] if m else None
+
+
+def from_now(text: str | None, field: str) -> str | None:
+    """A time given from now: +30s, +10m, +2h, +1d (more than zero), as an ISO time. The only way deadlines, etas
+    and reminders are written (D-102): one in the past, or without a timezone, cannot be given."""
+    if text is None:
         return None
-    now = datetime.now(timezone.utc)
-    if text.startswith("+") and (delay := _interval_s(text)) is not None:
-        if delay <= 0:
-            raise ValueError(f"deadline={text!r}: a relative deadline must be ahead (+30m, +2h, +1d)")
-        return (now + timedelta(seconds=delay)).isoformat(timespec="seconds")
-    hint = f"deadline={text!r}: use an ISO time with timezone (e.g. 2026-10-07T18:00:00+09:00) or +30m / +2h / +1d"
-    try:
-        due = parse_iso(text)
-    except ValueError:
-        raise ValueError(hint) from None
-    if due.tzinfo is None:
-        raise ValueError(hint)
-    if due <= now:
-        raise ValueError(f"deadline {text} is in the past (now {now.isoformat(timespec='seconds')}); {hint}")
-    return text
+    if not (text.startswith("+") and (delay := _interval_s(text)) and delay >= 1):
+        raise ValueError(f"{field}={text!r}: give it from now, at least a second: +30m, +2h, +1d")
+    return (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat(timespec="seconds")
 
 
 def default_reply_deadline(hub: Hub, timeout_s: float | None, kind: str | None = "query") -> str | None:
     if hub.cfg.default_reply_deadline_s > 0:
-        # Without a deadline nothing ever chases a missing reply (no-stall design, G3): take the node's default,
-        # but never before the task's own run limit plus a margin, or a long task would be chased while it
-        # still runs normally (C's review of 6a5e2f1). Experiments and code get the longer default (D-098).
+        # Without a deadline nothing ever chases a missing reply (no-stall design, G3): take the node's default, but
+        # never before the task's own run limit plus a margin, or a long task would be chased while it still runs
+        # normally. Experiments and code get the longer default (D-098).
         wait_s = hub.cfg.default_reply_deadline_s
         if kind in LONG_KINDS and hub.cfg.long_reply_deadline_s > 0:
             wait_s = hub.cfg.long_reply_deadline_s
@@ -113,36 +106,10 @@ def default_reply_deadline(hub: Hub, timeout_s: float | None, kind: str | None =
 
 
 async def _send_request(hub: Hub, me: str, to: str, body: dict[str, Any], *, artifacts, parent_task, priority,
-                        project, internal, model, depends_on) -> dict[str, Any]:
+                        project) -> dict[str, Any]:
     default_deadline = body.get("deadline") if body.get("deadline_default") else None
-    if internal:
-        # D-073: a brain's own long work, run by its worker (never the session); sent to itself, in its project
-        if await hub.resolve(to) != str(hub.local_agent(me)[0]):
-            raise ValueError("an internal subtask is sent to yourself (to = your own address)")
-        body["internal"] = True
-        if model:
-            body["model"] = model
-        parent = parent_task or _current_task()
-        owner = hub.ledger.task(parent, "owner") if parent else None
-        if owner:
-            # a sub belongs to its parent's project (its brain's plan is there; Codex review of 09456a9)
-            agent = hub.local_agent(me)[1]
-            inherited = agent.project_of(owner.get("request"))
-            if project and project != inherited:
-                raise ValueError(f"an internal subtask belongs to its parent's project ({inherited}), "
-                                 f"not {project}")
-            project = inherited
     if project:
         body["project"] = project                    # D-069: the recipient routes it to that project's directory
-    if depends_on:
-        unknown = [d for d in depends_on if hub.ledger.task(d) is None]
-        if unknown:
-            raise ValueError(f"depends_on names tasks this node does not know: {', '.join(unknown)}")
-        sender = str(hub.local_agent(me)[0])
-        foreign = [d for d in depends_on if not is_participant(hub.ledger, sender, d)]
-        if foreign:                                  # their results travel with it: only one's own tasks (Codex)
-            raise PermissionError(f"depends_on may name only tasks {sender} takes part in, not {', '.join(foreign)}")
-        body["depends_on"] = list(depends_on)       # held here until they are done (D-073 batch 2)
     sender = str(hub.local_agent(me)[0])
     for ref in artifacts or []:
         # Attaching grants the recipient access (visibility.artifact_visible), so only what the sender may see
@@ -153,7 +120,7 @@ async def _send_request(hub: Hub, me: str, to: str, body: dict[str, Any], *, art
     target = await hub.card_or_none(to)
     task_id, delivery = await hub.request(
         me, to, body, artifacts=[ArtifactRef.from_dict(a) for a in artifacts or []],
-        parent_task=parent_task or _current_task(), priority=priority, hold_for=depends_on)
+        parent_task=parent_task or _current_task(), priority=priority)
     out = {"task_id": task_id, "to": await hub.resolve(to), "delivery": delivery}
     if default_deadline:
         out["note_deadline"] = (f"default deadline {default_deadline} (node.yaml default_reply_deadline_s, "
@@ -230,17 +197,17 @@ def _wake_view(hub: Hub, me: str, types: tuple[str, ...] | None) -> tuple[str | 
 
 async def inbox_page(hub: Hub, me: str, peek: bool = False, types: tuple[str, ...] | None = None,
                      before_seq: int | None = None, leader_before_seq: int | None = None,
-                     limit: int = 50) -> dict[str, Any]:
+                     limit: int = 50, show: bool = True) -> dict[str, Any]:
     """inbox() for a session looking at its mail, plus what the page left out (D-074): how many unread the cursor
     covers, how many it lists, how many older ones it did not, and `next`, the cursor for the following page.
-    Paging has two stages (Codex review of 374be94): the leader's mail first (leader_before_seq), then the other
+    Paging has two stages: the leader's mail first (leader_before_seq), then the other
     mail (before_seq), each newest to oldest, so every message is listed exactly once."""
     addr, _ = hub.local_agent(me)
     next_to, own_results = _wake_view(hub, me, types)
     count = functools.partial(hub.ledger.unseen_count, str(addr), types, next_to=next_to, own_results=own_results,
                               project=_project_view(hub, me))        # the same view the listing has (D-072)
     total = count(before_seq=before_seq, leader_before_seq=leader_before_seq)
-    rows = await inbox(hub, me, limit=limit, peek=peek, types=types, before_seq=before_seq,
+    rows = await inbox(hub, me, limit=limit, peek=peek, types=types, before_seq=before_seq, show=show,
                        leader_before_seq=leader_before_seq)
     page: dict[str, Any] = {"messages": rows, "unread": total, "listed": len(rows),
                             "older_unlisted": max(0, total - len(rows))}
@@ -271,9 +238,8 @@ async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, 
     show=False: a notifier's read (watch, push), which does not count as showing the mail to the session."""
     addr, _ = hub.local_agent(me)
     project = _project_view(hub, me)
-    # A message that hands me the baton (body.next == me) needs me as much as a REQUEST does.
-    # (a notifier's ACTIONABLE view too: Codex's watch, which then sees a background job's wake-up)
-    # Results of my own requests too only with wake_on_own_results (no-stall G2, per agent, off by default).
+    # A message that hands me the baton (body.next == me) needs me as much as a REQUEST does. Results of my own requests
+    # too only with wake_on_own_results (no-stall G2, per agent, off by default).
     next_to, own_results = _wake_view(hub, me, types)
     if wait_s and not include_seen:
         # Messages reach this node's ledger through the daemon, so waiting on the ledger is enough
@@ -321,19 +287,10 @@ async def clear_inbox(hub: Hub, me: str, before_seq: int) -> dict[str, Any]:
     return out
 
 
-def _interval_s(text: str) -> float | None:
-    """'30s' / '10m' / '5h' / '1d' (a leading + is allowed) in seconds; None if it is not one."""
-    text = text.lstrip("+")
-    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-    if text and text[-1] in units and text[:-1].replace(".", "", 1).isdigit():
-        return float(text[:-1]) * units[text[-1]]
-    return None
-
-
 async def remind_me(hub: Hub, me: str, at: str, text: str, every: str | None = None,
                     task_id: str | None = None) -> dict[str, Any]:
-    """The node puts `text` into the agent's inbox at `at` (ISO time with timezone, or +30s/+10m/+2h) as a message
-    that hands the agent the baton, so it wakes a session (channel push, Codex watch) and waits in the inbox while
+    """The node puts `text` into the agent's inbox at `at` (+30s/+10m/+2h from now) as a message
+    that hands the agent the baton, so it wakes a session and waits in the inbox while
     none runs (D-066). every='5h' repeats it at that interval until cancel_reminder. task_id: the task a worker run
     sets it for: a post with no session gets that task run again when it fires (D-098)."""
     addr, _ = hub.local_agent(me)
@@ -342,16 +299,7 @@ async def remind_me(hub: Hub, me: str, at: str, text: str, every: str | None = N
         every_s = _interval_s(every)
         if not every_s:
             raise ValueError(f"every={every!r}: use an interval like 30m, 5h or 1d")
-    if (delay := _interval_s(at)) is not None and at.startswith("+"):
-        due = datetime.now(timezone.utc) + timedelta(seconds=delay)
-    else:
-        hint = f"at={at!r}: use an ISO time with timezone (e.g. 2026-09-25T18:00:00+09:00) or +30s / +10m / +2h"
-        try:
-            due = parse_iso(at)
-        except ValueError:
-            raise ValueError(hint) from None
-        if due.tzinfo is None:
-            raise ValueError(hint)
+    due = parse_iso(from_now(at, "at"))
     due_iso = due.astimezone(timezone.utc).isoformat(timespec="milliseconds")
     return {"reminder": hub.ledger.add_reminder(str(addr), due_iso, text, every_s, task_id), "due": due_iso,
             "every_s": every_s}
@@ -377,21 +325,8 @@ async def _read_receipts(hub: Hub, me: str, envs: list[Envelope], read: bool = T
             await hub.finish(env.task_id, result_body("complete", summary), record=False)   # a notice, not work
 
 
-def _eta(eta: str | None) -> str | None:
-    """An eta is an ISO time with timezone (D-076)."""
-    if eta is None:
-        return None
-    try:
-        when = parse_iso(eta)
-    except (TypeError, ValueError):
-        when = None
-    if when is None or when.tzinfo is None:
-        raise ValueError(f"eta={eta!r}: use an ISO time with timezone, e.g. 2026-10-03T09:00:00+00:00")
-    return eta
-
-
 async def accept_task(hub: Hub, me: str, task_id: str, eta: str | None = None) -> dict[str, Any]:
-    eta = _eta(eta)
+    eta = from_now(eta, "eta")
     if _check_actor(hub, _owned(hub, me, task_id)) == task_id:
         # A worker's task was accepted for it when the daemon started it: nothing to do, and no session claim
         return {"task_id": task_id, "accepted": True, "note": "already accepted for you when the worker started"}
@@ -454,7 +389,7 @@ async def report_progress(hub: Hub, me: str, message: str, task_id: str | None =
     body = {"reason": message} if msg_type == "BLOCKED" else {"state": new_state, "message": message}
     if next:
         body["next"] = next
-    if (eta := _eta(eta)):
+    if (eta := from_now(eta, "eta")):
         body["eta"] = eta                         # a new estimate: what a chase asks for (D-076)
         hub.ledger.update_task(task_id, "owner", eta=eta)
     ok = await hub.owner_transition(task_id, new_state, message, msg_type=msg_type, body=body)
@@ -462,7 +397,6 @@ async def report_progress(hub: Hub, me: str, message: str, task_id: str | None =
             and any(c["status"] not in TERMINAL_STATES for c in hub.ledger.children(task_id))):
         # Waiting with open child tasks is waiting on them: the node wakes this task when they are done (D-066)
         hub.ledger.add_job(task_id, task["owner"], None, None, None, None, "child tasks", children=True)
-    hub.mark_sub_on_plan(task_id, "!" if new_state == "BLOCKED" else ">", message if new_state == "BLOCKED" else None)
     return {"task_id": task_id, "state": new_state, "sent": ok}
 
 
@@ -476,13 +410,13 @@ async def submit_result(hub: Hub, me: str, status: str, summary: str, *, task_id
     task = _owned(hub, me, task_id)
     if task["status"] in TERMINAL_STATES:
         return {"task_id": task_id, "error": f"task already {task['status']}; result not changed"}
-    _check_actor(hub, task)
+    worker_of = _check_actor(hub, task)
     body = result_body(status, summary, outputs=outputs, evidence=evidence, limitations=limitations,
                        follow_up=follow_up, how=how, notes=notes)
     if next:
         body["next"] = next
     refs = [ArtifactRef.from_dict(a) for a in artifacts or []]
-    if task_id == _current_task():
+    if worker_of == task_id:
         # Inside a daemon-run task: store a draft; the daemon sends it when the process exits.
         hub.ledger.update_task(task_id, "owner", result_draft={**body, "artifacts": [r.to_dict() for r in refs]})
         return {"task_id": task_id, "recorded": True, "status": status,
@@ -496,37 +430,39 @@ async def ask_question(hub: Hub, me: str, task_id: str, question: str, next: str
     return {"task_id": task_id, "delivery": delivery}
 
 
+CONTROLS = ("pause", "resume", "interrupt")
+
+
+async def control_task(hub: Hub, me: str, task_id: str, action: str, message: str) -> dict[str, Any]:
+    """Pause, resume or interrupt one task (D-089): an UPDATE about it to its owner, which affects that task only.
+    From its requester it goes the usual way; from anyone else (a trusted controller such as the secretary, on a
+    task other posts asked for) to the owner the shared task record names. The owner's node decides: pause and
+    resume for the requester or a trusted controller, interrupt for a trusted controller only; anything else
+    from a stranger is ignored there."""
+    if action not in CONTROLS:
+        raise ValueError(f"action={action!r}: one of {', '.join(CONTROLS)}")
+    addr, _ = hub.local_agent(me)
+    body = {"message": message, action: True}
+    asked = hub.ledger.task(task_id, "requester")
+    if asked and asked["local_agent"] == str(addr):
+        delivery = await hub.reply(me, task_id, "UPDATE", body)
+    else:
+        record = await hub._remote_task(task_id, None) if hub.bus else None
+        if not record:
+            raise KeyError(f"unknown task {task_id}: no shared task record names its owner")
+        delivery = await hub.send(Envelope(type="UPDATE", sender=str(addr), to=record["owner"], task_id=task_id,
+                                           body=body))
+    return {"task_id": task_id, "action": action, "delivery": delivery}
+
+
 async def answer(hub: Hub, me: str, task_id: str, text: str, next: str | None = None) -> dict[str, Any]:
     delivery = await hub.reply(me, task_id, "ANSWER", {"answer": text, **({"next": next} if next else {})})
     return {"task_id": task_id, "delivery": delivery}
 
 
-NUDGE_EVERY_S = 3 * 3600     # a task is nudged by hand at most this often (D-076 §5: "同一任务数小时一次")
-
-
-async def nudge(hub: Hub, me: str, task_id: str, note: str = "") -> dict[str, Any]:
-    """Wake the owner of a task of ours that seems stuck (D-073 batch 2): it must answer what it is doing, where
-    it is stuck and a new eta. A stalled worker is laid out again by its node. At most once in NUDGE_EVERY_S."""
-    task = hub.ledger.task(task_id, "requester")
-    if task is None or task["local_agent"] != str(hub.local_agent(me)[0]):
-        raise KeyError(f"{task_id} was not requested by {me} from this node")
-    if task["status"] in TERMINAL_STATES:
-        raise ValueError(f"{task_id} is {task['status']}: nothing to nudge")
-    now = datetime.now(timezone.utc)
-    if not hub.ledger.claim_nudge(task_id, now.isoformat(), (now - timedelta(seconds=NUDGE_EVERY_S)).isoformat()):
-        # one compare-and-set in the ledger, so two nudges at once (or from two processes) send one (Codex)
-        raise PermissionError(f"{task_id} was nudged at {hub.ledger.task(task_id, 'requester')['nudged_at']}; "
-                              f"at most once in {NUDGE_EVERY_S // 3600} h")
-    text = (f"nudge from {me}: {note or 'how is it going?'} Reply with what you are doing, where you are stuck "
-            "and a new eta (report_progress eta=…).")
-    delivery = await hub.send(Envelope(type="UPDATE", sender=task["local_agent"], to=task["owner"], task_id=task_id,
-                                       body={"message": text, "next": task["owner"], "nudge": True}))
-    return {"task_id": task_id, "nudged": task["owner"], "delivery": delivery}
-
-
 async def set_session_taking_work(hub: Hub, me: str, on: bool) -> dict[str, Any]:
     """`mutmuas <post> off|on`: the session stays online but takes no new work; the worker does. Only a post with
-    a worker can hand its work over (Codex review of b442f2c)."""
+    a worker can hand its work over."""
     addr, agent = hub.local_agent(me)
     if not on and not agent.auto_worker:
         raise PermissionError(f"{addr} has no worker (auto_worker) to take the work: its session stays on")
@@ -541,8 +477,8 @@ async def push_due(hub: Hub, me: str, cursor: int | None) -> tuple[list[dict[str
     between: a busy session is not interrupted (§5.4); the Stop hook has it look before it ends a turn.
     Records each push (count, time). Returns (messages, next cursor)."""
     if cursor is None:
-        # every unread one up to now, oldest first, page by page (not just the newest page: Codex review of
-        # b442f2c); the live cursor starts at the boundary only once all before it are covered
+        # every unread one up to now, oldest first, page by page (not just the newest page); the live cursor starts
+        # at the boundary only once all before it are covered
         boundary, rows, since = hub.ledger.last_rowid(), [], 0
         while page := [r for r in await inbox(hub, me, peek=True, types=WAKE, since=str(since), limit=200,
                                               show=False) if (r["seq"] or 0) <= boundary]:
@@ -570,10 +506,6 @@ async def cancel_task(hub: Hub, me: str, task_id: str, reason: str = "") -> dict
     task = hub.ledger.task(task_id, "requester")
     if task is None:
         raise KeyError(f"{task_id} was not requested from this node")
-    if hub.ledger.drop_held(task_id):
-        # never sent (it waited for its dependencies): nobody else knows it, so no CANCEL goes out
-        hub.ledger.update_task(task_id, "requester", status="CANCELLED")
-        return {"task_id": task_id, "delivery": "withdrawn before it was sent"}
     delivery = await hub.reply(me, task_id, "CANCEL", {"reason": reason} if reason else {})
     # The requester has withdrawn; don't keep waiting on an owner that may never answer
     # (offline for good, or never received the REQUEST).
@@ -592,8 +524,8 @@ async def publish_artifact(hub: Hub, me: str, path: str, *, key: str | None = No
         src = (Path.cwd() / src)
     if not key:
         # The key is shared metadata (object-store listings), so by default it names no local file: a random id,
-        # keeping only a short extension so a fetched copy still opens with the right tool (Codex review of
-        # dfdd719). Pass key= to publish under a readable name on purpose.
+        # keeping only a short extension so a fetched copy still opens with the right tool. Pass key= to publish
+        # under a readable name on purpose.
         import secrets
         suffix = src.suffix if src.is_file() and len(src.suffix) <= 8 and src.suffix[1:].isalnum() else ""
         key = f"{addr.node}/{addr.agent}/{task_id or _current_task() or 'adhoc'}/{secrets.token_hex(8)}{suffix}"
@@ -605,7 +537,6 @@ async def publish_artifact(hub: Hub, me: str, path: str, *, key: str | None = No
 async def add_observer(hub: Hub, me: str, task_id: str, observer: str) -> dict[str, Any]:
     """Let someone else read a task I take part in (requester, owner or observer): they get copies of its
     REQUEST and RESULT, and the other participants are told so that later RESULTs reach them too."""
-    from .ids import Address
     addr, _ = hub.local_agent(me)
     me_s = str(addr)
     if me_s not in acl(hub.ledger, task_id):
@@ -618,16 +549,13 @@ async def add_observer(hub: Hub, me: str, task_id: str, observer: str) -> dict[s
     copies = []
     if me_s in (base["requester"], base["owner"]):
         copies = await send_observer_copies(hub, me_s, task_id, [observer])
-    # An observer does not send copies itself: a node that never saw the task could only check the sender
-    # against the task record, which names requester and owner. The owner relays them when it hears of the
-    # new observer below (Codex review of 8c018ee).
+    # An observer does not send copies itself: a node that never saw the task could only check the sender against the
+    # task record, which names requester and owner. The owner relays them when it hears of the new observer below.
     for other in sorted({base["requester"], base["owner"]} - {me_s}):
-        try:          # so the requester's side forwards a later RESULT, and every side knows the ACL
-            await hub.send(Envelope(type="UPDATE", sender=me_s, to=other, task_id=task_id,
-                                    body={"message": f"{me_s} added observer {observer}", "fyi": True,
-                                          "observers_add": [observer]}))
-        except Exception:
-            pass
+        # so the requester's side forwards a later RESULT, and every side knows the ACL
+        await hub.send(Envelope(type="UPDATE", sender=me_s, to=other, task_id=task_id,
+                                body={"message": f"{me_s} added observer {observer}", "fyi": True,
+                                      "observers_add": [observer]}))
     out = {"task_id": task_id, "observer": observer, "copies_sent": copies}
     if not copies and me_s not in (base["requester"], base["owner"]):
         out["copies_relayed_by"] = base["owner"]
@@ -705,20 +633,6 @@ async def list_artifacts(hub: Hub, me: str | None = None) -> list[dict[str, Any]
     return [a for a in await hub.artifacts.list() if artifact_visible(hub.ledger, viewer, a["uri"])]
 
 
-async def history(hub: Hub, me: str | None = None, task_id: str | None = None, limit: int = 500) -> list[dict]:
-    """Messages from the stream that `me` sent or received. Everyone else's mail is not for `me`."""
-    viewer = str(hub.local_agent(me)[0])
-    rows = []
-    for _subject, data in await hub.bus.history(limit=limit):
-        try:
-            env = Envelope.from_json(data).to_dict()
-        except Exception:
-            continue
-        if (task_id is None or env.get("task_id") == task_id) and message_visible(viewer, env):
-            rows.append(env)
-    return rows
-
-
 async def fetch_artifact(hub: Hub, uri: str, dest_dir: str | None = None, sha256: str | None = None,
                          me: str | None = None) -> dict:
     if not artifact_visible(hub.ledger, str(hub.local_agent(me)[0]), uri):
@@ -731,21 +645,18 @@ async def fetch_artifact(hub: Hub, uri: str, dest_dir: str | None = None, sha256
 
 def _check_actor(hub: Hub, task: dict[str, Any]) -> str | None:
     """Every owner-side change (accept, reject, progress, result) is made by whoever holds the task, so a task is
-    never done twice and a running worker is not interrupted (D-032, D-032a; Codex reviews of 6116466, ba28e70).
-    Who the caller is comes from the process tree: a process descending from a worker the daemon started (pid
-    and start time recorded) is that worker, whatever its environment says. MUTMUAS_TASK_ID can only add a
-    restriction (a process that claims to be a worker is treated as one), never prove anything.
+    never done twice and a running worker is not interrupted. The caller is a worker when the daemon started it
+    for a task that is still running (node.worker_task), else the session (D-102).
     - A worker acts on its own task only.
-    - A task held by the worker is changed only by that worker's processes.
+    - A task held by the worker is changed only by its worker.
     - A task held by the session is not changed by a worker.
     Returns the task the caller is the worker of (None: not a worker)."""
-    from .node import _ancestors, worker_tasks_of
-    proven = worker_tasks_of(hub.ledger, task["owner"], {os.getpid(), *_ancestors(os.getpid())})
-    worker_of = next(iter(proven), None) or _current_task()
+    from .node import worker_task
+    worker_of = worker_task(hub.ledger, task["owner"])
     if worker_of and task["task_id"] != worker_of:
         raise PermissionError(f"a worker process (task {worker_of}) acts only on its own task, not on "
                               f"{task['task_id']}, which belongs to the session or to another run")
-    if task.get("runner") == "worker" and task["task_id"] not in proven:
+    if task.get("runner") == "worker" and worker_of != task["task_id"]:
         raise PermissionError(f"{task['task_id']} is being done by the worker the daemon started; it is not "
                               "interrupted (D-032a): wait for its result (whoami: worker_running)")
     if task.get("runner") == "session" and worker_of == task["task_id"]:
@@ -761,35 +672,3 @@ def _owned(hub: Hub, me: str, task_id: str) -> dict[str, Any]:
     return task
 
 
-
-def internal_caller(hub: Hub) -> str | None:
-    """The internal subtask (D-073) whose worker the calling process descends from, if any. Decided from the
-    process tree (the worker's pid and start time are recorded when the daemon starts it), as for the lease and
-    _check_actor; MUTMUAS_TASK_ID can only add the restriction, never lift it (Codex review of 09456a9)."""
-    from .node import _ancestors, worker_tasks_of
-    chain = {os.getpid(), *_ancestors(os.getpid())}
-    ids = {t for a in hub.cfg.agents for t in worker_tasks_of(hub.ledger, str(Address(hub.cfg.node, a.id)), chain)}
-    if os.environ.get("MUTMUAS_TASK_ID"):
-        ids.add(os.environ["MUTMUAS_TASK_ID"])
-    for task_id in ids:
-        task = hub.ledger.task(task_id, "owner")
-        if ((task or {}).get("request") or {}).get("internal"):
-            return task_id
-    return None
-
-
-def _not_for_subs(fn):
-    """An internal subtask's worker sees no mail and sends none (D-073)."""
-    @functools.wraps(fn)
-    async def guarded(hub: Hub, *args, **kwargs):
-        if sub := internal_caller(hub):
-            raise PermissionError(f"{sub} is an internal subtask (D-073): its worker may only report progress, "
-                                  "register a job and submit its result")
-        return await fn(hub, *args, **kwargs)
-    return guarded
-
-
-for _name in ("send_request", "check_task", "wait_for_result", "inbox", "clear_inbox", "remind_me",
-              "cancel_reminder", "accept_task", "ask_question", "answer", "cancel_task", "add_observer",
-              "list_tasks", "history", "nudge"):
-    globals()[_name] = _not_for_subs(globals()[_name])

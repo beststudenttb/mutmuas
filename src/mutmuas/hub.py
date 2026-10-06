@@ -23,8 +23,7 @@ from .config import AgentConfig, NodeConfig
 from .ids import Address, new_task_id, parse_iso
 from .ledger import Ledger
 from .visibility import acl, is_coordinator, is_participant, status_layer
-from .protocol import (REQUEST_KINDS, TERMINAL_STATES, ArtifactRef, Envelope, ProtocolError,
-                       task_state_for_result)
+from .protocol import TERMINAL_STATES, ArtifactRef, Envelope, task_state_for_result
 
 log = logging.getLogger(__name__)
 
@@ -146,6 +145,8 @@ class Hub:
 
     async def send(self, env: Envelope) -> str:
         """Outbox first, then try to publish. Returns 'sent' or 'queued' (daemon will retry)."""
+        if env.body.get("next"):            # like `to`: the receiving node knows itself by address, not by alias
+            env.body["next"] = await self.resolve(env.body["next"])
         env.validate()
         self.ledger.queue_outgoing(env)
         return await self.try_publish(env)
@@ -173,25 +174,16 @@ class Hub:
 
     async def request(self, sender: str | None, to: str, body: dict[str, Any], *,
                       artifacts: list[ArtifactRef] | None = None, parent_task: str | None = None,
-                      priority: str = "normal", task_id: str | None = None,
-                      hold_for: list[str] | None = None) -> tuple[str, str]:
-        """Send a REQUEST. Returns (task_id, delivery). hold_for: task ids it depends on (D-073 batch 2): the
-        request is kept on this node ("held") until they are done, then sent with their results."""
+                      priority: str = "normal", task_id: str | None = None) -> tuple[str, str]:
+        """Send a REQUEST. Returns (task_id, delivery)."""
         addr, agent = self.local_agent(sender)
         if not agent.has("REQUEST_TASK"):
             raise PermissionDenied(f"{addr} lacks REQUEST_TASK permission")
-        if body.get("kind", "query") not in REQUEST_KINDS:
-            raise ProtocolError(f"kind must be one of {sorted(REQUEST_KINDS)}")
         if parent_task:
             body = {**body, "parent_task": parent_task}
         env = Envelope(type="REQUEST", sender=str(addr), to=await self.resolve(to), body=body,
                        task_id=task_id or new_task_id(), priority=priority, artifacts=artifacts or [])
-        if hold_for:
-            env.validate()
-            self.ledger.hold_request(env, hold_for)
-            return env.task_id, "held"
         delivery = await self.send(env)
-        await self.copy_to_observers(str(addr), env, body.get("observers") or [])
         return env.task_id, delivery
 
     async def copy_to_observers(self, sender: str, original: Envelope, observers: list[str]) -> None:
@@ -202,16 +194,13 @@ class Hub:
         for observer in observers:
             if observer in (original.sender, original.to):
                 continue
-            try:
-                await self.send(Envelope(
-                    type="UPDATE", sender=sender, to=observer, task_id=original.task_id,
-                    conversation_id=original.conversation_id, artifacts=original.artifacts, body={
-                        "message": f"observer copy: {original.type} {original.sender} -> {original.to}",
-                        "fyi": True, "participants": people,
-                        "copy_of": {"type": original.type, "from": original.sender, "to": original.to,
-                                    "body": original.body}}))
-            except Exception as e:
-                log.warning("copy to observer %s failed: %r", observer, e)
+            await self.send(Envelope(
+                type="UPDATE", sender=sender, to=observer, task_id=original.task_id,
+                conversation_id=original.conversation_id, artifacts=original.artifacts, body={
+                    "message": f"observer copy: {original.type} {original.sender} -> {original.to}",
+                    "fyi": True, "participants": people,
+                    "copy_of": {"type": original.type, "from": original.sender, "to": original.to,
+                                "body": original.body}}))      # a failed publish stays in the outbox
 
     async def reply(self, local: str, task_id: str, type: str, body: dict[str, Any] | None = None,
                     artifacts: list[ArtifactRef] | None = None, to: str | None = None) -> str:
@@ -323,7 +312,7 @@ class Hub:
     # ---- owner side ---------------------------------------------------
 
     async def publish_task_record(self, task_id: str) -> None:
-        """Mirror an owned task into the shared task KV so any node can observe it."""
+        """Mirror an owned task into the shared task KV so any node can observe it (only the owner's node may)."""
         task = self.ledger.task(task_id, "owner")
         if task is None or self.bus is None:
             return
@@ -357,18 +346,6 @@ class Hub:
         log.info("task %s -> %s (%s)", task_id, status, message)
         return True
 
-    def mark_sub_on_plan(self, task_id: str, marker: str, note: str | None = None) -> None:
-        """An internal subtask (D-073) does not write PLAN.md: the node marks its line on its brain's plan, in the
-        project directory the sub belongs to (the brain's own)."""
-        task = self.ledger.task(task_id, "owner")
-        request = (task or {}).get("request") or {}
-        if not request.get("internal"):
-            return
-        agent = self.local_agent(task["owner"])[1]
-        board = agent.home(agent.project_of(request)) / "PLAN.md"
-        if board.is_file():
-            rewrite_plan(board, lambda text: mark_plan_line(text, task_id, marker, note))
-
     def add_inbox_line(self, task: dict[str, Any]) -> None:
         """Arriving work goes on the post's plan, in the 收件 section (spec v1.1 §3.1): one unchecked line naming
         the task; the agent moves it into its plan when it takes the work, and delivery removes it."""
@@ -400,7 +377,7 @@ class Hub:
             raise KeyError(f"task {task_id} is not owned by this node")
         if task["status"] in TERMINAL_STATES:
             return False                                         # finished already: the board is not touched
-        # an invalid RESULT is refused before anything changes, the board included (Codex review of ea40b88)
+        # an invalid RESULT is refused before anything changes, the board included
         Envelope(type="RESULT", sender=task["owner"], to=task["requester"], body=result, task_id=task_id,
                  artifacts=artifacts or []).validate()
         agent = self.local_agent(task["owner"])[1]
@@ -409,8 +386,8 @@ class Hub:
         taken: list[str] = []
 
         def take(text: str) -> str:
-            # this task's section goes into the result and off the board in one locked rewrite, so a line the
-            # node adds meanwhile (收件) is not overwritten (Codex review of b442f2c)
+            # this task's section goes into the result and off the board in one locked rewrite, so a line the node adds
+            # meanwhile (收件) is not overwritten
             found = plan_section(text, task_id)
             if not found:
                 return text
@@ -434,9 +411,6 @@ class Hub:
         await self.try_publish(env)
         await self.publish_task_record(task_id)
         log.info("task %s finished: %s", task_id, result["status"])
-        if (task.get("request") or {}).get("internal"):
-            # a sub's line on its brain's plan (D-073); the brain itself adds and rearranges the lines
-            self.mark_sub_on_plan(task_id, "!" if result["status"] == "failed" else "x", result.get("summary"))
         self.drop_inbox_line(task_id)
         if workdir:
             workdir.mkdir(parents=True, exist_ok=True)          # as a run does; a post may not have run yet
@@ -450,7 +424,7 @@ INBOX_SECTION = "## 收件"
 
 def rewrite_plan(board: Path, change, create: bool = False) -> None:
     """Rewrite PLAN.md with change(text): one writer at a time over the whole read-modify-write (a cross-process
-    lock), through a temporary file of its own (Codex review of 09456a9)."""
+    lock), through a temporary file of its own."""
     with open(board.with_name(".PLAN.md.lock"), "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if not board.is_file() and not create:
@@ -489,14 +463,6 @@ def drop_section_line(text: str, heading: str, task_id: str) -> str:
             return "\n".join(lines[:i] + lines[i + 1:])
         i += 1
     return text
-
-
-def mark_plan_line(text: str, task_id: str, marker: str, note: str | None = None) -> str:
-    """The first checklist line naming task_id gets the marker ([>] [x] [!] ...) and, if given, a note."""
-    pattern = re.compile(rf"^(\s*[-*]\s*)\[[ >xw!]\](.*\b{re.escape(task_id)}\b.*?)(\s+— .*)?$", re.M)
-    note = " ".join(str(note).split())[:200] if note else ""
-    return pattern.sub(lambda m: f"{m.group(1)}[{marker}]{m.group(2)}" + (f" — {note}" if note else ""), text,
-                       count=1)
 
 
 _HEADING = re.compile(r" {0,3}(#{1,6})(?:\s|$)")

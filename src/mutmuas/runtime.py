@@ -51,11 +51,6 @@ class TaskContext:
     session_id: str | None = None        # a new brain conversation's id, chosen by the node before the run
 
     @property
-    def internal(self) -> bool:
-        """An internal subtask (D-073): a brain's own long work, run by its worker."""
-        return bool(self.request.body.get("internal"))
-
-    @property
     def home(self) -> Path:
         """The directory of this task's project (D-069), or the post directory without one."""
         return self.agent.home(self.agent.project_of(self.request.body))
@@ -86,7 +81,8 @@ class TaskContext:
 
     def payload(self) -> dict[str, Any]:
         return {"task_id": self.task_id, "agent": self.address, "attempt": self.attempt,
-                "workdir": str(self.cwd), "git_branch": self.git_branch, "request": self.request.to_dict()}
+                "workdir": str(self.cwd), "git_branch": self.git_branch, "request": self.request.to_dict(),
+                "interrupts": self.interrupts}
 
 
 @dataclass
@@ -120,13 +116,11 @@ class SubprocessRuntime:
         argv, stdin = self.command(ctx)
         runs = self.node.data_path / "runs"
         runs.mkdir(parents=True, exist_ok=True)
-        # a new name for every run: a task woken after a background job starts again at attempt 1 (r19 F1)
+        # a new name for every run: a task woken after a background job starts again at attempt 1
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         log_path = runs / f"{ctx.task_id}.{stamp}.attempt{ctx.attempt}.log"
         workdir = self.start_dir(ctx)
         workdir.mkdir(parents=True, exist_ok=True)
-        if ctx.internal:
-            (ctx.home / "runs" / ctx.task_id).mkdir(parents=True, exist_ok=True)     # a sub's outputs (D-073)
         log.info("task %s: starting %s in %s", ctx.task_id, argv[0], workdir)
         with open(log_path, "wb") as logf:
             logf.write(f"$ {' '.join(argv)}\n".encode())
@@ -138,8 +132,8 @@ class SubprocessRuntime:
                 ctx.on_spawn(proc.pid)
             tail = bytearray()
             try:
-                # a command that does not read its input may close it first: not an error, its exit code says how
-                # it went (C's Linux runs: `true` made a run fail with ConnectionResetError now and then)
+                # a command that does not read its input may close it first: not an error, its exit code says how it
+                # went
                 with contextlib.suppress(BrokenPipeError, ConnectionResetError):
                     if stdin is not None:
                         proc.stdin.write(stdin)
@@ -194,32 +188,6 @@ def extra_dirs(ctx: TaskContext) -> list[Path]:
     return dirs + (ctx.agent.code_paths if ctx.agent.code_mode == "direct" else [])
 
 
-def sub_prompt(ctx: TaskContext) -> str:
-    """An internal subtask (D-073): one piece of its brain's work, no mail, no plan of its own."""
-    req = ctx.request
-    out = ctx.home / "runs" / ctx.task_id
-    return f"""You are a sub-worker of {ctx.address} in the mutmuas multi-agent system (project "{ctx.node.project}",
-node {ctx.node.node}). Your brain gave you one piece of its work.
-
-Task id: {ctx.task_id}   (attempt {ctx.attempt})
-TASK:
-{json.dumps(req.body, indent=2, ensure_ascii=False)}
-
-You have the MCP server "mutmuas" with three tools, all for this task only: report_progress, submit_result, add_job.
-Rules:
-1. Work in {llm_start_dir(ctx)}. Write your outputs (files, logs, results) under {out}.
-2. Do not edit PLAN.md or HANDOFF.md: the node marks your line on your brain's plan when you report progress
-   and when you finish. Do not write worker-log.md either.
-3. Call report_progress for meaningful milestones of long work.
-4. Finish by calling submit_result exactly once, as the very last step. status must be honest: complete = every
-   acceptance criterion met; partial = some output but not all; failed = nothing usable. Put the paths of your
-   outputs and the key numbers in it; how you did it in `how`, anything worth noting in `notes`.
-5. Work that runs long (e.g. training): start it detached, `nohup <command> > <log> 2>&1 < /dev/null &` (on a GPU
-   machine through gpu-run), register it with add_job (pid and done_file, log, a one-line note) and end this run
-   without submit_result. You are started again when the job ends.
-"""
-
-
 def interrupt_note(ctx: TaskContext) -> str:
     """The messages that interrupted (or paused and resumed) this task's previous run (D-089): first thing to read."""
     if not ctx.interrupts:
@@ -234,8 +202,6 @@ def worker_prompt(ctx: TaskContext) -> str:
 
 
 def _worker_prompt(ctx: TaskContext) -> str:
-    if ctx.internal:
-        return sub_prompt(ctx)
     req = ctx.request
     code = extra_dirs(ctx)
     git_note = (f"\nThe code for this task is in an isolated git worktree{' at ' + str(ctx.workdir) if code else ''} "
@@ -296,10 +262,6 @@ Rules:
 class ClaudeCodeRuntime(SubprocessRuntime):
     name = "claude-code"
 
-    @staticmethod
-    def request_model(ctx: TaskContext) -> str | None:
-        return ctx.request.body.get("model")
-
     def start_dir(self, ctx: TaskContext) -> Path:
         return llm_start_dir(ctx)
 
@@ -316,18 +278,17 @@ class ClaudeCodeRuntime(SubprocessRuntime):
         if ctx.allows("RUN_EXPERIMENT"):
             tools += ["Bash"]
             available += [] if "Bash" in available else ["Bash"]
-        # Tools come from node.yaml alone (D-032; Codex review of 6c2a60a): --tools limits what exists, since
-        # --allowedTools only pre-approves. Setting source "project" only: not "user" (its allow rules and
-        # plugin hooks) nor "local" (a session's "don't ask again" approvals); "project" still loads the
-        # function CLAUDE.md above the project directory and the project's memory.
+        # Tools come from node.yaml alone: --tools limits what exists, since --allowedTools only pre-approves. Setting
+        # source "project" only: not "user" (its allow rules and plugin hooks) nor "local" (a session's "don't ask
+        # again" approvals); "project" still loads the function CLAUDE.md above the project directory and the project's
+        # memory.
         argv = ["claude", "-p", "--output-format", "json", "--mcp-config", str(cfg_path), "--strict-mcp-config",
                 "--setting-sources", "project",
                 "--tools", ",".join(available), "--allowedTools", ",".join(tools)]
         for d in extra_dirs(ctx):
             argv += ["--add-dir", str(d)]
-        model = (self.request_model(ctx) or "sonnet") if ctx.internal else self.agent.model   # a sub: latest Sonnet
-        if model:
-            argv += ["--model", model]
+        if self.agent.model:
+            argv += ["--model", self.agent.model]
         if ctx.resume:
             argv += ["--resume", ctx.resume]
         elif ctx.session_id:
@@ -371,9 +332,8 @@ class CodexRuntime(SubprocessRuntime):
                 # exec mode cannot prompt; pre-approve only our own server's tools
                 "-c", 'mcp_servers.mutmuas.default_tools_approval_mode="approve"',
                 *(["-c", "sandbox_workspace_write.network_access=true"] if writable and self.agent.network else [])]
-        model = ctx.request.body.get("model") if ctx.internal else None
-        if model or self.agent.model:
-            argv += ["-m", model or self.agent.model]
+        if self.agent.model:
+            argv += ["-m", self.agent.model]
         return argv + list(self.agent.extra_args) + ["-"], worker_prompt(ctx).encode()
 
 
@@ -400,7 +360,7 @@ def _last_json(text: str) -> dict[str, Any] | None:
 async def stop_group(pgid: int, grace_s: float = 5.0) -> bool:
     """Stop a run's whole process group: SIGTERM, then SIGKILL to whatever is left after grace_s. The group is
     waited on, not just its leader: a child that ignores SIGTERM would keep running and keep its locks (a GPU
-    flock) (Codex review of 9f39ff0). True once the group is gone."""
+    flock). True once the group is gone."""
     for sig in (signal.SIGTERM, signal.SIGKILL):
         if _group_gone(pgid, sig):
             return True
@@ -419,8 +379,8 @@ def group_alive(pgid: int) -> bool:
 
 def _group_gone(pgid: int, sig: int) -> bool:
     """Whether the group is gone after sending it sig. Members that are zombies (dead, not yet reaped by their
-    parent) count as gone: Linux lets kill() reach a zombie, macOS answers EPERM for a group of zombies only
-    (secretary's run on B, Codex re-review of cb77a33). A live member we may not signal is not gone."""
+    parent) count as gone: Linux lets kill() reach a zombie, macOS answers EPERM for a group of zombies only. A
+    live member we may not signal is not gone."""
     try:
         os.killpg(pgid, sig)
     except ProcessLookupError:
@@ -431,7 +391,7 @@ def _group_gone(pgid: int, sig: int) -> bool:
 
 
 def _all_zombies(states: list[str]) -> bool:
-    # the group answered a signal, so ps must show members: none shown says nothing (Codex third review)
+    # the group answered a signal, so ps must show members: none shown says nothing
     return bool(states) and all(state.startswith("Z") for state in states)
 
 

@@ -1,16 +1,23 @@
 """D-052: the node, not the model, does the mechanical part of delivery. When an owned task gets its RESULT it
 appends the R7.11 line to the post's worker-log.md (how and notes from submit_result, '未填' when missing) and
-attaches this task's PLAN.md section (the heading with the task id) to the result, then takes it off the board."""
+attaches this task's PLAN.md section (the heading with the task id) to the result, then takes it off the board.
+
+Arriving work is written into the post's plan and the sender is told its place in the queue; every
+run keeps its own log."""
 
 from __future__ import annotations
 
 import os
+import sys
 
-from conftest import auto_worker_node, owned_task
+import pytest
+from conftest import Orphan, auto_worker_node, owned_task
 
 from mutmuas import cli, tools
 from mutmuas.node import proc_start
-from mutmuas.protocol import Envelope, request_body
+from mutmuas.protocol import Envelope, request_body, result_body
+from mutmuas.runtime import ScriptRuntime, TaskContext
+
 
 PLAN = """# T-other: another task
 - [x] something -> out.txt
@@ -114,8 +121,28 @@ async def test_agentctl_submit_result_takes_how_and_notes(monkeypatch):
     assert calls[0]["how"] == "h" and calls[0]["notes"] == "n"
 
 
+async def test_agentctl_submit_result_reads_the_rest_from_a_file(tmp_path, monkeypatch):
+    """A script worker writes its result as YAML and passes --file; the flags win over the file."""
+    calls = []
+
+    async def fake_submit(hub, me, status, summary, **kw):
+        calls.append((status, summary, kw))
+        return {}
+
+    monkeypatch.setattr(tools, "submit_result", fake_submit)
+    result = tmp_path / "result.yaml"
+    result.write_text("status: partial\nsummary: from the file\noutputs: {loss: 0.2}\nnotes: n\n"
+                      "artifacts: [{uri: 'artifact://p/B/desk/T-d/x.json'}]\n")
+    args = cli.agentctl_parser().parse_args(["submit-result", "--task", "T-d", "--file", str(result),
+                                             "--status", "complete", "--as", "B:desk"])
+    await cli.cmd_submit(args, None)
+    [(status, summary, kw)] = calls
+    assert (status, summary) == ("complete", "from the file")
+    assert kw["outputs"] == {"loss": 0.2} and kw["notes"] == "n" and kw["artifacts"][0]["uri"].endswith("x.json")
+
+
 def test_the_worker_prompt_leaves_the_log_to_the_node(tmp_path):
-    from test_staff_v4 import _claude_ctx
+    from test_worker_setup import _claude_ctx
 
     from mutmuas.runtime import worker_prompt
     _, ctx, _ = _claude_ctx(tmp_path)
@@ -148,3 +175,127 @@ make test
     rest = drop_plan_section(board, "T-d")
     assert "# T-d2: a similar id" in rest and "## T-later" in rest and "make test" not in rest
     assert plan_section(board, "T-d3") is None and drop_plan_section(board, "T-d3") == board
+
+
+def _request(task_id: str, objective: str = "label the desk images", **extra) -> Envelope:
+    return Envelope(type="REQUEST", sender="A:sender", to="B:desk", task_id=task_id,
+                    body={**request_body(objective, "reason"), **extra})
+
+
+async def _arrive(daemon, agent, env):
+    daemon.hub.ledger.ingest(env)
+    state = await daemon._on_request(agent, env)
+    daemon.hub.ledger.mark_handled(env.message_id, state or "handled")
+
+
+@pytest.fixture
+def session():
+    proc = Orphan("import time; time.sleep(60)")
+    yield proc
+    proc.kill()
+
+
+def _out(ledger, type_, task_id):
+    return [e for e in ledger.outbox() if e.type == type_ and e.task_id == task_id]
+
+
+async def test_arriving_work_is_written_into_the_plan_and_the_sender_told_its_place(tmp_path, session):
+    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    ledger.session_beat("B:desk", session.pid, str(agent.workdir_path), session_pid=session.pid)
+    plan = agent.workdir_path / "PLAN.md"
+    try:
+        await _arrive(daemon, agent, _request("T-1", "first job\nwith details"))
+        await _arrive(daemon, agent, _request("T-2", "second job"))
+        text = plan.read_text()
+        assert "## 收件" in text and "- [ ] T-1 from A:sender: first job" in text and "with details" not in text
+        assert "- [ ] T-2 from A:sender: second job" in text
+        [receipt] = [e for e in _out(ledger, "UPDATE", "T-2") if e.body.get("state") == "PENDING"]
+        assert "2 in the queue" in receipt.body["message"] and receipt.body.get("position") == 2
+        await hub.finish("T-1", result_body("complete", "done"))
+        assert "T-1" not in plan.read_text() and "T-2" in plan.read_text()
+    finally:
+        ledger.close()
+
+
+async def test_a_workers_acknowledgement_carries_its_place_too(tmp_path):
+    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    try:
+        await _arrive(daemon, agent, _request("T-1"))
+        [ack] = _out(ledger, "ACK", "T-1")
+        assert ack.body.get("position") == 1 and "1 in the queue" in ack.body["message"]
+        assert "T-1" in (agent.workdir_path / "PLAN.md").read_text()
+    finally:
+        ledger.close()
+
+
+async def test_finish_does_not_overwrite_a_line_the_node_adds_meanwhile(tmp_path, monkeypatch):
+    """Another node writer (a new 收件 line) arrives while finish rewrites PLAN.md: it must not be lost."""
+    import threading
+    from pathlib import Path
+    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    board = agent.workdir_path / "PLAN.md"
+    owned_task(ledger, "T-done", ingest=True)
+    owned_task(ledger, "T-new", ingest=True)
+    board.parent.mkdir(parents=True, exist_ok=True)
+    board.write_text("# PLAN\n## [>] T-done test\n- [x] done\n\n## 收件\n")
+    other = []
+
+    def meanwhile():                                   # the moment finish writes the board back
+        if not other:
+            other.append(threading.Thread(target=hub.add_inbox_line, args=(ledger.task("T-new", "owner"),)))
+            other[0].start()
+            other[0].join(0.5)
+    write_text, replace = Path.write_text, Path.replace
+
+    def patched_write(path, *a, **k):
+        if path == board:
+            meanwhile()
+        return write_text(path, *a, **k)
+
+    def patched_replace(path, target):
+        if target == board:
+            meanwhile()
+        return replace(path, target)
+    monkeypatch.setattr(Path, "write_text", patched_write)
+    monkeypatch.setattr(Path, "replace", patched_replace)
+    try:
+        await hub.finish("T-done", result_body("complete", "done"))
+        other[0].join(5)
+        text = board.read_text()
+        assert "T-new" in text and "T-done test" not in text
+        assert "- [x] done" in ledger.task("T-done", "owner")["result"]["outputs"]["plan"]
+    finally:
+        ledger.close()
+
+
+async def test_a_refused_result_leaves_the_plan_section_alone(tmp_path):
+    """Codex review of ea40b88: an invalid RESULT (empty summary) was refused after the task's PLAN section had
+    already been taken off the board."""
+    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    owned_task(ledger, "T-s", "RUNNING", ingest=True)
+    board = agent.workdir_path / "PLAN.md"
+    board.parent.mkdir(parents=True, exist_ok=True)
+    board.write_text("# PLAN\n## [>] T-s\n- [ ] important unsaved work\n")
+    try:
+        with pytest.raises(Exception):
+            await tools.submit_result(hub, "B:desk", "complete", "", task_id="T-s")
+        task = ledger.task("T-s", "owner")
+        assert task["status"] == "RUNNING" and task["result"] is None
+        assert "important unsaved work" in board.read_text()
+    finally:
+        ledger.close()
+
+
+async def test_every_run_keeps_its_own_log(tmp_path):
+    """r19 F1: a woken task starts again at attempt 1, and its log overwrote the first run's."""
+    from mutmuas.config import AgentConfig, NodeConfig
+    from mutmuas.protocol import Envelope, request_body
+    agent = AgentConfig(id="desk", mode="worker", runtime="script", workdir=str(tmp_path / "work"),
+                        command=[sys.executable, "-c", "print('run')"])
+    node = NodeConfig(project="p", node="B", data_dir=str(tmp_path / "data"), agents=[agent])
+    req = Envelope(type="REQUEST", sender="A:s", to="B:desk", task_id="T-j", body=request_body("x", "y"))
+    runtime = ScriptRuntime(agent, node)
+    first = await runtime.run(TaskContext("T-j", req, agent, node, 1))
+    second = await runtime.run(TaskContext("T-j", req, agent, node, 1))
+    assert first.log_path != second.log_path
+    assert "run" in open(first.log_path).read() and "run" in open(second.log_path).read()

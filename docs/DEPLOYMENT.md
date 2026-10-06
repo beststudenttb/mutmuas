@@ -276,7 +276,7 @@ with `auto_worker: true` and a worker `runtime` is run by the daemon as a worker
    ```
 3. Durable delivery: stop B's daemon, then run `agentctl ask B:ping "ping while offline"` on A. The
    output shows `delivery: sent` with a note that B is offline. Start B's daemon again and run
-   `agentctl result <task_id> --wait 60`. It completes.
+   `agentctl task <task_id>` until it shows COMPLETED.
 4. Real LLM worker: `agentctl ask B:representation "List the files in your working directory" --wait 600`.
 5. Artifacts: on A run `echo hi > /tmp/x.txt && agentctl artifact publish /tmp/x.txt`, then on B run
    `agentctl artifact fetch <uri> --dest /tmp/got`.
@@ -293,11 +293,15 @@ agentctl agents --capability isaac_lab
 agentctl tasks                   # tasks this node requested or owns
 agentctl tasks --all             # every task, from the shared ledger
 agentctl task <id>               # full message history: who asked what, why, and what came back
-agentctl history --task <id>     # raw audit trail from the stream
 agentctl inbox --as A:lead       # messages for an interactive agent
 tail -f ~/.mutmuas/visual_rl/B/node.log
 ls ~/.mutmuas/visual_rl/B/runs/  # per-task agent output (<task>.<UTC start time>.attempt<N>.log, one per run)
 ```
+
+While an agent's session is online, a shell beside it only reads (the commands above with `inbox --peek`, and
+`watch --headers-only`) and switches the session's work (`session off|on`). `agentctl update`, `submit`, `artifact`
+and the other commands that act as the agent are refused there: the session acts through its MCP tools, and a
+running worker's own processes act on its task (MESSAGE_PROTOCOL.md, "One agent, one session").
 
 ## 8. Recovery
 
@@ -307,7 +311,7 @@ ls ~/.mutmuas/visual_rl/B/runs/  # per-task agent output (<task>.<UTC start time
 | Server machine lost | Messages and artifacts live in `store_dir`, so back up `/var/lib/nats/jetstream`. Without a backup: start a fresh server with the same `nats-server.conf`. Nodes re-register on their next heartbeat, and each node's `ledger.sqlite3` still holds its own tasks and messages. Messages in flight and object-store artifacts are lost. |
 | Node daemon crashes / machine reboots | The service manager restarts it. On start it re-queues unfinished tasks (attempt+1, requester notified "restarted"). After `max_attempts` a task fails with an explanation. **auto_worker exception** (v4, D-040): a task whose worker submitted its result is delivered, not run again; a task whose worker from before the restart still runs (pid and start time both match) is skipped, recorded once in the failure log (`agentctl failures`) and looked at again every heartbeat until that worker has ended; any other task is run again. The old worker is not stopped. A session's task is left to the session. |
 | Rolling back from v4 | Back up `data/ledger.sqlite3` before deploying v4. The ledger keeps working with the old code (it ignores the new `tasks.runner*` columns and the `failures` table). Remove the v4 fields from `node.yaml` first (`auto_worker`, `code_mode`, `code_dirs`): the old code rejects unknown keys and would not start. |
-| A task is stuck | `agentctl cancel <id>` from the requester. On the owner, `agentctl task <id>` and the run log show why. |
+| A task is stuck | The requester's session withdraws it (MCP `cancel_task`). On the owner, `agentctl task <id>` and the run log show why. |
 | Wrong credentials | The daemon logs `Authorization Violation` and retries. Check `nats.credentials_file` and that the server config includes the node. |
 | Reset one node completely | Stop its daemon and delete its `data_dir`. Its durable mailbox on the server still holds unacknowledged messages, which are delivered again. |
 | Rotate a node's password | Delete `<out>/<NODE>.env`, re-run `server-config`, reload the server, copy the new file to the node, and restart the node. |
@@ -315,35 +319,30 @@ ls ~/.mutmuas/visual_rl/B/runs/  # per-task agent output (<task>.<UTC start time
 ## 8b. Retire a post (D-085/D-089)
 
 `agent-node retire-agent <id> [--hand-over <addr>]` shows what it would do; add `-y` to do it, on the node
-that has the post, **with the node daemon stopped** (Codex review of c46cfb9):
+that has the post, **with the node daemon stopped**. That is the guard (D-102): the command holds the daemon's
+lock (`data/daemon.lock`) to the end, and refuses while the post's session is online or a worker of it runs, so
+nothing else acts for the post meanwhile. A person starting its session or editing its files in the middle is
+not guarded against.
 
-1. refuses while the node daemon runs (it holds `data/daemon.lock`; the command holds it to the end, so the
-   daemon cannot start meanwhile), while the post's session is online, or while a worker of it runs a task;
-   refuses also while unread mail waits in its mailbox, unless `--keep-mailbox` (the mailbox is then kept and
+1. refuses also while unread mail waits in its mailbox, unless `--keep-mailbox` (the mailbox is then kept and
    listed under `todo`; nothing unread is deleted);
-2. writes the manifest `RETIRED-<id>-<time>.json` next to node.yaml **before the first change** (if it cannot,
-   nothing is done), and again after every step, an intent before the directory move (state planned / started /
-   done / failed, the steps done, the error);
-3. fences the post in the same ledger transaction as the session check: from then on no session takes it and no
-   tool (MCP or agentctl) acts as it;
-4. node.yaml: a timestamped backup (`node.yaml.bak-<time>-retire-<id>`), then only that agent's list item is
+2. writes the whole plan to `RETIRED-<id>-<time>.json` next to node.yaml before the first change;
+3. node.yaml: a timestamped backup (`node.yaml.bak-<time>-retire-<id>`), then only that agent's list item is
    taken out, found from the parsed YAML's own positions (a comment inside the item goes with it; comments after
-   it stay). The result is checked to differ from the original by that one agent and nothing else, and written
-   atomically;
-5. its open work is refused back to each requester ("retired; ask <hand-over> instead"); what it asked others
+   it stay), written atomically;
+4. its open work is refused back to each requester ("retired; ask <hand-over> instead"); what it asked others
    for is withdrawn (their nodes cascade further down);
-6. its registry card and mailbox are removed now when the bus is reachable, else listed under `todo` (the node
+5. its registry card and mailbox are removed now when the bus is reachable, else listed under `todo` (the node
    removes the card at its next start);
-7. its post directory is moved whole to `work/_archive/<post>-<time>/`. Nothing in it is deleted, since it may
-   hold the leader's files. A directory another agent uses, or one inside it, is left in place, judged by file
-   identity (a case variant or a link of the path is the same directory).
+6. its post directory is moved whole to `work/_archive/<post>-<time>/`. Nothing in it is deleted, since it may
+   hold the leader's files. A directory another agent uses (the same path, or one inside the other) is left in
+   place.
 
 Start the node again afterwards: it forgets the address. `agent-node retire-agent --undo <manifest>` (also with
-`--dry-run`) works from the manifest of a finished or a failed run, also with the node daemon stopped: the block
-goes back to its old place in the agents list (checked the same way), the directory back from wherever it is on
-disk, the fence is lifted; then start the node. It changes nothing when the post directory exists again (both
-directories are named: merge them by hand), when a different agent now has the same id, or when neither the
-directory nor its archive is there. Refused and withdrawn tasks stay so.
+`--dry-run`, and also with the node daemon stopped) puts the block back at its old place in the agents list
+unless that id is configured, and the directory back from its archive unless something is in its place (then it
+says so); then start the node. What is on disk decides, so a run that stopped midway is undone too. Refused and
+withdrawn tasks stay so.
 
 ## 8a. Supervision and known risks
 
@@ -361,8 +360,12 @@ Known risks (protections removed on purpose; one line each):
 
 - An old worker's children that outlive their leader after a daemon crash are not looked for; a retry can run
   next to them.
-- An observer copy whose owner publishes its task record only much later (owner offline for long) is dropped
-  after a few tries.
+- Observer copies of a REQUEST are sent by the owner's node once it has the request (D-102), so they arrive
+  only when that node is up. During a rolling upgrade a new requester with an old owner sends none (the old code
+  left them to the requester): they come once the owner's node runs the new code. A copy that reaches an
+  observer without any record of the task (no bus at the observer) is dropped and logged.
+- A worker's send_request takes its own task as parent_task by default (MUTMUAS_TASK_ID), unchecked; the
+  daemon sets that variable, so it is the worker's task unless a person sets it by hand.
 - A session started from the wrong directory (empty memory, other rules) is not told so.
 - A `.claude/settings.json` in or above a worker's project directory that allows tools is trusted.
 - The session holding an agent does not learn that a second session tried to take it over.
@@ -383,8 +386,6 @@ Known risks (protections removed on purpose; one line each):
 - The node and the brain may write the same PLAN.md at the same moment: the node's writes take a lock
   (.PLAN.md.lock) and rewrite only the sub's line, but the brain does not take that lock, so a brain write in
   between can be lost (D-073).
-- An internal subtask's worker is kept from mail by its tools, not by the operating system: it runs as the same
-  user with the post's Read/Bash, so it could read the node's ledger file directly (D-073).
 - Who may interrupt is decided by the sender address (node.yaml `trusted_controllers`, a list of full addresses,
   checked at load; D-089). Each node has its own bus credential and may publish only as its own node, but the
   agents of one node share it: any process on node B can send as B:claude-secretary. The list is a soft
@@ -398,8 +399,8 @@ Known risks (protections removed on purpose; one line each):
   (`stuck_pgid`) and watched as a group, also after its leader has ended; nothing runs for the task while it
   lives, and the heartbeat lays the task out once it has gone. The node knows a run's process only from the
   runtime's spawn report, and a group id is checked by its live members (a reused id is not told apart).
-- Pause is not reliable for every open child task: a held child (depends_on) is paused where it waits, and a
-  child its owner node has already recorded is paused there, but a pause that reaches the owner node before the
+- Pause is not reliable for every open child task: a child its owner node has already recorded is paused there,
+  but a pause that reaches the owner node before the
   child's REQUEST was handled is dropped (no persistent order or tombstone for unknown tasks).
 - A run stopped while its worktree is made (code tasks) is not known to be safe: the git process may go on and
   the next run reuses a half-made worktree as it finds it. Not verified; do not count on interrupting a code
@@ -412,8 +413,6 @@ Known risks (protections removed on purpose; one line each):
   through check_task on a task it may see.
 - Retiring a post cannot take back the refusals and withdrawals it sent; `--undo` restores only the config
   block and the directory (D-085).
-- A retired post's fence lives in the ledger: a session started while it stands gets "being retired" and no mail;
-  a run that failed before node.yaml changed keeps the fence until `--undo` lifts it.
 - `retire-agent` trusts `data/daemon.lock`: a daemon started from another data directory for the same node is not
   seen.
 - Two brain runs of one post never overlap, so different projects of a post wait for each other's brain runs.

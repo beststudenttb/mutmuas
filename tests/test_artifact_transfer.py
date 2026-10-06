@@ -3,7 +3,7 @@
 import json
 
 import pytest
-from conftest import eventually, interactive, thread_types, worker
+from conftest import interactive, thread_types, worker
 
 from mutmuas import tools
 from mutmuas.artifacts import ArtifactError, ArtifactUnavailable

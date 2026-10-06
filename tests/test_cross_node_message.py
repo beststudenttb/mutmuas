@@ -277,7 +277,6 @@ async def test_notifier_waits_for_nats_at_startup(make_config, cluster, tmp_path
 
 async def test_wake_filter_ignores_results_of_my_own_requests(make_config, cluster):
     """--only wake: a RESULT for my request does not interrupt me; a new REQUEST to me does."""
-    import asyncio
     a = make_config("A", [interactive("main")])
     b = make_config("B", [worker("lab", "lab.py"), interactive("coder")])
     await cluster.start(a)

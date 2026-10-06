@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS messages (
     last_error      TEXT,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL,
+    shown           INTEGER NOT NULL DEFAULT 0,   -- an inbox listing showed it: clear_inbox may mark it read
+    pushed          INTEGER NOT NULL DEFAULT 0,   -- push state (spec v1.1 §5.1)
+    pushed_at       TEXT,
     PRIMARY KEY (message_id, direction)
 );
 CREATE INDEX IF NOT EXISTS messages_state ON messages(direction, state);
@@ -63,6 +66,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     attempts        INTEGER NOT NULL DEFAULT 0,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL,
+    runner          TEXT,                    -- auto_worker: 'worker' | 'session', claimed in one transaction
+    runner_pid      INTEGER,                 -- the worker's process ...
+    runner_start    TEXT,                    -- ... and its start time (pids get reused)
+    stuck_pgid      INTEGER,                 -- a process group a stop could not end: nothing runs beside it
+    eta             TEXT,                    -- the owner's estimate (D-076)
+    interrupts      TEXT,                    -- messages that stopped a run, for the next run (D-089)
+    paused          INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, role)
 );
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(role, status);
@@ -75,7 +85,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     session_pid     INTEGER,                    -- its parent: the session itself (Claude Code, Codex, ...)
     cwd             TEXT,
     started_at      TEXT NOT NULL,
-    last_seen       TEXT NOT NULL
+    last_seen       TEXT NOT NULL,
+    accepting       INTEGER NOT NULL DEFAULT 1   -- 0: online but takes no work (`off`)
 );
 
 -- Artifacts an agent of this node published itself: with inbound mail, the only source of artifact access
@@ -95,7 +106,10 @@ CREATE TABLE IF NOT EXISTS reminders (
     due             TEXT NOT NULL,
     text            TEXT NOT NULL,
     created_at      TEXT NOT NULL,
-    fired_at        TEXT
+    fired_at        TEXT,
+    every_s         REAL,                    -- repeats after this many seconds
+    cancelled_at    TEXT,
+    task_id         TEXT                     -- set in a worker run: the task it wakes (D-098)
 );
 
 -- Follow-ups already sent (overdue reply, session gone), so each is sent once.
@@ -114,21 +128,6 @@ CREATE TABLE IF NOT EXISTS failures (
     task_id         TEXT,
     attempt         INTEGER,
     error           TEXT NOT NULL            -- "<ExceptionType>: <message>"
-);
-
--- A post being retired (agent-node retire-agent): no session may take its lease from the check on (Codex review
--- of c46cfb9). Cleared by --undo.
-CREATE TABLE IF NOT EXISTS retiring (
-    local_agent     TEXT PRIMARY KEY,
-    at              TEXT NOT NULL
-);
-
--- Requests held by their sender until the tasks they depend on are done (D-073 batch 2, depends_on).
-CREATE TABLE IF NOT EXISTS held (
-    task_id         TEXT PRIMARY KEY,
-    envelope        TEXT NOT NULL,
-    depends_on      TEXT NOT NULL,           -- json list of task ids
-    created_at      TEXT NOT NULL
 );
 
 -- A post's brain batch (D-073): worker runs of (agent, project) resume this conversation until an idle spell.
@@ -152,7 +151,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     note            TEXT,
     created_at      TEXT NOT NULL,
     ended_at        TEXT,
-    ended           TEXT                     -- how it ended: process gone / done-file and its first lines
+    ended           TEXT,                    -- how it ended: process gone / done-file and its first lines
+    children        INTEGER NOT NULL DEFAULT 0   -- waits on the task's child tasks instead (D-066)
 );
 """
 
@@ -181,52 +181,7 @@ class Ledger:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=30000")
-        self._migrate_v1()
         self.db.executescript(SCHEMA)
-        self._add_column("sessions", "session_pid", "INTEGER")    # ledgers created by exp/wake e2fb5d1
-        # 1 once an inbox listing has shown the message to the session: clear_inbox may only mark those read
-        self._add_column("messages", "shown", "INTEGER NOT NULL DEFAULT 0")
-        # Who is doing an owner task of an auto_worker agent: 'worker' (runner_pid: its process) or 'session'.
-        # Claimed in one transaction, so a task is never done twice (D-032).
-        self._add_column("tasks", "runner", "TEXT")
-        self._add_column("tasks", "runner_pid", "INTEGER")
-        self._add_column("tasks", "runner_start", "TEXT")          # the process's start time: pids get reused
-        # D-089: the process group of a run whose stop failed; nothing runs for the task while it lives
-        self._add_column("tasks", "stuck_pgid", "INTEGER")
-        # D-066: a job that waits on the task's direct child tasks (parent_task) instead of a process or file
-        self._add_column("jobs", "children", "INTEGER NOT NULL DEFAULT 0")
-        self._add_column("reminders", "every_s", "REAL")             # repeat after this many seconds
-        self._add_column("reminders", "cancelled_at", "TEXT")
-        self._add_column("reminders", "task_id", "TEXT")             # set in a worker run: the task it wakes
-        # D-073 batch 2: push state per message (spec §5.1), the owner's eta (D-076), the last nudge (requester
-        # side), and a session that is online but takes no work (`off`)
-        self._add_column("messages", "pushed", "INTEGER NOT NULL DEFAULT 0")
-        self._add_column("messages", "pushed_at", "TEXT")
-        self._add_column("tasks", "eta", "TEXT")
-        self._add_column("tasks", "nudged_at", "TEXT")
-        self._add_column("sessions", "accepting", "INTEGER NOT NULL DEFAULT 1")
-        # D-089: messages that interrupted a worker's run, for its next run; a task paused until resumed
-        self._add_column("tasks", "interrupts", "TEXT")
-        self._add_column("tasks", "paused", "INTEGER NOT NULL DEFAULT 0")
-
-    def _add_column(self, table: str, column: str, decl: str) -> None:
-        if column not in [r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")]:
-            self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
-
-    def _migrate_v1(self) -> None:
-        """v1 keyed messages on message_id alone, which dropped same-node deliveries. Re-key in place."""
-        pk = [r["name"] for r in self.db.execute("PRAGMA table_info(messages)") if r["pk"]]
-        if pk != ["message_id"]:
-            return
-        with self.tx() as db:
-            db.execute("ALTER TABLE messages RENAME TO messages_v1")
-            db.execute("DROP INDEX IF EXISTS messages_state")
-            db.execute("DROP INDEX IF EXISTS messages_task")
-            for stmt in SCHEMA.split("CREATE TABLE IF NOT EXISTS tasks")[0].split(";"):
-                if stmt.strip():        # executescript would commit implicitly; stay inside this transaction
-                    db.execute(stmt)
-            db.execute("INSERT INTO messages SELECT * FROM messages_v1")
-            db.execute("DROP TABLE messages_v1")
 
     def close(self) -> None:
         self.db.close()
@@ -324,11 +279,9 @@ class Ledger:
     def _project_filter(project: tuple[str, str] | None) -> tuple[str, tuple]:
         """project = (the session's project, the post's default project): leave out requests of other projects,
         which the worker takes (D-072). A request without `project` belongs to the default project."""
-        # a brain's internal subtasks (D-073) are its own work for its worker, never mail for the session
-        internal = " AND NOT (type = 'REQUEST' AND json_extract(envelope, '$.body.internal') IS 1)"
         if not project:
-            return internal, ()
-        return (internal + " AND NOT (type = 'REQUEST' AND COALESCE(json_extract(envelope, '$.body.project'), ?)"
+            return "", ()
+        return (" AND NOT (type = 'REQUEST' AND COALESCE(json_extract(envelope, '$.body.project'), ?)"
                 " IS NOT ?)", (project[1], project[0]))
 
     def unseen(self, local_agent: str, limit: int = 50, mark: bool = True,
@@ -338,8 +291,8 @@ class Ledger:
                leader_before_seq: int | None = None) -> list[Envelope]:
         """Inbound messages an interactive agent has not looked at yet.
         Without `since` (a session looking at its mail) the page holds the newest (D-074): the leader's mail first
-        (body.leader, D-049, when leader_first), then newest to oldest. Paging back has two stages (Codex review of
-        374be94): leader_before_seq continues the leader's mail older than it (then fills up with the newest other
+        (body.leader, D-049, when leader_first), then newest to oldest. Paging back has two stages:
+        leader_before_seq continues the leader's mail older than it (then fills up with the newest other
         mail); before_seq pages through the other mail only.
         With `since` (a notifier's cursor, advanced to the last row) it stays in arrival order, oldest first, so
         nothing is skipped.
@@ -365,8 +318,8 @@ class Ledger:
                               f" AND state='handled' AND local_agent=?{type_sql}{since_sql}{before_sql}"
                               f" ORDER BY {order} LIMIT ?",
                               (local_agent, *type_args, *since_arg, *before_arg, limit)).fetchall()
-            # show: a foreground listing for the session (peek too) = shown, so clear_inbox may clear it later;
-            # a notifier's read (watch, push) is not (Codex review of 8c018ee). mark: read.
+            # show: a foreground listing for the session (peek too) = shown, so clear_inbox may clear it later; a
+            # notifier's read (watch, push) is not. mark: read.
             sets = [x for x, on in (("shown=1", show), ("seen=1", mark)) if on]
             if rows and sets:
                 db.executemany(f"UPDATE messages SET {', '.join(sets)} WHERE message_id=? AND direction='in'",
@@ -420,39 +373,20 @@ class Ledger:
 
     def session_beat(self, local_agent: str, pid: int, cwd: str | None, session_pid: int | None = None) -> None:
         now = now_iso()
-        with self.tx() as db:
-            if not db.execute("SELECT 1 FROM retiring WHERE local_agent=?", (local_agent,)).fetchone():
-                db.execute(self._BEAT_SQL, (local_agent, pid, session_pid, cwd, now, now))
+        self.db.execute(self._BEAT_SQL, (local_agent, pid, session_pid, cwd, now, now))
 
     def session_claim(self, local_agent: str, pid: int, cwd: str | None, holder_alive,
                       session_pid: int | None = None) -> int:
         """One agent, one session: beat as the holder if the lease is free, stale or already ours; otherwise return
-        the holder's pid, or -1 while the agent is being retired. The check and the write are one transaction
-        (BEGIN IMMEDIATE), so two sessions starting together cannot both win."""
+        the holder's pid. The check and the write are one transaction (BEGIN IMMEDIATE), so two sessions starting
+        together cannot both win."""
         now = now_iso()
         with self.tx() as db:
-            if db.execute("SELECT 1 FROM retiring WHERE local_agent=?", (local_agent,)).fetchone():
-                return -1
             row = db.execute("SELECT * FROM sessions WHERE local_agent=?", (local_agent,)).fetchone()
             if row is not None and row["pid"] not in (0, pid) and holder_alive(dict(row)):
                 return row["pid"]
             db.execute(self._BEAT_SQL, (local_agent, pid, session_pid, cwd, now, now))
         return pid
-
-    def begin_retire(self, local_agent: str, refuse_if) -> str | None:
-        """Fence an agent for retirement, or say why not: refuse_if() (e.g. its session is there) is checked in the
-        same transaction that sets the fence, so no session can take the lease in between."""
-        with self.tx() as db:
-            if (why := refuse_if()):
-                return why
-            db.execute("INSERT OR REPLACE INTO retiring (local_agent, at) VALUES (?,?)", (local_agent, now_iso()))
-        return None
-
-    def retiring(self, local_agent: str) -> bool:
-        return self.db.execute("SELECT 1 FROM retiring WHERE local_agent=?", (local_agent,)).fetchone() is not None
-
-    def end_retire(self, local_agent: str) -> None:
-        self.db.execute("DELETE FROM retiring WHERE local_agent=?", (local_agent,))
 
     def claim_task(self, task_id: str, runner: str, statuses: tuple[str, ...],
                    refuse_if=None) -> str | None:
@@ -479,14 +413,16 @@ class Ledger:
                         " AND runner=?", (task_id, runner))
 
     def set_runner_pid(self, task_id: str, pid: int | None, start: str | None = None) -> None:
-        self.db.execute("UPDATE tasks SET runner_pid=?, runner_start=? WHERE task_id=? AND role='owner'"
-                        " AND runner='worker'", (pid, start, task_id))
+        """The process the daemon started for a run, auto_worker (runner 'worker') or mode: worker (no claim)
+        alike: only the daemon writes it, so a pid here always means a daemon-started run."""
+        self.db.execute("UPDATE tasks SET runner_pid=?, runner_start=? WHERE task_id=? AND role='owner'",
+                        (pid, start, task_id))
 
     def worker_runs(self, local_agent: str) -> list[tuple[int, str | None, str]]:
         """(pid, start time, task id) of the processes the daemon started for this agent's unfinished tasks."""
         rows = self.db.execute(
             "SELECT runner_pid, runner_start, task_id FROM tasks WHERE role='owner' AND local_agent=?"
-            " AND runner='worker' AND runner_pid IS NOT NULL"
+            " AND runner_pid IS NOT NULL"
             f" AND status NOT IN ({','.join('?' * len(TERMINAL_STATES))})",
             (local_agent, *TERMINAL_STATES)).fetchall()
         return [(r[0], r[1], r[2]) for r in rows]
@@ -502,7 +438,7 @@ class Ledger:
 
     def mark_seen_before(self, local_agent: str, before_seq: int) -> list[Envelope]:
         """Mark everything up to a rowid as read (the session's explicit 'clear the backlog') that an inbox
-        listing has shown: never mail the session has not seen (STANDARD item 8; Codex review of dfdd719).
+        listing has shown: never mail the session has not seen.
         Informational messages (ACKs, progress) are cleared whether listed or not (D-098).
         Returns what was marked, so receipts can follow."""
         with self.tx() as db:
@@ -515,8 +451,8 @@ class Ledger:
 
     def list_recent_inbound(self, local_agent: str, limit: int = 50, show: bool = True) -> list[Envelope]:
         """The newest handled inbound messages, read or not (inbox --all): not ones still new, unverified or
-        rejected (Codex review of d98413f). With show (a foreground listing) the unread ones count as shown, so
-        clear_inbox may clear them later; they are not marked read (Codex review of d13ffc8)."""
+        rejected. With show (a foreground listing) the unread ones count as shown, so
+        clear_inbox may clear them later; they are not marked read."""
         with self.tx() as db:
             rows = db.execute("SELECT message_id, envelope FROM messages WHERE direction='in' AND local_agent=?"
                               " AND state='handled' ORDER BY rowid DESC LIMIT ?", (local_agent, limit)).fetchall()
@@ -524,15 +460,6 @@ class Ledger:
                 db.executemany("UPDATE messages SET shown=1 WHERE message_id=? AND direction='in' AND seen=0",
                                [(r["message_id"],) for r in rows])
         return [Envelope.from_json(r["envelope"]) for r in rows]
-
-    def inbound_state(self, message_id: str) -> str | None:
-        row = self.db.execute("SELECT state FROM messages WHERE message_id=? AND direction='in'",
-                              (message_id,)).fetchone()
-        return row["state"] if row else None
-
-    def inbound_in_state(self, state: str) -> list[Envelope]:
-        return [Envelope.from_json(r["envelope"]) for r in
-                self.db.execute("SELECT envelope FROM messages WHERE direction='in' AND state=?", (state,))]
 
     def unshown_count(self, local_agent: str, before_seq: int) -> int:
         """Unread mail up to a rowid that no foreground inbox listing has shown (clear_inbox leaves it)."""
@@ -635,45 +562,6 @@ class Ledger:
 
     def set_session_accepting(self, local_agent: str, accepting: bool) -> bool:
         cur = self.db.execute("UPDATE sessions SET accepting=? WHERE local_agent=?", (int(accepting), local_agent))
-        return cur.rowcount == 1
-
-    def hold_request(self, env: Envelope, depends_on: list[str]) -> None:
-        """A REQUEST that waits for other tasks (depends_on): its requester-side task exists, the message is not
-        queued yet."""
-        with self.tx() as db:
-            self._insert_task(db, env, role="requester", local_agent=env.sender, status="PENDING")
-            db.execute("INSERT INTO held (task_id, envelope, depends_on, created_at) VALUES (?,?,?,?)",
-                       (env.task_id, env.to_json().decode(), json.dumps(depends_on), now_iso()))
-
-    def held(self) -> list[dict[str, Any]]:
-        return [{"task_id": r["task_id"], "envelope": Envelope.from_json(r["envelope"]),
-                 "depends_on": json.loads(r["depends_on"])} for r in self.db.execute("SELECT * FROM held")]
-
-    def release_held(self, env: Envelope) -> bool:
-        """Queue the held REQUEST (its task already exists) and forget the hold, in one transaction; not if the
-        hold is gone (withdrawn meanwhile) or its task is closed."""
-        with self.tx() as db:
-            row = db.execute("SELECT t.status FROM held h JOIN tasks t ON t.task_id=h.task_id AND t.role='requester'"
-                             " WHERE h.task_id=?", (env.task_id,)).fetchone()
-            if row is None or row["status"] in TERMINAL_STATES:
-                db.execute("DELETE FROM held WHERE task_id=?", (env.task_id,))
-                return False
-            self._queue(db, env)                              # its task exists already: only the message is new
-            db.execute("UPDATE tasks SET request=?, updated_at=? WHERE task_id=? AND role='requester'",
-                       (json.dumps(env.body, ensure_ascii=False), now_iso(), env.task_id))
-            db.execute("DELETE FROM held WHERE task_id=?", (env.task_id,))
-        return True
-
-    def drop_held(self, task_id: str) -> bool:
-        return self.db.execute("DELETE FROM held WHERE task_id=?", (task_id,)).rowcount == 1
-
-    def held_ids(self) -> set[str]:
-        return {r[0] for r in self.db.execute("SELECT task_id FROM held")}
-
-    def claim_nudge(self, task_id: str, now: str, cutoff: str) -> bool:
-        """Take the nudge window of a requested task: True for one caller only (no nudge since `cutoff`)."""
-        cur = self.db.execute("UPDATE tasks SET nudged_at=? WHERE task_id=? AND role='requester'"
-                              " AND (nudged_at IS NULL OR nudged_at < ?)", (now, task_id, cutoff))
         return cur.rowcount == 1
 
     def brain_session(self, local_agent: str, project: str | None) -> str | None:
@@ -796,7 +684,7 @@ class Ledger:
         """Apply a state transition. Terminal states are sticky unless ``force``. Returns False if refused.
 
         ``queue``: a message announcing this transition, put in the outbox in the *same* transaction, so a
-        crash can never leave a finished task whose RESULT was not queued (found by A:codex).
+        crash can never leave a finished task whose RESULT was not queued.
         """
         with self.tx() as db:
             row = db.execute("SELECT status FROM tasks WHERE task_id=? AND role=?", (task_id, role)).fetchone()

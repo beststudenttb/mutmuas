@@ -1,5 +1,8 @@
 """Long jobs (D-050): a task registers a background job, waits (WAITING) without being treated as failed, and the
-node's heartbeat wakes the post when the job ends (process gone, or done-file there)."""
+node's heartbeat wakes the post when the job ends (process gone, or done-file there).
+
+A wake-up lost to a crash between "job ended" and "wake" is made up at restart, once; a task that
+reported BLOCKED while its job ran is laid out again too."""
 
 from __future__ import annotations
 
@@ -122,7 +125,7 @@ async def test_a_restart_leaves_a_waiting_task_alone(tmp_path):
 
 
 def test_the_resumed_worker_is_told_how_its_jobs_ended(tmp_path):
-    from test_staff_v4 import _claude_ctx
+    from test_worker_setup import _claude_ctx
 
     from mutmuas.runtime import worker_prompt
     _, ctx, _ = _claude_ctx(tmp_path)
@@ -220,4 +223,89 @@ async def test_cancelling_a_waiting_task_stops_its_job_and_nothing_wakes_later(t
         assert "T-j" not in daemon._queued["B:desk"]
     finally:
         job.kill()
+        ledger.close()
+
+
+def _crashed_after_job_end(ledger, task_id="T-j", claim=None):
+    """The state a crash leaves between _check_jobs' end_job and _wake_for_job: every job ended, task WAITING."""
+    owned_task(ledger, task_id, "WAITING", claim=claim, ingest=True)
+    job_id = ledger.add_job(task_id, "B:desk", None, None, "/tmp/train.done", "/tmp/train.log", "training")
+    ledger.end_job(job_id, "done-file /tmp/train.done appeared: '0'")
+
+
+def _wake_notes(ledger, task_id="T-j"):
+    return [m for m in ledger.thread(task_id) if "background job ended" in ((m.get("body") or {}).get("message") or "")]
+
+
+async def test_a_workers_lost_wake_up_is_made_up_at_restart_once(tmp_path):
+    _, ledger, daemon = _node(tmp_path)
+    _crashed_after_job_end(ledger)
+    try:
+        await daemon.recover()
+        await daemon.recover()                               # a second restart, or the scan run again
+        await daemon._check_jobs()
+        task = ledger.task("T-j", "owner")
+        assert task["status"] == "ACCEPTED" and "T-j" in daemon._queued["B:desk"]
+        assert daemon._queues["B:desk"].qsize() == 1 and len(_wake_notes(ledger)) == 1
+    finally:
+        ledger.close()
+
+
+async def test_a_sessions_lost_wake_up_is_made_up_at_restart_once(tmp_path):
+    _, ledger, daemon = _node(tmp_path, mode="interactive")
+    _crashed_after_job_end(ledger)
+    try:
+        await daemon.recover()
+        await daemon.recover()
+        notes = await tools.inbox(daemon.hub, "B:desk", types=tools.WAKE)
+        assert [n["task_id"] for n in notes] == ["T-j"] and "background job ended" in notes[0]["body"]["message"]
+        assert ledger.task("T-j", "owner")["status"] == "RUNNING"
+    finally:
+        ledger.close()
+
+
+async def test_an_auto_worker_is_woken_not_handed_its_in_progress_draft(tmp_path):
+    """Before: recover() took the WAITING task for an ordinary crashed run and delivered the worker's draft."""
+    _, _, ledger, _, daemon = auto_worker_node(tmp_path)
+    _crashed_after_job_end(ledger, claim="worker")
+    ledger.update_task("T-j", "owner", result_draft={"status": "partial", "summary": "training runs"})
+    try:
+        await daemon.recover()
+        task = ledger.task("T-j", "owner")
+        assert task["status"] == "ACCEPTED" and task["result"] is None and "T-j" in daemon._queued["B:desk"]
+    finally:
+        ledger.close()
+
+
+async def test_job_end_wakes_a_blocked_worker_task(tmp_path):
+    _, ledger, daemon = _node(tmp_path)
+    owned_task(ledger, "T-j", "RUNNING", ingest=True)
+    job = Orphan("import time; time.sleep(60)")
+    await tools.add_job(daemon.hub, "B:desk", "T-j", pid=job.pid, note="training")
+    await daemon.hub.owner_transition("T-j", "BLOCKED", "also needs a dataset")   # what report_progress(BLOCKED) does
+    assert ledger.jobs("T-j")
+    try:
+        job.terminate()
+        job.wait(5)
+        await daemon._check_jobs()
+        assert ledger.jobs("T-j") == []
+        task = ledger.task("T-j", "owner")
+        assert "T-j" in daemon._queued["B:desk"], task["status"]
+    finally:
+        ledger.close()
+
+
+async def test_named_next_wakes_a_blocked_worker_task_with_a_job(tmp_path):
+    """_wake_task ends the jobs, hands over to _wake_for_job, and that goes to _settle while still BLOCKED."""
+    _, ledger, daemon = _node(tmp_path)
+    owned_task(ledger, "T-j", "RUNNING", ingest=True)
+    job = Orphan("import time; time.sleep(60)")
+    await tools.add_job(daemon.hub, "B:desk", "T-j", pid=job.pid, note="training")
+    await daemon.hub.owner_transition("T-j", "BLOCKED", "needs an answer")
+    try:
+        await daemon._wake_task(ledger.task("T-j", "owner"), "named next")
+        assert ledger.jobs("T-j") == []                 # the wait was ended ...
+        assert "T-j" in daemon._queued["B:desk"], ledger.task("T-j", "owner")["status"]   # ... so it must run
+    finally:
+        job.terminate()
         ledger.close()

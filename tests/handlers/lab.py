@@ -69,7 +69,8 @@ elif action == "experiment":
         out = Path.cwd() / f"{task['task_id']}-metrics.json"
         out.write_text(json.dumps({"losses": losses, "seed": inputs.get("seed", 0)}))
         ref = await tools.publish_artifact(hub, me, str(out), id="METRICS")
-        await tools.submit_result(hub, me, "complete", f"ran {steps} steps", outputs={"final_loss": losses[-1]},
+        await tools.submit_result(hub, me, "complete", f"ran {steps} steps",
+                                  outputs={"final_loss": losses[-1], "told": task.get("interrupts", [])},
                                   artifacts=[ref], evidence=[f"{len(losses)} loss values recorded"])
 
     asyncio.run(with_hub(run))
@@ -130,6 +131,16 @@ elif action == "block_only":
         await tools.report_progress(hub, me, "need the dataset path from the requester", state="BLOCKED")
 
     asyncio.run(with_hub(run))
+
+elif action == "block_once":
+    # Blocked until the requester has answered (the test creates inputs["flag"]), then done.
+    if not Path(inputs["flag"]).exists():
+        async def run(hub):
+            await tools.report_progress(hub, me, "need the dataset path from the requester", state="BLOCKED")
+
+        asyncio.run(with_hub(run))
+    else:
+        print(json.dumps({"status": "complete", "summary": "unblocked"}))
 
 elif action == "evil_commit":
     # A hostile agent: commit, then plant an fsmonitor and hooks in its

@@ -11,8 +11,7 @@ import pytest
 import yaml
 from conftest import auto_worker_node, owned_task
 
-from mutmuas import node as node_module
-from mutmuas import tools
+from mutmuas import node as node_module, tools
 from mutmuas.protocol import Envelope, request_body
 from mutmuas.runtime import RunOutcome, worker_prompt
 
@@ -106,13 +105,13 @@ async def test_ordinary_mail_does_not_interrupt(tmp_path, blocking):
         ledger.close()
 
 
-async def test_high_priority_with_interrupt_stops_whatever_the_post_runs(tmp_path, blocking):
-    """A new instruction (not about the running task) marked interrupt: the running task is laid out again."""
+async def test_a_trusted_controller_interrupts_a_running_task_someone_else_requested(tmp_path, blocking):
+    """D-089: the secretary stops a run of a task A:sender asked for; the next run gets its message first."""
     agent, _, ledger, hub, daemon = _node(tmp_path)
     owned_task(ledger, "T-r", "ACCEPTED", ingest=True)
     runner = await _running(daemon, agent, "T-r")
     try:
-        await _deliver(daemon, agent, _update("T-other", sender="B:secretary", priority="high", interrupt=True))
+        await _deliver(daemon, agent, _update("T-r", sender="B:secretary", priority="high", interrupt=True))
         await asyncio.wait_for(blocking.started.wait(), 5)
         assert "stop using the old environment" in worker_prompt(blocking.runs[1])
     finally:
@@ -210,9 +209,6 @@ async def test_an_interrupted_brain_run_is_resumed_in_the_same_conversation(tmp_
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
         ledger.close()
-
-
-# --------------------------------------------------------------------------- Codex review of 9f39ff0
 
 
 async def test_stopping_a_run_stops_its_whole_process_group_and_frees_its_lock(tmp_path):
@@ -341,26 +337,6 @@ async def test_a_job_ending_while_paused_leaves_the_task_paused(tmp_path):
         ledger.close()
 
 
-async def test_a_held_child_is_paused_and_not_sent_until_resumed(tmp_path):
-    from mutmuas.protocol import result_body
-    agent, _, ledger, hub, daemon = _node(tmp_path)
-    owned_task(ledger, "T-p", "RUNNING", ingest=True)
-    dep = await tools.send_request(hub, "B:desk", "C:far", "train", "dep", parent_task="T-x")
-    held = await tools.send_request(hub, "B:desk", "C:rl", "evaluate", "after", parent_task="T-p",
-                                    depends_on=[dep["task_id"]])
-    try:
-        await _deliver(daemon, agent, _update("T-p", pause=True))
-        await daemon._on_reply(Envelope(type="RESULT", sender="C:far", to="B:desk", task_id=dep["task_id"],
-                                        body=result_body("complete", "trained")))
-        await daemon._release_held()
-        assert not [e for e in ledger.outbox() if e.task_id == held["task_id"] and e.type == "REQUEST"]
-        await _deliver(daemon, agent, _update("T-p", resume=True))
-        await daemon._release_held()
-        assert [e for e in ledger.outbox() if e.task_id == held["task_id"] and e.type == "REQUEST"]
-    finally:
-        ledger.close()
-
-
 async def test_only_trusted_addresses_interrupt_and_priority_is_no_permission(tmp_path, blocking):
     agent, _, ledger, hub, daemon = _node(tmp_path)
     owned_task(ledger, "T-r", "ACCEPTED", ingest=True)
@@ -411,9 +387,6 @@ async def test_a_restart_stops_the_old_worker_of_a_paused_task(tmp_path):
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
         ledger.close()
-
-
-# --------------------------------------------------------------------------- Codex re-review of cb77a33
 
 
 async def test_a_resume_while_the_pause_is_being_published_still_lays_the_task_out(tmp_path, monkeypatch):
@@ -485,19 +458,6 @@ async def test_a_trusted_update_reaches_an_old_worker_after_a_restart(tmp_path, 
         await _deliver(daemon, agent, _update("T-r", sender="B:secretary"))       # about the task it runs
         assert stopped == [12345] and "T-r" in daemon._queued["B:desk"]
         assert ledger.task("T-r", "owner")["interrupts"]
-    finally:
-        ledger.close()
-
-
-async def test_a_trusted_interrupt_of_the_post_reaches_its_old_workers(tmp_path, old_worker):
-    stopped, _ = old_worker
-    agent, _, ledger, hub, daemon = _node(tmp_path)
-    owned_task(ledger, "T-r", "RUNNING", claim="worker", ingest=True)
-    ledger.set_runner_pid("T-r", 12345, "synthetic-start")
-    try:
-        await daemon.recover()
-        await _deliver(daemon, agent, _update("T-other", sender="B:secretary", interrupt=True))
-        assert stopped == [12345] and "T-r" in daemon._queued["B:desk"]
     finally:
         ledger.close()
 
@@ -599,9 +559,6 @@ def test_group_states_reads_this_systems_ps():
     finally:
         child.kill()
         child.wait()
-
-
-# --------------------------------------------------------------------------- Codex third review (7a109df)
 
 
 async def test_a_group_left_by_a_failed_stop_is_watched_after_its_leader_ends(tmp_path, monkeypatch):
@@ -743,9 +700,6 @@ async def test_a_command_that_exits_without_reading_its_stdin_is_not_a_runtime_e
     assert outcome.exit_code == 0
 
 
-# --------------------------------------------------------------------------- Codex fourth review (a41498e)
-
-
 async def test_a_run_that_fails_with_an_io_error_and_cannot_be_stopped_is_watched(tmp_path, monkeypatch):
     import sys
     from mutmuas import runtime
@@ -829,3 +783,244 @@ async def test_a_runner_cancelled_as_its_run_ends_stops_instead_of_waiting_forev
         outer["runner"].cancel()
         await asyncio.gather(outer["runner"], return_exceptions=True)
         ledger.close()
+
+
+async def test_an_interrupt_reaches_the_live_worker_of_a_waiting_task(tmp_path, old_worker):  # noqa: F811
+    stopped, _ = old_worker
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-r", "WAITING", claim="worker", ingest=True)        # it reported WAITING, still runs
+    ledger.set_runner_pid("T-r", 12345, "synthetic-start")
+    ledger.update_task("T-r", "owner", attempts=2)
+    try:
+        await _deliver(daemon, agent, _update("T-r", sender="B:secretary", interrupt=True))
+        assert stopped == [12345] and "T-r" in daemon._queued["B:desk"]
+        assert ledger.task("T-r", "owner")["attempts"] == 0                  # the next run starts afresh
+    finally:
+        ledger.close()
+
+
+async def test_a_paused_pending_task_stays_paused_after_a_restart(tmp_path):
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-r", "PENDING", claim="worker", ingest=True)
+    ledger.update_task("T-r", "owner", paused=1)
+    try:
+        await daemon._recover_auto(ledger.task("T-r", "owner"))
+        task = ledger.task("T-r", "owner")
+        assert task["status"] == "WAITING" and task["paused"] and "T-r" not in daemon._queued["B:desk"]
+    finally:
+        ledger.close()
+
+
+def _requester_node(tmp_path):
+    """A:main on its own node (no bus): what it sends stays in its outbox, from where the test delivers it."""
+    from mutmuas.config import AgentConfig, NodeConfig
+    from mutmuas.hub import Hub
+    from mutmuas.ledger import Ledger
+    cfg = NodeConfig(project="p", node="A", data_dir=str(tmp_path / "A"),
+                     agents=[AgentConfig(id="main", mode="interactive")]).validate()
+    ledger = Ledger(cfg.db_path)
+    return ledger, Hub(cfg, None, ledger)
+
+
+async def test_the_requester_pauses_resumes_and_interrupts_with_control_task(tmp_path, blocking):
+    agent, cfg, ledger, hub, daemon = _node(tmp_path)
+    cfg.trusted_controllers = ["A:main"]
+    a_ledger, a_hub = _requester_node(tmp_path)
+
+    def sent(type_):
+        return [e for e in a_ledger.outbox() if e.type == type_][-1]
+    task_id = (await tools.send_request(a_hub, "A:main", "B:desk", "train it", "test"))["task_id"]
+    await _deliver(daemon, agent, sent("REQUEST"))
+    runner = await _running(daemon, agent, task_id)
+    try:
+        await tools.control_task(a_hub, "A:main", task_id, "pause", "hold on")
+        await _deliver(daemon, agent, sent("UPDATE"))
+        await _settle(lambda: ledger.task(task_id, "owner")["status"] == "WAITING")
+        assert ledger.task(task_id, "owner")["paused"]
+        await tools.control_task(a_hub, "A:main", task_id, "resume", "go on")
+        await _deliver(daemon, agent, sent("UPDATE"))
+        await asyncio.wait_for(blocking.started.wait(), 5)
+        blocking.started.clear()
+        await tools.control_task(a_hub, "A:main", task_id, "interrupt", "use env v2")
+        await _deliver(daemon, agent, sent("UPDATE"))
+        await asyncio.wait_for(blocking.started.wait(), 5)
+        assert len(blocking.runs) == 3 and "use env v2" in worker_prompt(blocking.runs[-1])
+        with pytest.raises(ValueError):
+            await tools.control_task(a_hub, "A:main", task_id, "stop", "x")
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        ledger.close()
+        a_ledger.close()
+
+
+async def test_control_task_interrupt_does_not_hit_someone_elses_running_task(tmp_path, blocking):
+    agent, cfg, ledger, hub, daemon = _node(tmp_path)
+    cfg.trusted_controllers = ["A:main"]
+    a_ledger, a_hub = _requester_node(tmp_path)
+    owned_task(ledger, "T-y", "ACCEPTED", ingest=True)            # another requester's task, running now
+    runner = await _running(daemon, agent, "T-y")
+    try:
+        x = (await tools.send_request(a_hub, "A:main", "B:desk", "my task", "test"))["task_id"]
+        await _deliver(daemon, agent, [e for e in a_ledger.outbox() if e.type == "REQUEST"][-1])
+        await asyncio.sleep(0.2)
+        n = len(blocking.runs)
+        await tools.control_task(a_hub, "A:main", x, "interrupt", "use env v2")
+        await _deliver(daemon, agent, [e for e in a_ledger.outbox() if e.type == "UPDATE"][-1])
+        await asyncio.sleep(0.5)
+        y = ledger.task("T-y", "owner")
+        xr = ledger.task(x, "owner")
+        assert xr.get("interrupts"), "A:main's message never reached its own task X"
+        assert not y.get("interrupts"), f"T-y was interrupted by A:main's control of {x}: {y.get('interrupts')}"
+        assert len(blocking.runs) == n
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        ledger.close()
+        a_ledger.close()
+
+
+async def test_untrusted_requester_cannot_interrupt(tmp_path, blocking):
+    agent, cfg, ledger, hub, daemon = _node(tmp_path)              # trusts only B:secretary
+    a_ledger, a_hub = _requester_node(tmp_path)
+    x = (await tools.send_request(a_hub, "A:main", "B:desk", "my task", "test"))["task_id"]
+    await _deliver(daemon, agent, [e for e in a_ledger.outbox() if e.type == "REQUEST"][-1])
+    runner = await _running(daemon, agent, x)
+    try:
+        await tools.control_task(a_hub, "A:main", x, "interrupt", "stop")
+        await _deliver(daemon, agent, [e for e in a_ledger.outbox() if e.type == "UPDATE"][-1])
+        await asyncio.sleep(0.5)
+        assert len(blocking.runs) == 1 and not ledger.task(x, "owner").get("interrupts")
+        assert ledger.task(x, "owner")["status"] in ("ACCEPTED", "RUNNING")
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        ledger.close()
+        a_ledger.close()
+
+
+def test_a_script_worker_finds_the_interrupt_in_its_task_json(tmp_path):
+    from mutmuas.runtime import TaskContext
+    agent, cfg, ledger, hub, daemon = _node(tmp_path)
+    request = owned_task(ledger, "T-r", "ACCEPTED", ingest=True)
+    try:
+        ctx = TaskContext("T-r", request, agent, cfg, 1, interrupts=["UPDATE from B:secretary on T-r: use env v2"])
+        assert ctx.payload()["interrupts"] == ["UPDATE from B:secretary on T-r: use env v2"]
+    finally:
+        ledger.close()
+
+
+async def test_trusted_controller_interrupting_another_requesters_queued_task_hits_only_it(tmp_path, blocking):
+    """B:secretary (trusted) marks interrupt on T-x (someone else's task of the post, not running) while T-y runs."""
+    agent, cfg, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-y", "ACCEPTED", ingest=True)
+    owned_task(ledger, "T-x", "ACCEPTED", ingest=True)
+    runner = await _running(daemon, agent, "T-y")
+    try:
+        n = len(blocking.runs)
+        await _deliver(daemon, agent, _update("T-x", sender="B:secretary", interrupt=True))
+        await asyncio.sleep(0.5)
+        assert ledger.task("T-x", "owner").get("interrupts")
+        assert not ledger.task("T-y", "owner").get("interrupts")
+        assert len(blocking.runs) == n
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        ledger.close()
+
+
+async def test_control_task_interrupt_arriving_before_its_request_does_not_stop_the_post(tmp_path, blocking):
+    """The owner has no row for X yet (its REQUEST not delivered / still in an outbox): the residual post-level branch."""
+    agent, cfg, ledger, hub, daemon = _node(tmp_path)
+    cfg.trusted_controllers = ["A:main"]
+    a_ledger, a_hub = _requester_node(tmp_path)
+    owned_task(ledger, "T-y", "ACCEPTED", ingest=True)
+    runner = await _running(daemon, agent, "T-y")
+    try:
+        x = (await tools.send_request(a_hub, "A:main", "B:desk", "my task", "test"))["task_id"]
+        n = len(blocking.runs)
+        await tools.control_task(a_hub, "A:main", x, "interrupt", "use env v2")
+        await _deliver(daemon, agent, [e for e in a_ledger.outbox() if e.type == "UPDATE"][-1])  # REQUEST not yet
+        await asyncio.sleep(0.5)
+        y = ledger.task("T-y", "owner")
+        assert not y.get("interrupts"), f"T-y was interrupted by A:main's control of {x}: {y.get('interrupts')}"
+        assert len(blocking.runs) == n
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        ledger.close()
+        a_ledger.close()
+
+
+class _NoBus:
+    connected = False
+
+
+def _controller_node(tmp_path, monkeypatch, owner="B:desk"):
+    """C:secretary on its own node, which took part in nothing: it finds a task's owner in the shared record."""
+    from mutmuas.config import AgentConfig, NodeConfig
+    from mutmuas.hub import Hub
+    from mutmuas.ledger import Ledger
+    cfg = NodeConfig(project="p", node="C", data_dir=str(tmp_path / "C"),
+                     agents=[AgentConfig(id="secretary", mode="interactive")]).validate()
+    ledger = Ledger(cfg.db_path)
+    hub = Hub(cfg, _NoBus(), ledger)
+
+    async def record(task_id, _owner):
+        return {"task_id": task_id, "owner": owner, "requester": "A:sender"}
+    monkeypatch.setattr(hub, "_remote_task", record)
+    return ledger, hub
+
+
+async def test_the_secretary_controls_a_task_another_post_asked_for(tmp_path, monkeypatch, blocking):
+    """The D-089 case: A:sender asked B:desk; the secretary, trusted on B, pauses, resumes and interrupts that
+    task; another task of the post is not touched."""
+    agent, cfg, ledger, hub, daemon = _node(tmp_path)
+    cfg.trusted_controllers = ["C:secretary"]
+    s_ledger, s_hub = _controller_node(tmp_path, monkeypatch)
+    owned_task(ledger, "T-r", "ACCEPTED", ingest=True)
+    owned_task(ledger, "T-y", "ACCEPTED", ingest=True)
+
+    async def control(action, text):
+        await tools.control_task(s_hub, "C:secretary", "T-r", action, text)
+        await _deliver(daemon, agent, [e for e in s_ledger.outbox() if e.type == "UPDATE"][-1])
+    runner = await _running(daemon, agent, "T-r")
+    try:
+        await control("pause", "the GPU is needed")
+        await _settle(lambda: ledger.task("T-r", "owner")["status"] == "WAITING")
+        assert ledger.task("T-r", "owner")["paused"]
+        await control("resume", "go on")
+        await asyncio.wait_for(blocking.started.wait(), 5)
+        blocking.started.clear()
+        await control("interrupt", "use env v2")
+        await asyncio.wait_for(blocking.started.wait(), 5)
+        runs = [ctx for ctx in blocking.runs if ctx.task_id == "T-r"]
+        assert len(runs) == 3 and "use env v2" in worker_prompt(runs[-1])
+        assert not ledger.task("T-y", "owner").get("interrupts")
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        ledger.close()
+        s_ledger.close()
+
+
+async def test_a_control_from_a_stranger_is_ignored_and_logged(tmp_path, monkeypatch, blocking, caplog):
+    agent, cfg, ledger, hub, daemon = _node(tmp_path)               # trusts only B:secretary
+    s_ledger, s_hub = _controller_node(tmp_path, monkeypatch)        # C:secretary: neither trusted nor requester
+    owned_task(ledger, "T-r", "ACCEPTED", ingest=True)
+    runner = await _running(daemon, agent, "T-r")
+    try:
+        for action in ("pause", "interrupt"):
+            await tools.control_task(s_hub, "C:secretary", "T-r", action, "stop it")
+            env = [e for e in s_ledger.outbox() if e.type == "UPDATE"][-1]
+            ledger.ingest(env)
+            assert await daemon._handle(agent, env) == "rejected"
+        await asyncio.sleep(0.3)
+        task = ledger.task("T-r", "owner")
+        assert len(blocking.runs) == 1 and not task["paused"] and not task.get("interrupts")
+        assert "ignored a control from C:secretary" in caplog.text
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        ledger.close()
+        s_ledger.close()

@@ -166,7 +166,7 @@ mutually trusted machines of one lab.
 - **Honesty is structural.** `RESULT.status ∈ {complete, partial, failed}` is validated, and the daemon
   never upgrades a result.
 - **Observable by construction.** Every task has a thread (`agentctl task <id>`), a shared record
-  (`agentctl tasks --all`), a raw audit trail (`agentctl history`) and run logs.
+  (`agentctl tasks --all`) and run logs.
 
 ## 9. Replaceability
 

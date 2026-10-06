@@ -91,23 +91,6 @@ def duplicate_notice(addr: str, holder: int) -> dict[str, Any]:
             "meta": {"session": "duplicate", "holder_pid": str(holder)}}
 
 
-SUB_TOOLS = {"report_progress", "submit_result", "add_job"}
-
-
-def internal_subtask(cfg: NodeConfig, task_id: str | None) -> bool:
-    """Is this the worker of an internal subtask (D-073)? From the owner's ledger: the task it was started for, or
-    the process tree (it descends from a sub's recorded worker process), whatever the caller's binding says."""
-    from .ledger import Ledger
-    ledger = Ledger(cfg.db_path)
-    try:
-        task = ledger.task(task_id, "owner") if task_id else None
-        if ((task or {}).get("request") or {}).get("internal"):
-            return True
-        return tools.internal_caller(Hub(cfg, None, ledger)) is not None
-    finally:
-        ledger.close()
-
-
 def holds_session(agent, worker_task: str | None) -> bool:
     """Does this MCP server beat as the agent's session (and so hold its lease)? A session of an interactive
     agent does; a worker's task does not (decided by the config and by how the daemon started it, not by an
@@ -126,12 +109,7 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         me = os.getpid()
         while True:
             holder = hub.ledger.session_claim(addr, me, os.getcwd(), session_alive, session_pid=os.getppid())
-            if holder == -1 and state.get("duplicate_of") != holder:
-                state["duplicate_of"] = holder
-                await push_now({"content": f"mutmuas: {addr} is being retired (agent-node retire-agent): this "
-                                           "session gets no mail and must not act as it.",
-                                "meta": {"session": "retired"}})
-            elif holder != me and state.get("duplicate_of") != holder:
+            if holder != me and state.get("duplicate_of") != holder:
                 state["duplicate_of"] = holder
                 await push_now(duplicate_notice(addr, holder))
             elif holder == me:
@@ -190,7 +168,6 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
 
     server = MCPServer("mutmuas", instructions=INSTRUCTIONS, lifespan=lifespan)
     register = server.tool
-    sub = internal_subtask(cfg, worker_task)
 
     def guarded_tool(*dargs, **dkw):
         """Every tool but whoami first checks that this session holds the agent (one agent, one session), and
@@ -207,8 +184,6 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
                 except Exception as e:
                     logging.getLogger(__name__).warning("tool %s failed: %r", fn.__name__, e)
                     return dump({"error": f"{type(e).__name__}: {e}"})
-            if sub and fn.__name__ not in SUB_TOOLS:
-                return fn                    # an internal subtask's worker sees no mail and sends none (D-073)
             return register(*dargs, **dkw)(checked)
         return wrap
     server.tool = guarded_tool
@@ -245,22 +220,18 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
                            timeout_s: float | None = None, artifacts: list[dict[str, Any]] | None = None,
                            priority: str = "normal", reply: str = "required", deadline: str | None = None,
                            observers: list[str] | None = None, leader: bool = False,
-                           project: str | None = None, internal: bool = False, model: str | None = None,
-                           depends_on: list[str] | None = None) -> str:
+                           project: str | None = None) -> str:
         """Delegate a task to another agent. kind: query | artifact | experiment | code.
         project: the project the work belongs to (the recipient works in its directory for it); default: theirs.
-        internal: a long piece of your own work for your worker (to = yourself; never your session; it gets only
-        report_progress/submit_result/add_job; model defaults to the latest Sonnet). Wait with add_job(children=True).
-        depends_on: task ids it needs first: it is held here and sent, with their results, once they are done.
         leader: true only when the leader asked for this task (it goes first in their queue).
         reply: required (the default: they owe you a RESULT) | none (a notice; closed once they read it).
-        deadline: ISO time with timezone by which you need the reply; overdue replies are followed up.
+        deadline: when you need the reply, from now (+2h, +1d); overdue replies are followed up.
         Returns a task_id; the message is durable even if the target is offline."""
         return dump(await tools.send_request(
             hub(), state["me"], to, objective, reason, kind=kind, inputs=inputs, expected_outputs=expected_outputs,
             constraints=constraints, acceptance_criteria=acceptance_criteria, timeout_s=timeout_s,
             artifacts=artifacts, priority=priority, reply=reply, deadline=deadline, observers=observers,
-            leader=leader, project=project, internal=internal, model=model, depends_on=depends_on))
+            leader=leader, project=project))
 
     @server.tool()
     async def check_task(task_id: str) -> str:
@@ -308,7 +279,7 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
 
     @server.tool()
     async def remind_me(at: str, text: str, every: str | None = None) -> str:
-        """Come back to something later: at (ISO time with timezone, or +10m / +2h) the node puts the text into
+        """Come back to something later: at (+10m / +2h / +1d from now) the node puts the text into
         your inbox, which wakes you like new mail (and waits there if no session runs). every (e.g. "5h") repeats
         it until cancel_reminder. Use it instead of promising to "check again in a while"."""
         return dump(await tools.remind_me(hub(), state["me"], at, text, every=every, task_id=worker_task))
@@ -327,8 +298,8 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
 
     @server.tool()
     async def accept_task(task_id: str, eta: str | None = None) -> str:
-        """Accept a task that was sent to you (interactive agents). eta: when you expect to deliver (ISO time with
-        timezone); the requester's node reminds you once it passes and asks for a new one."""
+        """Accept a task that was sent to you (interactive agents). eta: when you expect to deliver, from now
+        (+2h, +1d); the requester's node reminds you once it passes and asks for a new one."""
         return dump(await tools.accept_task(hub(), state["me"], task_id, eta=eta))
 
     @server.tool()
@@ -340,15 +311,9 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
     async def report_progress(message: str, task_id: str | None = None, state_: str | None = None,
                               next: str | None = None, eta: str | None = None) -> str:
         """Tell the requester about progress on a task you own. state_: RUNNING | WAITING | BLOCKED.
-        next: the address whose move it is now (wakes them). eta: a new estimate (ISO time with timezone),
+        next: the address whose move it is now (wakes them). eta: a new estimate from now (+2h, +1d),
         e.g. when you were reminded that the old one passed."""
         return dump(await tools.report_progress(hub(), state["me"], message, task_id, state_, next=next, eta=eta))
-
-    @server.tool()
-    async def nudge(task_id: str, note: str = "") -> str:
-        """Remind the owner of a task you requested that seems stuck: it is woken and must answer what it does,
-        where it is stuck and a new eta. At most once every few hours per task."""
-        return dump(await tools.nudge(hub(), state["me"], task_id, note))
 
     @server.tool()
     async def add_job(pid: int | None = None, done_file: str | None = None, log: str | None = None,
@@ -383,6 +348,14 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
     async def answer_question(task_id: str, answer: str, next: str | None = None) -> str:
         """Answer a QUESTION about a task."""
         return dump(await tools.answer(hub(), state["me"], task_id, answer, next=next))
+
+    @server.tool()
+    async def control_task(task_id: str, action: str, message: str) -> str:
+        """Pause, resume or interrupt one task; only that task is affected. action: pause | resume | interrupt.
+        pause stops its run and keeps it waiting until resume; interrupt stops its run (if it runs) and lays it
+        out again with your message first. Its requester may pause and resume it; an address in the owner node's
+        trusted_controllers (the secretary) may do all three on any task. Anything else is ignored there."""
+        return dump(await tools.control_task(hub(), state["me"], task_id, action, message))
 
     @server.tool()
     async def publish_artifact(path: str, description: str = "", backend: str = "object",
