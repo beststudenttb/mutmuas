@@ -11,7 +11,7 @@ import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from conftest import Orphan, auto_worker_node, owned_task
+from conftest import Orphan, auto_worker_node, backdate_deadline, owned_task
 
 from mutmuas import tools
 from mutmuas.protocol import Envelope, request_body, result_body
@@ -361,7 +361,8 @@ async def test_a_held_request_is_not_chased_and_gets_its_deadline_on_release(tmp
     _requested(ledger, "T-dep")
     try:
         held = await tools.send_request(hub, "B:desk", "C:far", "evaluate", "test", depends_on=["T-dep"],
-                                        deadline="2000-01-01T00:00:00+00:00")
+                                        deadline="+1h")
+        backdate_deadline(ledger, held["task_id"], "2000-01-01T00:00:00+00:00")
         quiet = await tools.send_request(hub, "B:desk", "C:far", "evaluate", "test", depends_on=["T-dep"])
         await daemon._follow_ups()
         await daemon._chase_etas()

@@ -311,7 +311,7 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         """Come back to something later: at (ISO time with timezone, or +10m / +2h) the node puts the text into
         your inbox, which wakes you like new mail (and waits there if no session runs). every (e.g. "5h") repeats
         it until cancel_reminder. Use it instead of promising to "check again in a while"."""
-        return dump(await tools.remind_me(hub(), state["me"], at, text, every=every))
+        return dump(await tools.remind_me(hub(), state["me"], at, text, every=every, task_id=worker_task))
 
     @server.tool()
     async def cancel_reminder(reminder: int) -> str:

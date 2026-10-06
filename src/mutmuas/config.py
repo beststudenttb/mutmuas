@@ -206,6 +206,8 @@ class NodeConfig:
     # A request that needs a reply but names no deadline gets this one (seconds from sending), so the overdue
     # follow-up can chase it (no-stall design, G3). 0 = no default.
     default_reply_deadline_s: float = 4 * 3600
+    # ... and for experiment and code requests, which take longer (D-098). 0 = the one above.
+    long_reply_deadline_s: float = 24 * 3600
     # Defaults for every worker run of this node (an agent's max_turns / max_cost_usd overrides them; D-066).
     # None = no limit. A run stopped at a limit without a result is a failed run (R5.4: run once more).
     worker_max_turns: int | None = None

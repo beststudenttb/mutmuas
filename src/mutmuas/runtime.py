@@ -286,7 +286,10 @@ Rules:
    PLAN.md what you wait for, and end this run without submit_result. You are started again when the job ends.
 8. Parts you delegate with send_request are this task's child tasks (parent_task is set for you). To wait for
    them, call add_job(children=True) and end this run without submit_result: you are started again once
-   each has a result, was refused or cancelled, or is past its deadline, and told how each ended.
+   each has a result, was refused or cancelled, or is past its deadline, and told how each ended. Wait on
+   children=True, not a done_file: nobody writes a done_file when a child task ends. You are also started
+   again when a child asks a question or reports it is blocked, when a message names you next, and when a
+   reminder you set comes due (the wait then ends: add the job again if you still wait).
 """
 
 

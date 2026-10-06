@@ -159,6 +159,17 @@ CREATE TABLE IF NOT EXISTS jobs (
 TASK_JSON_FIELDS = ("request", "result", "result_draft", "input_refs", "output_refs", "interrupts")
 
 
+# Informational inbound mail (D-098): an ACK, or an UPDATE that names nobody next and is none of the special kinds
+# (nudge, observer copy or grant, follow-up, an FYI copy to a node lead). It is read as it is handled, so it
+# never piles up as unread.
+INFO_KEYS = ("next", "nudge", "copy_of", "observers_add", "follow_up", "fyi")
+INFO_SQL = ("(type='ACK' OR (type='UPDATE' AND "
+            + " AND ".join(f"json_extract(envelope,'$.body.{k}') IS NULL" for k in INFO_KEYS) + "))")
+
+
+def is_info(env) -> bool:
+    return env.type == "ACK" or (env.type == "UPDATE" and not any(env.body.get(k) for k in INFO_KEYS))
+
 class Ledger:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -184,6 +195,7 @@ class Ledger:
         self._add_column("jobs", "children", "INTEGER NOT NULL DEFAULT 0")
         self._add_column("reminders", "every_s", "REAL")             # repeat after this many seconds
         self._add_column("reminders", "cancelled_at", "TEXT")
+        self._add_column("reminders", "task_id", "TEXT")             # set in a worker run: the task it wakes
         # D-073 batch 2: push state per message (spec §5.1), the owner's eta (D-076), the last nudge (requester
         # side), and a session that is online but takes no work (`off`)
         self._add_column("messages", "pushed", "INTEGER NOT NULL DEFAULT 0")
@@ -489,10 +501,11 @@ class Ledger:
     def mark_seen_before(self, local_agent: str, before_seq: int) -> list[Envelope]:
         """Mark everything up to a rowid as read (the session's explicit 'clear the backlog') that an inbox
         listing has shown: never mail the session has not seen (STANDARD item 8; Codex review of dfdd719).
+        Informational messages (ACKs, progress) are cleared whether listed or not (D-098).
         Returns what was marked, so receipts can follow."""
         with self.tx() as db:
             rows = db.execute("SELECT message_id, envelope FROM messages WHERE direction='in' AND local_agent=?"
-                              " AND seen=0 AND shown=1 AND state='handled' AND rowid <= ?",
+                              f" AND seen=0 AND (shown=1 OR {INFO_SQL}) AND state='handled' AND rowid <= ?",
                               (local_agent, before_seq)).fetchall()
             db.executemany("UPDATE messages SET seen=1 WHERE message_id=? AND direction='in'",
                            [(r["message_id"],) for r in rows])
@@ -522,16 +535,21 @@ class Ledger:
     def unshown_count(self, local_agent: str, before_seq: int) -> int:
         """Unread mail up to a rowid that no foreground inbox listing has shown (clear_inbox leaves it)."""
         return self.db.execute("SELECT COUNT(*) FROM messages WHERE direction='in' AND local_agent=? AND seen=0"
-                               " AND shown=0 AND state='handled' AND rowid <= ?",
+                               f" AND shown=0 AND NOT {INFO_SQL} AND state='handled' AND rowid <= ?",
                                (local_agent, before_seq)).fetchone()[0]
+
+    def mark_info_read(self, message_id: str) -> None:
+        """An informational message (ACK, progress) is read as it is handled: it does not count as unread."""
+        self.db.execute("UPDATE messages SET seen=1 WHERE message_id=? AND direction='in'", (message_id,))
 
     def record_published(self, uri: str, local_agent: str) -> None:
         self.db.execute("INSERT OR IGNORE INTO artifact_publishers (uri, local_agent, published_at) VALUES (?,?,?)",
                         (uri, local_agent, now_iso()))
 
-    def add_reminder(self, local_agent: str, due: str, text: str, every_s: float | None = None) -> int:
-        cur = self.db.execute("INSERT INTO reminders (local_agent, due, text, created_at, every_s) VALUES (?,?,?,?,?)",
-                              (local_agent, due, text, now_iso(), every_s))
+    def add_reminder(self, local_agent: str, due: str, text: str, every_s: float | None = None,
+                     task_id: str | None = None) -> int:
+        cur = self.db.execute("INSERT INTO reminders (local_agent, due, text, created_at, every_s, task_id)"
+                              " VALUES (?,?,?,?,?,?)", (local_agent, due, text, now_iso(), every_s, task_id))
         return cur.lastrowid
 
     def due_reminders(self, now: str) -> list[dict[str, Any]]:

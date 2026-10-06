@@ -55,8 +55,9 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                        leader: bool = False, project: str | None = None, internal: bool = False,
                        model: str | None = None, depends_on: list[str] | None = None) -> dict[str, Any]:
     default_deadline = None
+    deadline = _deadline(deadline)
     if not deadline and reply != "none" and not depends_on:      # a held request gets it when it is sent
-        default_deadline = default_reply_deadline(hub, timeout_s)
+        default_deadline = default_reply_deadline(hub, timeout_s, kind)
     body = request_body(objective, reason, kind=kind, inputs=inputs, expected_outputs=expected_outputs,
                         constraints=constraints, acceptance_criteria=acceptance_criteria,
                         deadline=deadline or default_deadline, timeout_s=timeout_s, reply=reply, observers=observers,
@@ -66,12 +67,37 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                                project=project, internal=internal, model=model, depends_on=depends_on)
 
 
-def default_reply_deadline(hub: Hub, timeout_s: float | None) -> str | None:
+LONG_KINDS = ("experiment", "code")       # their default deadline is long_reply_deadline_s (D-098)
+
+
+def _deadline(text: str | None) -> str | None:
+    """A deadline as given: an ISO time with timezone, or relative (+30m, +2h, +1d); one already past is refused
+    (D-098: it used to be taken and reported overdue at once)."""
+    if not text:
+        return None
+    now = datetime.now(timezone.utc)
+    if text.startswith("+") and (delay := _interval_s(text)) is not None:
+        return (now + timedelta(seconds=delay)).isoformat(timespec="seconds")
+    hint = f"deadline={text!r}: use an ISO time with timezone (e.g. 2026-10-07T18:00:00+09:00) or +30m / +2h / +1d"
+    try:
+        due = parse_iso(text)
+    except ValueError:
+        raise ValueError(hint) from None
+    if due.tzinfo is None:
+        raise ValueError(hint)
+    if due <= now:
+        raise ValueError(f"deadline {text} is in the past (now {now.isoformat(timespec='seconds')}); {hint}")
+    return text
+
+
+def default_reply_deadline(hub: Hub, timeout_s: float | None, kind: str | None = "query") -> str | None:
     if hub.cfg.default_reply_deadline_s > 0:
         # Without a deadline nothing ever chases a missing reply (no-stall design, G3): take the node's default,
         # but never before the task's own run limit plus a margin, or a long task would be chased while it
-        # still runs normally (C's review of 6a5e2f1).
+        # still runs normally (C's review of 6a5e2f1). Experiments and code get the longer default (D-098).
         wait_s = hub.cfg.default_reply_deadline_s
+        if kind in LONG_KINDS and hub.cfg.long_reply_deadline_s > 0:
+            wait_s = hub.cfg.long_reply_deadline_s
         if timeout_s:
             wait_s = max(wait_s, timeout_s + DEADLINE_MARGIN_S)
         return (datetime.now(timezone.utc) + timedelta(seconds=wait_s)).isoformat(timespec="seconds")
@@ -122,7 +148,8 @@ async def _send_request(hub: Hub, me: str, to: str, body: dict[str, Any], *, art
         parent_task=parent_task or _current_task(), priority=priority, hold_for=depends_on)
     out = {"task_id": task_id, "to": await hub.resolve(to), "delivery": delivery}
     if default_deadline:
-        out["note_deadline"] = (f"default deadline {default_deadline} (node.yaml default_reply_deadline_s); "
+        out["note_deadline"] = (f"default deadline {default_deadline} (node.yaml default_reply_deadline_s, "
+                                "long_reply_deadline_s for experiment/code); "
                                 "pass deadline= to set your own")
     if delivery == "queued":
         out["note"] = "message bus unreachable; kept in the local outbox and sent automatically on reconnect"
@@ -295,10 +322,12 @@ def _interval_s(text: str) -> float | None:
     return None
 
 
-async def remind_me(hub: Hub, me: str, at: str, text: str, every: str | None = None) -> dict[str, Any]:
+async def remind_me(hub: Hub, me: str, at: str, text: str, every: str | None = None,
+                    task_id: str | None = None) -> dict[str, Any]:
     """The node puts `text` into the agent's inbox at `at` (ISO time with timezone, or +30s/+10m/+2h) as a message
     that hands the agent the baton, so it wakes a session (channel push, Codex watch) and waits in the inbox while
-    none runs (D-066). every='5h' repeats it at that interval until cancel_reminder."""
+    none runs (D-066). every='5h' repeats it at that interval until cancel_reminder. task_id: the task a worker run
+    sets it for: a post with no session gets that task run again when it fires (D-098)."""
     addr, _ = hub.local_agent(me)
     every_s = None
     if every is not None:
@@ -316,7 +345,7 @@ async def remind_me(hub: Hub, me: str, at: str, text: str, every: str | None = N
         if due.tzinfo is None:
             raise ValueError(hint)
     due_iso = due.astimezone(timezone.utc).isoformat(timespec="milliseconds")
-    return {"reminder": hub.ledger.add_reminder(str(addr), due_iso, text, every_s), "due": due_iso,
+    return {"reminder": hub.ledger.add_reminder(str(addr), due_iso, text, every_s, task_id), "due": due_iso,
             "every_s": every_s}
 
 
