@@ -1,8 +1,6 @@
 """Example configs stay loadable; config errors are caught early; generated server config is valid."""
 
-import shutil
 import subprocess
-from pathlib import Path
 
 import pytest
 import yaml

@@ -5,16 +5,20 @@ directory to work/_archive/ untouched, and can be undone."""
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 import yaml
 from conftest import Orphan
 
+from mutmuas import runtime as runtime_module
 from mutmuas.config import load_config
 from mutmuas.ledger import Ledger
+from mutmuas.node import proc_start
 from mutmuas.protocol import Envelope, request_body
 from mutmuas.retire import retire, undo
+
 
 CONFIG = """# node C: issued by the secretary
 project: p
@@ -154,8 +158,6 @@ def test_agent_node_retire_agent_shows_the_plan_until_told_yes(node, capsys):
     assert "id: vision" in path.read_text() and post.is_dir()
 
 
-# --------------------------------------------------------------------------- Codex review of c46cfb9
-
 SMALL = """project: p
 node: C
 data_dir: ./data
@@ -279,9 +281,6 @@ def test_undo_with_dry_run_changes_nothing(tmp_path, bus, capsys):
     assert json.loads(capsys.readouterr().out)["dry_run"]
 
 
-# --------------------------------------------------------------------------- Codex re-review of f5d9ad5
-
-
 async def test_undo_is_refused_while_the_node_daemon_runs(tmp_path, bus):
     from mutmuas.node import daemon_lock
     path, post = _small(tmp_path)
@@ -305,9 +304,6 @@ async def test_a_daemon_that_fails_to_start_lets_go_of_its_lock(tmp_path):
         await daemon.run_forever()
     with daemon_lock(cfg):
         pass
-
-
-# --------------------------------------------------------------------------- Codex third review (88b6720)
 
 
 async def test_a_stop_cancelled_while_going_offline_still_lets_go_of_the_lock(tmp_path):
@@ -334,3 +330,22 @@ async def test_a_stop_cancelled_while_going_offline_still_lets_go_of_the_lock(tm
     with daemon_lock(cfg):
         pass
 
+
+async def test_retire_waits_for_a_stuck_process_group_of_a_finished_task(node, monkeypatch):  # noqa: F811
+    path, cfg, ledger, post = node
+    ledger.update_task("T-open", "owner", status="CANCELLED", stuck_pgid=12345)
+    monkeypatch.setattr(runtime_module, "group_alive", lambda pgid: pgid == 12345)
+    with pytest.raises(PermissionError, match="T-open"):
+        await retire(path, "vision")
+    assert "id: vision" in path.read_text() and post.is_dir()
+
+
+async def test_retire_waits_for_a_running_plain_worker(node):  # noqa: F811
+    path, cfg, ledger, post = node
+    run = Envelope(type="REQUEST", sender="C:lead", to="C:plain", task_id="T-run", body=request_body("run", "test"))
+    ledger.ingest(run)
+    ledger.create_owned_task(run)
+    ledger.update_task("T-run", "owner", status="RUNNING")
+    ledger.set_runner_pid("T-run", os.getpid(), proc_start(os.getpid()))   # mode: worker: no runner claim
+    with pytest.raises(PermissionError, match="worker is running"):
+        await retire(path, "plain")

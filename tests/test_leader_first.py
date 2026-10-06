@@ -38,7 +38,7 @@ async def test_a_workers_queue_takes_the_leaders_tasks_first(tmp_path):
 
 async def test_the_sessions_inbox_lists_the_leaders_mail_first(tmp_path):
     """The leader's mail first, then the newest (D-074), whether the session peeks or reads. A watcher's cursor
-    (since) keeps arrival order: its cursor is the last row (test_inbox_newest)."""
+    (since) keeps arrival order: its cursor is the last row (test_inbox)."""
     _, _, ledger, hub, _ = auto_worker_node(tmp_path)
     try:
         for task_id, leader in (("T-1", False), ("T-L", True), ("T-2", False)):

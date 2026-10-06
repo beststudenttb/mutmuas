@@ -74,7 +74,6 @@ async def test_g2_no_wake_for_a_notice_or_for_someone_elses_request(make_config,
     assert notice["task_id"] not in wake and other["task_id"] not in wake
 
 
-
 # C's review of 6a5e2f1 (T-20260927190001-fcb94ea4)
 
 async def test_g3_default_deadline_leaves_room_for_the_task_timeout(make_config, cluster):

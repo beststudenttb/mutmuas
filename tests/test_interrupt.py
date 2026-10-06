@@ -11,8 +11,7 @@ import pytest
 import yaml
 from conftest import auto_worker_node, owned_task
 
-from mutmuas import node as node_module
-from mutmuas import tools
+from mutmuas import node as node_module, tools
 from mutmuas.protocol import Envelope, request_body
 from mutmuas.runtime import RunOutcome, worker_prompt
 
@@ -212,9 +211,6 @@ async def test_an_interrupted_brain_run_is_resumed_in_the_same_conversation(tmp_
         ledger.close()
 
 
-# --------------------------------------------------------------------------- Codex review of 9f39ff0
-
-
 async def test_stopping_a_run_stops_its_whole_process_group_and_frees_its_lock(tmp_path):
     """A child in the run's process group that ignores SIGTERM and holds a (GPU-like) flock is killed too."""
     import fcntl
@@ -391,9 +387,6 @@ async def test_a_restart_stops_the_old_worker_of_a_paused_task(tmp_path):
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
         ledger.close()
-
-
-# --------------------------------------------------------------------------- Codex re-review of cb77a33
 
 
 async def test_a_resume_while_the_pause_is_being_published_still_lays_the_task_out(tmp_path, monkeypatch):
@@ -581,9 +574,6 @@ def test_group_states_reads_this_systems_ps():
         child.wait()
 
 
-# --------------------------------------------------------------------------- Codex third review (7a109df)
-
-
 async def test_a_group_left_by_a_failed_stop_is_watched_after_its_leader_ends(tmp_path, monkeypatch):
     live = {"leader": True, "group": True}
 
@@ -723,9 +713,6 @@ async def test_a_command_that_exits_without_reading_its_stdin_is_not_a_runtime_e
     assert outcome.exit_code == 0
 
 
-# --------------------------------------------------------------------------- Codex fourth review (a41498e)
-
-
 async def test_a_run_that_fails_with_an_io_error_and_cannot_be_stopped_is_watched(tmp_path, monkeypatch):
     import sys
     from mutmuas import runtime
@@ -808,4 +795,30 @@ async def test_a_runner_cancelled_as_its_run_ends_stops_instead_of_waiting_forev
     finally:
         outer["runner"].cancel()
         await asyncio.gather(outer["runner"], return_exceptions=True)
+        ledger.close()
+
+
+async def test_an_interrupt_of_the_post_reaches_the_live_worker_of_a_waiting_task(tmp_path, old_worker):  # noqa: F811
+    stopped, _ = old_worker
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-r", "WAITING", claim="worker", ingest=True)        # it reported WAITING, still runs
+    ledger.set_runner_pid("T-r", 12345, "synthetic-start")
+    ledger.update_task("T-r", "owner", attempts=2)
+    try:
+        await _deliver(daemon, agent, _update("T-other", sender="B:secretary", interrupt=True))
+        assert stopped == [12345] and "T-r" in daemon._queued["B:desk"]
+        assert ledger.task("T-r", "owner")["attempts"] == 0                  # the next run starts afresh
+    finally:
+        ledger.close()
+
+
+async def test_a_paused_pending_task_stays_paused_after_a_restart(tmp_path):
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-r", "PENDING", claim="worker", ingest=True)
+    ledger.update_task("T-r", "owner", paused=1)
+    try:
+        await daemon._recover_auto(ledger.task("T-r", "owner"))
+        task = ledger.task("T-r", "owner")
+        assert task["status"] == "WAITING" and task["paused"] and "T-r" not in daemon._queued["B:desk"]
+    finally:
         ledger.close()

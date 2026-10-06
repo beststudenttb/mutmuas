@@ -238,8 +238,6 @@ async def _pushed(notes, task_id):
     return next((n for n in notes if n["meta"].get("task_id") == task_id), None)
 
 
-# ---- A:codex review of the lease (dfacc41): reproduced first, then fixed ----
-
 def test_codex_lease_claim_has_no_race(tmp_path, monkeypatch):
     """Two processes claiming at once must not both end up holding the agent."""
     import threading

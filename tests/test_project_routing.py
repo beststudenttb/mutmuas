@@ -155,9 +155,6 @@ async def test_the_worker_picks_up_other_projects_work_left_pending(tmp_path, se
         ledger.close()
 
 
-# --------------------------------------------------------------------------- Codex light review of fe64cee
-
-
 async def test_without_a_worker_a_project_session_still_sees_and_takes_other_projects_work(tmp_path, session):
     """auto_worker off: nobody else would take it, so it is neither filtered from the session nor left hidden."""
     agent, ledger, hub, daemon = _node(tmp_path)
