@@ -260,11 +260,11 @@ There are four layers (`src/mutmuas/visibility.py`):
   `add_observer`.
   - Observers receive FYI copies of the REQUEST and RESULT. The copies never wake them.
   - Each copy lists the task's participants. The observer's node keeps a copy only if both the sender and
-    the recipient are on that list.
+    the recipient are on that list, and the sender is the task's requester or owner: from its own records, or
+    from the shared task record, which the requester's node writes before it sends the copies (D-102).
   - Every other participant is told `observers_add`, so the requester's side also forwards a later RESULT.
 - A worker's `notify` lead gets the status layer only: task id, a short objective, status.
 - Artifacts: the object store keeps no description (it travels in the participants' ArtifactRef).
-- A session started outside its workdir is reported to the agent and to the coordinators, not on the card.
 - **Not a security boundary.** Every process holding the node credential can still read:
   - the message stream;
   - the object-store bytes;

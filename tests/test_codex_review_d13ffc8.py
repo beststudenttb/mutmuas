@@ -62,7 +62,7 @@ def test_existing_observer_cannot_send_task_content_copy_directly(tmp_path):
         },
     )
     try:
-        assert daemon._on_observer_copy(direct_copy) == "rejected"
+        assert asyncio.run(daemon._on_observer_copy(direct_copy)) == "rejected"
         assert not is_participant(ledger, "A:peer", request.task_id)
     finally:
         ledger.close()

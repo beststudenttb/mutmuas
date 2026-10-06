@@ -6,6 +6,7 @@ are deliberately small and do not require a running NATS server.
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
 import sys
 
@@ -69,7 +70,7 @@ def test_observer_copy_requires_sender_in_persisted_acl(tmp_path):
             },
         )
 
-        assert daemon._on_observer_copy(forged_copy) == "rejected"
+        assert asyncio.run(daemon._on_observer_copy(forged_copy)) == "rejected"
         assert not is_participant(ledger, "A:peer", request.task_id)
     finally:
         ledger.close()

@@ -205,3 +205,25 @@ async def test_codex_shared_records_hold_only_the_agreed_fields(make_config, clu
                "accepts_kinds", "state", "availability", "session", "session_seen", "heartbeat_s", "last_heartbeat"}
     for card in (await bus.kv_all(bus.names.agents_kv)).values():
         assert set(card) <= allowed, set(card) - allowed
+
+
+async def test_the_requester_writes_the_task_record_before_its_observer_copies(tmp_path, monkeypatch):
+    """D-102: an observer's node checks a copy against the shared task record as it arrives, so the requester's
+    node writes that record before the copies go out (no waiting and retrying for the owner's record)."""
+    from conftest import auto_worker_node
+    agent, cfg, ledger, hub, daemon = auto_worker_node(tmp_path)
+    order = []
+
+    async def record(task_id, role="owner"):
+        order.append(("record", role))
+
+    async def send(env):
+        order.append(("send", env.to))
+        return "sent"
+    monkeypatch.setattr(hub, "publish_task_record", record)
+    monkeypatch.setattr(hub, "send", send)
+    try:
+        await tools.send_request(hub, "B:desk", "C:far", "x", "y", observers=["D:watch"])
+        assert order == [("send", "C:far"), ("record", "requester"), ("send", "D:watch")]
+    finally:
+        ledger.close()

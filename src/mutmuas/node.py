@@ -407,7 +407,7 @@ class NodeDaemon:
         # wakes once all are done), not pause/resume/interrupt
         if env.type not in ("REQUEST", "RESULT") and env.body.get("next") == env.to and not env.body.get("fyi") \
                 and not any(env.body.get(k) for k in ("pause", "resume", "interrupt")) \
-                and state not in ("rejected", "dropped", "unverified"):
+                and state not in ("rejected", "dropped"):
             what = env.body.get("question") or env.body.get("reason") or env.body.get("answer") \
                 or env.body.get("message") or ""
             await self._wake_named(env.to, env.task_id, f"{env.type} from {env.sender} on {env.task_id}: "
@@ -465,7 +465,7 @@ class NodeDaemon:
 
     async def _handle_message(self, agent: AgentConfig, env: Envelope) -> str | None:
         if env.type == "UPDATE" and env.body.get("copy_of"):
-            return self._on_observer_copy(env)
+            return await self._on_observer_copy(env)
         if env.type == "UPDATE" and env.body.get("observers_add"):
             return self._on_observers_added(env)
         if env.type == "UPDATE" and env.body.get("nudge"):
@@ -481,12 +481,12 @@ class NodeDaemon:
         else:
             return await self._on_reply(env)
 
-    def _on_observer_copy(self, env: Envelope) -> str | None:
+    async def _on_observer_copy(self, env: Envelope) -> str | None:
         """A copy of a task's REQUEST or RESULT for an observer. Who takes part is never taken from the copy
-        itself:
-        - this node knows the task: the sender must be in the persisted ACL, else rejected;
-        - this node has never heard of it (a cross-node observer): kept unverified, not shown, until the shared
-          task record names the sender as its requester or owner (_verify_observer_copy)."""
+        itself: the sender must be the task's requester or owner, from this node's records when it knows the task,
+        else from the shared task record. That record is written before the copies are sent (hub.copy_to_observers),
+        so it is there when a copy arrives (D-102). It is a consistency check, not an authorisation boundary: any
+        node credential can write the task KV (D-008)."""
         copy = env.body.get("copy_of") or {}
         if copy.get("type") not in ("REQUEST", "RESULT") or not copy.get("from") or not copy.get("to"):
             return "rejected"
@@ -496,54 +496,17 @@ class NodeDaemon:
         if env.sender not in people or env.to not in people:
             log.warning("dropped observer copy %s: sender or recipient not in its participant list", env.short())
             return "rejected"
-        known = acl(self.hub.ledger, env.task_id)
-        if known:
+        if acl(self.hub.ledger, env.task_id):
             row = self.hub.ledger.task(env.task_id)        # every row of a task has the same requester/owner
-            if env.sender not in (row["requester"], row["owner"]):
-                # Content copies come from the requester or owner only; an observer's grant is relayed by the owner, so
-                # an observer never authors one.
-                log.warning("dropped observer copy %s: %s is not the task's requester or owner", env.short(),
-                            env.sender)
-                return "rejected"
-            self._record_copy(env, row["requester"], row["owner"])
-            return None
-        self._background_job(self._verify_observer_copy(env))
-        return "unverified"
-
-    def _still_unverified(self, message_id: str) -> bool:
-        return self.hub.ledger.inbound_state(message_id) in (None, "new", "unverified")
-
-    # The copy and the owner's task record travel separately, so the record may not be there yet: look again with
-    # growing gaps, then every last gap until it appears.
-    VERIFY_BACKOFF_S = (0.05, 0.2, 1, 3, 10, 30)
-
-    async def _verify_observer_copy(self, env: Envelope) -> None:
-        """Accept a copy about a task this node does not know only if the shared task record (written by the
-        owner's node) names its sender as requester or owner. That is a consistency check, not an authorisation
-        boundary: any node credential can write the task KV (step 2, D-008). A few tries with growing gaps; if
-        the record is still not there, the copy is recorded as a failure and dropped (D-040)."""
-        record = None
-        for gap in (0, *self.VERIFY_BACKOFF_S):
-            await asyncio.sleep(gap)
-            if not self.hub.bus or (gap and not self._still_unverified(env.message_id)):
-                return                                     # no bus, or decided elsewhere (a second verifier)
-            try:
-                record = await self.hub._remote_task(env.task_id, None)
-            except Exception as e:
-                self._failed("observer-copy", e, address=env.to, task_id=env.task_id)
-            if record:
-                break
-        if not record:
-            self._failed("observer-copy", "no task record names its sender; dropped", address=env.to,
-                         task_id=env.task_id)
-            self.hub.ledger.mark_handled(env.message_id, "dropped")
-            return
-        if env.sender not in (record.get("requester"), record.get("owner")):
-            log.warning("dropped observer copy %s: the task record does not name %s", env.short(), env.sender)
-            self.hub.ledger.mark_handled(env.message_id, "rejected")
-            return
-        self._record_copy(env, record["requester"], record["owner"])
-        self.hub.ledger.mark_handled(env.message_id, "handled")
+        else:
+            row = await self.hub._remote_task(env.task_id, None) if self.hub.bus else None
+        # content copies come from the requester or owner only; an observer's grant is relayed by the owner
+        if not row or env.sender not in (row.get("requester"), row.get("owner")):
+            log.warning("dropped observer copy %s: no record names %s its requester or owner", env.short(),
+                        env.sender)
+            return "rejected"
+        self._record_copy(env, row["requester"], row["owner"])
+        return None
 
     def _record_copy(self, env: Envelope, requester: str, owner: str) -> None:
         """The observer's own row: requester and owner from our records or the task record, never from the

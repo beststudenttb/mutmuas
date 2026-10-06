@@ -41,43 +41,6 @@ def _request(task_id: str = "T-review") -> Envelope:
     )
 
 
-async def test_unknown_observer_copy_is_retried_when_task_record_arrives(tmp_path, monkeypatch):
-    """A normal REQUEST/copy/KV race must not strand the observer copy forever."""
-    _, ledger, hub, daemon = _local_stack(tmp_path, "peer")
-    hub.bus = object()  # the verifier only needs to know that a shared bus exists
-    copy = Envelope(
-        type="UPDATE",
-        sender="A:main",
-        to="A:peer",
-        task_id="T-late-record",
-        body={
-            "message": "observer copy",
-            "fyi": True,
-            "participants": ["A:main", "A:peer", "B:desk"],
-            "copy_of": _request("T-late-record").to_dict(),
-        },
-    )
-    ledger.ingest(copy)
-    calls = 0
-
-    async def task_record_after_first_lookup(task_id, owner):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            return None
-        return {"task_id": task_id, "requester": "A:main", "owner": "B:desk"}
-
-    monkeypatch.setattr(hub, "_remote_task", task_record_after_first_lookup)
-    try:
-        assert daemon._on_observer_copy(copy) == "unverified"
-        await asyncio.sleep(0.2)
-
-        assert calls >= 2
-        assert is_participant(ledger, "A:peer", copy.task_id)
-    finally:
-        ledger.close()
-
-
 async def test_observer_can_add_observer_on_a_new_node(make_config, cluster):
     """The protocol allows any participant, including an observer, to add another observer."""
     a = make_config("A", [interactive("main")])
@@ -120,7 +83,7 @@ def test_observer_copy_still_requires_recipient_in_participant_list(tmp_path):
         },
     )
     try:
-        assert daemon._on_observer_copy(malformed) == "rejected"
+        assert asyncio.run(daemon._on_observer_copy(malformed)) == "rejected"
         assert not is_participant(ledger, "A:peer", request.task_id)
     finally:
         ledger.close()
