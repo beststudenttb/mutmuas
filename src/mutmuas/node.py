@@ -287,10 +287,11 @@ class NodeDaemon:
                 lock.__exit__(None, None, None)
         log.info("node %s stopped", self.cfg.node)
 
-    async def run_forever(self) -> None:
+    async def run_forever(self, stop: asyncio.Event | None = None) -> None:
+        """Run until `stop` is set (forever without one). A failed start is cleaned up too: its lock let go."""
         try:
-            await self.start()          # a failed start is cleaned up too: its lock let go
-            await asyncio.Event().wait()
+            await self.start()
+            await (stop or asyncio.Event()).wait()
         finally:
             await self.stop()
 
@@ -472,8 +473,9 @@ class NodeDaemon:
             await self._wake_for_job(task, jobs[-1], ended)
         elif task["status"] in ("BLOCKED", "WAITING"):
             hub.ledger.update_task(task_id, "owner", attempts=0)
-            await hub.owner_transition(task_id, "ACCEPTED", f"woken: {why}")
-            self._enqueue(task["owner"], task_id)
+            if task["status"] == "BLOCKED":            # _settle leaves BLOCKED alone: being named next lifts it
+                await hub.owner_transition(task_id, "ACCEPTED", f"woken: {why}")
+            await self._settle(task_id, f"woken: {why}")
 
     async def _handle_message(self, agent: AgentConfig, env: Envelope) -> str | None:
         if env.type == "UPDATE" and env.body.get("copy_of"):
@@ -481,7 +483,7 @@ class NodeDaemon:
         if env.type == "UPDATE" and env.body.get("observers_add"):
             return self._on_observers_added(env)
         if env.type == "UPDATE" and env.body.get("nudge"):
-            self._on_nudge(agent, env)                   # then kept in the inbox below: it wakes the session
+            await self._on_nudge(env)                    # then kept in the inbox below: it wakes the session
         if env.type in ("UPDATE", "ANSWER") and (kind := self._interrupt_kind(env)):
             await self._control(agent, env, kind)        # then kept in the inbox below like any message
         if env.type == "REQUEST":
@@ -1090,8 +1092,7 @@ class NodeDaemon:
         agent = self._agent_cfg(owner)
         if agent.mode == "worker" or (agent.auto_worker and task.get("runner") != "session"):
             hub.ledger.update_task(task_id, "owner", attempts=0)
-            await hub.owner_transition(task_id, "ACCEPTED", text)
-            self._enqueue(owner, task_id)
+            await self._settle(task_id, text)            # laid out again, a fresh run
             return
         # A session: a note in its own inbox that hands it the baton (next), which wakes it like a REQUEST. The task
         # leaves WAITING first, so recover() cannot wake it a second time.
@@ -1171,17 +1172,12 @@ class NodeDaemon:
                                              kind: True, "leader": bool(env.body.get("leader")),
                                              "next": child["owner"]}))
 
-    def _on_nudge(self, agent: AgentConfig, env: Envelope) -> None:
-        """An eta chase (D-076): a worker's task that is neither running nor queued is
-        laid out again (a stalled worker); a session is woken by the message itself (next)."""
+    async def _on_nudge(self, env: Envelope) -> None:
+        """An eta chase (D-076): a worker's task that should be under way is settled again, so a stalled one (neither
+        running nor queued) is laid out again; a session is woken by the message itself (next)."""
         task = self.hub.ledger.task(env.task_id, "owner")
-        if (not task or env.sender != task["requester"] or task["status"] not in ("ACCEPTED", "RUNNING")
-                or not (agent.mode == "worker" or agent.auto_worker) or task.get("runner") == "session"):
-            return
-        if env.task_id in self._queued.get(task["owner"], set()) or same_process(task.get("runner_pid"),
-                                                                                   task.get("runner_start")):
-            return
-        self._enqueue(task["owner"], env.task_id)
+        if task and env.sender == task["requester"] and task["status"] in ("ACCEPTED", "RUNNING"):
+            await self._settle(env.task_id, "chased: laid out again")
 
     async def _chase_etas(self) -> None:
         """催办 (D-076): a request of ours whose owner's eta has passed gets one reminder that asks for a new eta;

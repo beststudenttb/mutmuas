@@ -41,11 +41,6 @@ def status_layer(record: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def observer_role(agent: str) -> str:
-    """Task-row role for an observer (one row per observing agent: the table's key is (task_id, role))."""
-    return f"observer:{agent}"
-
-
 def acl(ledger: Ledger, task_id: str) -> set[str]:
     """Who takes part in a task, from what this node persisted about it: requester, owner, the observers
     listed on the request, and agents holding an observer row. Never inferred from who sent mail on it."""

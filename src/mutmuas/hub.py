@@ -463,14 +463,6 @@ def drop_section_line(text: str, heading: str, task_id: str) -> str:
     return text
 
 
-def mark_plan_line(text: str, task_id: str, marker: str, note: str | None = None) -> str:
-    """The first checklist line naming task_id gets the marker ([>] [x] [!] ...) and, if given, a note."""
-    pattern = re.compile(rf"^(\s*[-*]\s*)\[[ >xw!]\](.*\b{re.escape(task_id)}\b.*?)(\s+— .*)?$", re.M)
-    note = " ".join(str(note).split())[:200] if note else ""
-    return pattern.sub(lambda m: f"{m.group(1)}[{marker}]{m.group(2)}" + (f" — {note}" if note else ""), text,
-                       count=1)
-
-
 _HEADING = re.compile(r" {0,3}(#{1,6})(?:\s|$)")
 _FENCE = re.compile(r" {0,3}(```|~~~)")
 

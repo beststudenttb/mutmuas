@@ -459,10 +459,6 @@ class Ledger:
                                [(r["message_id"],) for r in rows])
         return [Envelope.from_json(r["envelope"]) for r in rows]
 
-    def inbound_in_state(self, state: str) -> list[Envelope]:
-        return [Envelope.from_json(r["envelope"]) for r in
-                self.db.execute("SELECT envelope FROM messages WHERE direction='in' AND state=?", (state,))]
-
     def unshown_count(self, local_agent: str, before_seq: int) -> int:
         """Unread mail up to a rowid that no foreground inbox listing has shown (clear_inbox leaves it)."""
         return self.db.execute("SELECT COUNT(*) FROM messages WHERE direction='in' AND local_agent=? AND seen=0"
