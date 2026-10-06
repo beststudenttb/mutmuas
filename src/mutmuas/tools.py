@@ -434,16 +434,24 @@ CONTROLS = ("pause", "resume", "interrupt")
 
 
 async def control_task(hub: Hub, me: str, task_id: str, action: str, message: str) -> dict[str, Any]:
-    """Pause, resume or interrupt a task I requested (D-089): an UPDATE to its owner about that task, which is the
-    only one it affects. The owner's node decides what it may do: pause and resume for the requester, interrupt
-    only for an address in its trusted_controllers."""
+    """Pause, resume or interrupt one task (D-089): an UPDATE about it to its owner, which affects that task only.
+    From its requester it goes the usual way; from anyone else (a trusted controller such as the secretary, on a
+    task other posts asked for) to the owner the shared task record names. The owner's node decides: pause and
+    resume for the requester or a trusted controller, interrupt for a trusted controller only; anything else
+    from a stranger is ignored there."""
     if action not in CONTROLS:
         raise ValueError(f"action={action!r}: one of {', '.join(CONTROLS)}")
     addr, _ = hub.local_agent(me)
-    task = hub.ledger.task(task_id, "requester")
-    if task is None or task["local_agent"] != str(addr):
-        raise PermissionError(f"{addr} did not request {task_id}: only its requester controls it")
-    delivery = await hub.reply(me, task_id, "UPDATE", {"message": message, action: True})
+    body = {"message": message, action: True}
+    asked = hub.ledger.task(task_id, "requester")
+    if asked and asked["local_agent"] == str(addr):
+        delivery = await hub.reply(me, task_id, "UPDATE", body)
+    else:
+        record = await hub._remote_task(task_id, None) if hub.bus else None
+        if not record:
+            raise KeyError(f"unknown task {task_id}: no shared task record names its owner")
+        delivery = await hub.send(Envelope(type="UPDATE", sender=str(addr), to=record["owner"], task_id=task_id,
+                                           body=body))
     return {"task_id": task_id, "action": action, "delivery": delivery}
 
 

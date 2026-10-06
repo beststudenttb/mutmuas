@@ -351,10 +351,10 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
 
     @server.tool()
     async def control_task(task_id: str, action: str, message: str) -> str:
-        """Pause, resume or interrupt a task you requested; only that task is affected. action: pause |
-        resume | interrupt. pause stops its run and keeps it waiting until resume; interrupt stops its run (if it
-        runs) and lays it out again with your message first (only if the owner's node trusts you:
-        trusted_controllers; otherwise the message just reaches the owner)."""
+        """Pause, resume or interrupt one task; only that task is affected. action: pause | resume | interrupt.
+        pause stops its run and keeps it waiting until resume; interrupt stops its run (if it runs) and lays it
+        out again with your message first. Its requester may pause and resume it; an address in the owner node's
+        trusted_controllers (the secretary) may do all three on any task. Anything else is ignored there."""
         return dump(await tools.control_task(hub(), state["me"], task_id, action, message))
 
     @server.tool()

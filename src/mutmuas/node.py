@@ -486,6 +486,13 @@ class NodeDaemon:
             await self._on_nudge(env)                    # then kept in the inbox below: it wakes the session
         if env.type in ("UPDATE", "ANSWER") and (kind := self._interrupt_kind(env)):
             await self._control(agent, env, kind)        # then kept in the inbox below like any message
+        elif env.type == "UPDATE" and any(env.body.get(k) for k in ("pause", "resume", "interrupt")):
+            task = self.hub.ledger.task(env.task_id, "owner")
+            if not task or env.sender != task["requester"]:
+                # a control from someone neither trusted here nor its requester: not acted on, not shown (D-089)
+                log.warning("ignored a control from %s on %s: not trusted here and not its requester", env.sender,
+                            env.task_id)
+                return "rejected"
         if env.type == "REQUEST":
             return await self._on_request(agent, env)
         elif env.type == "CANCEL":
@@ -1120,24 +1127,14 @@ class NodeDaemon:
         return None
 
     async def _control(self, agent: AgentConfig, env: Envelope, kind: str) -> None:
-        """D-089 pause / resume / interrupt, in one place: the wish goes into the ledger (paused, and the message for
-        the next run), the run doing the task is stopped, and _settle decides the rest from the ledger. A control acts on
-        its own task only; interrupt: true stops every task the post runs only when it comes from the owner of a task
-        the post asked for (a trusted controller's word). About a task this node does not know yet it does nothing."""
-        hub, addr = self.hub, env.to
-        text = f"{env.type} from {env.sender} on {env.task_id}: {short(env.body.get('message') or env.body.get('answer') or '', 400)}"
-        asked = hub.ledger.task(env.task_id, "requester")      # the post asked the sender for it: stop what it runs
-        if kind == "interrupt" and env.body.get("interrupt") and asked and asked["local_agent"] == addr \
-                and asked["owner"] == env.sender:
-            targets = [t["task_id"] for t in hub.ledger.tasks(role="owner", local_agent=addr,
-                                                              statuses=("ACCEPTED", "RUNNING", "WAITING"), limit=None)
-                       if t["task_id"] in self._running or self._old_worker(t)]
-        else:
-            targets = [env.task_id]
-        for task_id in targets:
-            task = hub.ledger.task(task_id, "owner")
-            if not task or task["owner"] != addr or task["status"] in TERMINAL_STATES:
-                continue
+        """D-089 pause / resume / interrupt of one task, in one place: the wish goes into the ledger (paused, and the
+        message for the next run), the run doing the task is stopped, and _settle decides the rest from the ledger.
+        It acts on the task it is about and on nothing else; about a task this node does not know yet it does
+        nothing."""
+        hub, addr, task_id = self.hub, env.to, env.task_id
+        text = f"{env.type} from {env.sender} on {task_id}: {short(env.body.get('message') or env.body.get('answer') or '', 400)}"
+        task = hub.ledger.task(task_id, "owner")
+        if task and task["owner"] == addr and task["status"] not in TERMINAL_STATES:
             if kind == "interrupt":
                 hub.ledger.update_task(task_id, "owner", attempts=0)       # the next run starts afresh
             else:

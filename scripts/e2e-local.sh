@@ -10,6 +10,7 @@
 #           -> it runs again and finishes
 #   TEST 4  A pauses and resumes B's experiment; interrupts its own task without touching another one running
 #           on the same post, and the next run gets the message (control_task)
+#   TEST 6  B:secretary, trusted on B, pauses and resumes a task it did not request (run before TEST 5)
 #   TEST 5  B retires its post B:data (daemon stopped) and undoes it
 #
 # Usage: scripts/e2e-local.sh [--keep]     (work dir: .local/e2e/, kept with --keep)
@@ -78,7 +79,7 @@ description: "GPU server (simulated)"
 data_dir: ./data
 heartbeat_s: 1
 resources: {gpu: {type: RTX4090, count: 2}}
-trusted_controllers: ["A:main"]
+trusted_controllers: ["A:main", "B:secretary"]
 nats: {servers: ["nats://127.0.0.1:$PORT"], credentials_file: ../server/B.env, tls_ca: ../server/tls/ca.crt}
 agents:
   - id: data
@@ -100,6 +101,11 @@ agents:
     capabilities: [isaac_lab, gpu_training]
     workdir: ./work/exp
     permissions: [READ, RUN_EXPERIMENT, PUBLISH_ARTIFACT, REQUEST_TASK]
+  - id: secretary
+    mode: interactive
+    role: secretary
+    workdir: ./work/secretary
+    permissions: [READ, REQUEST_TASK]
   - id: brain
     display: "B:c1"
     mode: interactive
@@ -138,6 +144,7 @@ async def main(cmd, task_id, *rest):
 asyncio.run(main(*sys.argv[1:-1]))
 PY
 ctl() { "$PY" "$W/ctl.py" "$@" "$W/A/node.yaml"; }
+ctl_b() { "$PY" "$W/ctl.py" "$@" "$W/B/node.yaml"; }     # as an agent of node B (CTL_AS)
 # wait_status <task> '<python condition on d (A's view)>' '<label>'
 wait_status() {
   for _ in $(seq 150); do
@@ -159,7 +166,7 @@ start_node B
 for _ in $(seq 50); do
   n=$("${AGENTCTL[@]}" agents --json --config "$W/A/node.yaml" 2>/dev/null \
       | json "sum(1 for a in d if a['online'])" 2>/dev/null || echo 0)
-  [ "$n" = "5" ] && break
+  [ "$n" = "6" ] && break
   sleep 0.2
 done
 "${AGENTCTL[@]}" status --config "$W/A/node.yaml"
@@ -247,6 +254,18 @@ RUNS=$(ls "$W/B/data/runs/" | grep -c "^$OTHER\..*\.log$")
 [ "$RUNS" = "1" ] && echo "PASS: the bystander ran once" || { echo "FAIL: bystander ran $RUNS times"; exit 1; }
 ctl wait "$MINE" \
   | check "d['result_status']=='complete' and any('use seed 9' in t for t in d['result']['outputs']['told'])" "the next run of the interrupted task got the message"
+
+step "TEST 6: B:secretary (trusted on B) pauses and resumes a task A:aux asked B for"
+OUT=$("${AGENTCTL[@]}" ask B:b1 "Another long run" --reason "secretary control" --kind experiment --as A:aux \
+  --input action=experiment --input steps=15 --input step_s=0.2 --json --config "$W/A/node.yaml")
+TASK6=$(echo "$OUT" | json "d['task_id']")
+CTL_AS=A:aux wait_status "$TASK6" "d['status']=='RUNNING'" "A:aux's experiment runs"
+CTL_AS=B:secretary ctl_b control "$TASK6" pause "the leader needs the GPU" >/dev/null
+CTL_AS=A:aux wait_status "$TASK6" "d['status']=='WAITING'" "paused by the secretary, who did not request it"
+CTL_AS=B:secretary ctl_b control "$TASK6" resume "go on" >/dev/null
+CTL_AS=A:aux ctl wait "$TASK6" \
+  | check "d['result_status']=='complete' and any('the leader needs the GPU' in t for t in d['result']['outputs']['told'])" \
+          "resumed and finished; the run after resume was told why it was paused"
 
 step "TEST 5: retire B:data (B's daemon stopped), then undo"
 kill "$PID_B"; wait "$PID_B" 2>/dev/null || true

@@ -105,15 +105,13 @@ async def test_ordinary_mail_does_not_interrupt(tmp_path, blocking):
         ledger.close()
 
 
-async def test_high_priority_with_interrupt_stops_whatever_the_post_runs(tmp_path, blocking):
-    """A new instruction (not about the running task) marked interrupt: the running task is laid out again."""
+async def test_a_trusted_controller_interrupts_a_running_task_someone_else_requested(tmp_path, blocking):
+    """D-089: the secretary stops a run of a task A:sender asked for; the next run gets its message first."""
     agent, _, ledger, hub, daemon = _node(tmp_path)
     owned_task(ledger, "T-r", "ACCEPTED", ingest=True)
     runner = await _running(daemon, agent, "T-r")
     try:
-        ledger.queue_outgoing(Envelope(type="REQUEST", sender="B:desk", to="B:secretary", task_id="T-other",
-                                       body={"objective": "o", "reason": "r"}))     # B:desk asked B:secretary for it
-        await _deliver(daemon, agent, _update("T-other", sender="B:secretary", priority="high", interrupt=True))
+        await _deliver(daemon, agent, _update("T-r", sender="B:secretary", priority="high", interrupt=True))
         await asyncio.wait_for(blocking.started.wait(), 5)
         assert "stop using the old environment" in worker_prompt(blocking.runs[1])
     finally:
@@ -464,21 +462,6 @@ async def test_a_trusted_update_reaches_an_old_worker_after_a_restart(tmp_path, 
         ledger.close()
 
 
-async def test_a_trusted_interrupt_of_the_post_reaches_its_old_workers(tmp_path, old_worker):
-    stopped, _ = old_worker
-    agent, _, ledger, hub, daemon = _node(tmp_path)
-    owned_task(ledger, "T-r", "RUNNING", claim="worker", ingest=True)
-    ledger.set_runner_pid("T-r", 12345, "synthetic-start")
-    try:
-        await daemon.recover()
-        ledger.queue_outgoing(Envelope(type="REQUEST", sender="B:desk", to="B:secretary", task_id="T-other",
-                                       body={"objective": "o", "reason": "r"}))     # B:desk asked B:secretary for it
-        await _deliver(daemon, agent, _update("T-other", sender="B:secretary", interrupt=True))
-        assert stopped == [12345] and "T-r" in daemon._queued["B:desk"]
-    finally:
-        ledger.close()
-
-
 async def test_a_stop_that_fails_is_not_reported_as_done(tmp_path, old_worker):
     stopped, state = old_worker
     state["stops"] = False
@@ -802,16 +785,14 @@ async def test_a_runner_cancelled_as_its_run_ends_stops_instead_of_waiting_forev
         ledger.close()
 
 
-async def test_an_interrupt_of_the_post_reaches_the_live_worker_of_a_waiting_task(tmp_path, old_worker):  # noqa: F811
+async def test_an_interrupt_reaches_the_live_worker_of_a_waiting_task(tmp_path, old_worker):  # noqa: F811
     stopped, _ = old_worker
     agent, _, ledger, hub, daemon = _node(tmp_path)
     owned_task(ledger, "T-r", "WAITING", claim="worker", ingest=True)        # it reported WAITING, still runs
     ledger.set_runner_pid("T-r", 12345, "synthetic-start")
     ledger.update_task("T-r", "owner", attempts=2)
     try:
-        ledger.queue_outgoing(Envelope(type="REQUEST", sender="B:desk", to="B:secretary", task_id="T-other",
-                                       body={"objective": "o", "reason": "r"}))     # B:desk asked B:secretary for it
-        await _deliver(daemon, agent, _update("T-other", sender="B:secretary", interrupt=True))
+        await _deliver(daemon, agent, _update("T-r", sender="B:secretary", interrupt=True))
         assert stopped == [12345] and "T-r" in daemon._queued["B:desk"]
         assert ledger.task("T-r", "owner")["attempts"] == 0                  # the next run starts afresh
     finally:
@@ -866,8 +847,6 @@ async def test_the_requester_pauses_resumes_and_interrupts_with_control_task(tmp
         assert len(blocking.runs) == 3 and "use env v2" in worker_prompt(blocking.runs[-1])
         with pytest.raises(ValueError):
             await tools.control_task(a_hub, "A:main", task_id, "stop", "x")
-        with pytest.raises(PermissionError):                       # the owner does not control its own task
-            await tools.control_task(hub, "B:desk", task_id, "pause", "x")
     finally:
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
@@ -971,3 +950,77 @@ async def test_control_task_interrupt_arriving_before_its_request_does_not_stop_
         await asyncio.gather(runner, return_exceptions=True)
         ledger.close()
         a_ledger.close()
+
+
+class _NoBus:
+    connected = False
+
+
+def _controller_node(tmp_path, monkeypatch, owner="B:desk"):
+    """C:secretary on its own node, which took part in nothing: it finds a task's owner in the shared record."""
+    from mutmuas.config import AgentConfig, NodeConfig
+    from mutmuas.hub import Hub
+    from mutmuas.ledger import Ledger
+    cfg = NodeConfig(project="p", node="C", data_dir=str(tmp_path / "C"),
+                     agents=[AgentConfig(id="secretary", mode="interactive")]).validate()
+    ledger = Ledger(cfg.db_path)
+    hub = Hub(cfg, _NoBus(), ledger)
+
+    async def record(task_id, _owner):
+        return {"task_id": task_id, "owner": owner, "requester": "A:sender"}
+    monkeypatch.setattr(hub, "_remote_task", record)
+    return ledger, hub
+
+
+async def test_the_secretary_controls_a_task_another_post_asked_for(tmp_path, monkeypatch, blocking):
+    """The D-089 case: A:sender asked B:desk; the secretary, trusted on B, pauses, resumes and interrupts that
+    task; another task of the post is not touched."""
+    agent, cfg, ledger, hub, daemon = _node(tmp_path)
+    cfg.trusted_controllers = ["C:secretary"]
+    s_ledger, s_hub = _controller_node(tmp_path, monkeypatch)
+    owned_task(ledger, "T-r", "ACCEPTED", ingest=True)
+    owned_task(ledger, "T-y", "ACCEPTED", ingest=True)
+
+    async def control(action, text):
+        await tools.control_task(s_hub, "C:secretary", "T-r", action, text)
+        await _deliver(daemon, agent, [e for e in s_ledger.outbox() if e.type == "UPDATE"][-1])
+    runner = await _running(daemon, agent, "T-r")
+    try:
+        await control("pause", "the GPU is needed")
+        await _settle(lambda: ledger.task("T-r", "owner")["status"] == "WAITING")
+        assert ledger.task("T-r", "owner")["paused"]
+        await control("resume", "go on")
+        await asyncio.wait_for(blocking.started.wait(), 5)
+        blocking.started.clear()
+        await control("interrupt", "use env v2")
+        await asyncio.wait_for(blocking.started.wait(), 5)
+        runs = [ctx for ctx in blocking.runs if ctx.task_id == "T-r"]
+        assert len(runs) == 3 and "use env v2" in worker_prompt(runs[-1])
+        assert not ledger.task("T-y", "owner").get("interrupts")
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        ledger.close()
+        s_ledger.close()
+
+
+async def test_a_control_from_a_stranger_is_ignored_and_logged(tmp_path, monkeypatch, blocking, caplog):
+    agent, cfg, ledger, hub, daemon = _node(tmp_path)               # trusts only B:secretary
+    s_ledger, s_hub = _controller_node(tmp_path, monkeypatch)        # C:secretary: neither trusted nor requester
+    owned_task(ledger, "T-r", "ACCEPTED", ingest=True)
+    runner = await _running(daemon, agent, "T-r")
+    try:
+        for action in ("pause", "interrupt"):
+            await tools.control_task(s_hub, "C:secretary", "T-r", action, "stop it")
+            env = [e for e in s_ledger.outbox() if e.type == "UPDATE"][-1]
+            ledger.ingest(env)
+            assert await daemon._handle(agent, env) == "rejected"
+        await asyncio.sleep(0.3)
+        task = ledger.task("T-r", "owner")
+        assert len(blocking.runs) == 1 and not task["paused"] and not task.get("interrupts")
+        assert "ignored a control from C:secretary" in caplog.text
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        ledger.close()
+        s_ledger.close()

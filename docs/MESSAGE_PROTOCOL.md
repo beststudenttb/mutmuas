@@ -108,15 +108,16 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
     may interrupt or pause any of its posts (at first only the secretary: the leader's word comes relayed by
     the secretary). Anyone else may pause and resume only a task it requested, sent to the address that owns
     it. `priority: high` and `leader: true` grant nothing: they only order what is allowed.
-  - Sent with the MCP tool `control_task(task_id, pause|resume|interrupt, message)`: an UPDATE from the task's
-    requester to its owner, so a trusted controller too controls the tasks it requested (the secretary relays
-    the leader's requests); it acts on that task only. A script worker finds the messages in its task JSON
-    (`interrupts`); an LLM worker's prompt starts with them.
+  - Sent with the MCP tool `control_task(task_id, pause|resume|interrupt, message)`: an UPDATE about that one
+    task to its owner. From the requester it goes the usual way; from anyone else (the secretary, on a task
+    another post asked for) to the owner the shared task record names. The owner's node acts on that task only
+    (there is no post-wide interrupt, D-102): pause and resume from its requester or a trusted controller,
+    interrupt from a trusted controller. A control from anyone else who is not its requester is not acted on
+    and not shown, only logged; an untrusted requester's interrupt reaches the owner as a plain message. A
+    script worker finds the messages in its task JSON (`interrupts`); an LLM worker's prompt starts with them.
   - An UPDATE or ANSWER from a trusted controller interrupts a worker in the middle of a run when it is about
-    the task that worker runs, or carries `interrupt: true`. About a task of the post, `interrupt: true` acts on
-    that task alone (its run is stopped if it runs; it is laid out again with the message either way). It stops
-    whatever the post runs only when it comes from the owner of a task the post asked for (the secretary, on a
-    task the post asked it for). An interrupt about a task the owner's node does not know yet (it came before
+    the task that worker runs, or carries `interrupt: true` (its run is stopped if it runs; it is laid out again
+    with the message either way). A control about a task the owner's node does not know yet (it came before
     the REQUEST) does nothing, and is not applied to that REQUEST when it arrives. The
     owner's node stops the run (the whole process group: what ignores SIGTERM gets SIGKILL), keeps the message
     on the task (`tasks.interrupts`) and lays the task out again; the next run's prompt starts with it, and a
