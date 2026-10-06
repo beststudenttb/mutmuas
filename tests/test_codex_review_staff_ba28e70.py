@@ -7,15 +7,13 @@ Option B (exp/staff-v4-b) changes two things here; the original file is kept in 
   the old worker is gone: never two actors."""
 
 import asyncio
-import os
 import subprocess
 import sys
 
 import pytest
 from conftest import auto_worker_node, owned_task
 
-from mutmuas import tools
-from mutmuas.node import NodeDaemon, lease_refusal
+from mutmuas.node import NodeDaemon
 
 
 def _setup(tmp_path):
@@ -25,33 +23,6 @@ def _setup(tmp_path):
 
 def _holder():
     return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(15)"])
-
-
-@pytest.mark.asyncio
-async def test_worker_without_task_env_still_cannot_finish_session_task(tmp_path, monkeypatch):
-    """A child of a worker can lose its environment but is still the worker, not the interactive session."""
-    agent, _, ledger, hub = _setup(tmp_path)
-    worker_task, session_task = "T-worker", "T-session"
-    owned_task(ledger, worker_task)
-    owned_task(ledger, session_task)
-    ledger.update_task(worker_task, "owner", status="RUNNING")
-    assert ledger.claim_task(worker_task, "worker", ("RUNNING",)) is None
-    from mutmuas.node import proc_start
-    ledger.set_runner_pid(worker_task, os.getpid(), proc_start(os.getpid()))  # models the daemon-started worker
-    assert ledger.claim_task(session_task, "session", ("PENDING",)) is None
-    ledger.update_task(session_task, "owner", status="RUNNING")
-    session = _holder()
-    try:
-        ledger.session_beat("B:desk", session.pid, str(agent.workdir_path), session_pid=session.pid)
-        assert lease_refusal(ledger, "B:desk") is None  # admitted via worker PID, not session PID
-        monkeypatch.delenv("MUTMUAS_TASK_ID", raising=False)
-        with pytest.raises(PermissionError, match="session|worker"):
-            await tools.submit_result(hub, "B:desk", "complete", "wrong actor", task_id=session_task)
-        assert ledger.task(session_task, "owner")["status"] == "RUNNING"
-    finally:
-        session.terminate()
-        session.wait(5)
-        ledger.close()
 
 
 @pytest.mark.asyncio

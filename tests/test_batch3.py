@@ -188,13 +188,13 @@ def _due_in_s(sent, ledger):
     return (parse_iso(deadline) - datetime.now(timezone.utc)).total_seconds()
 
 
-async def test_a_deadline_in_the_past_is_refused(tmp_path):
+async def test_a_deadline_is_given_from_now(tmp_path):
+    """D-102: only +N[smhd], so one in the past or without a timezone cannot be written."""
     agent, cfg, ledger, hub, daemon = auto_worker_node(tmp_path)
     try:
-        with pytest.raises(ValueError, match="past"):
-            await tools.send_request(hub, "B:desk", "C:far", "x", "y", deadline="2020-01-01T00:00:00+00:00")
-        with pytest.raises(ValueError, match="timezone"):
-            await tools.send_request(hub, "B:desk", "C:far", "x", "y", deadline="2099-01-01T00:00:00")
+        for bad in ("2020-01-01T00:00:00+00:00", "2099-01-01T00:00:00+00:00", "2099-01-01T00:00:00", "tomorrow"):
+            with pytest.raises(ValueError, match="from now"):
+                await tools.send_request(hub, "B:desk", "C:far", "x", "y", deadline=bad)
         assert ledger.tasks(role="requester") == []
     finally:
         ledger.close()

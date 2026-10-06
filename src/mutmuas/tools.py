@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import re
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -54,7 +55,7 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                        reply: str | None = None, observers: list[str] | None = None,
                        leader: bool = False, project: str | None = None) -> dict[str, Any]:
     default_deadline = None
-    deadline = _deadline(deadline)
+    deadline = from_now(deadline, "deadline")
     if not deadline and reply != "none":
         default_deadline = default_reply_deadline(hub, timeout_s, kind)
     body = request_body(objective, reason, kind=kind, inputs=inputs, expected_outputs=expected_outputs,
@@ -69,26 +70,23 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
 LONG_KINDS = ("experiment", "code")       # their default deadline is long_reply_deadline_s (D-098)
 
 
-def _deadline(text: str | None) -> str | None:
-    """A deadline as given: an ISO time with timezone, or relative (+30m, +2h, +1d); one already past is refused
-    (D-098: it used to be taken and reported overdue at once)."""
-    if not text:
+UNITS_S = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def _interval_s(text: str) -> float | None:
+    """'30s' / '10m' / '5h' / '1d' (a leading + is allowed) in seconds; None if it is not one."""
+    m = re.fullmatch(r"\+?(\d+(?:\.\d+)?)([smhd])", text or "")
+    return float(m[1]) * UNITS_S[m[2]] if m else None
+
+
+def from_now(text: str | None, field: str) -> str | None:
+    """A time given from now: +30s, +10m, +2h, +1d (more than zero), as an ISO time. The only way deadlines, etas
+    and reminders are written (D-102): one in the past, or without a timezone, cannot be given."""
+    if text is None:
         return None
-    now = datetime.now(timezone.utc)
-    if text.startswith("+") and (delay := _interval_s(text)) is not None:
-        if delay <= 0:
-            raise ValueError(f"deadline={text!r}: a relative deadline must be ahead (+30m, +2h, +1d)")
-        return (now + timedelta(seconds=delay)).isoformat(timespec="seconds")
-    hint = f"deadline={text!r}: use an ISO time with timezone (e.g. 2026-10-07T18:00:00+09:00) or +30m / +2h / +1d"
-    try:
-        due = parse_iso(text)
-    except ValueError:
-        raise ValueError(hint) from None
-    if due.tzinfo is None:
-        raise ValueError(hint)
-    if due <= now:
-        raise ValueError(f"deadline {text} is in the past (now {now.isoformat(timespec='seconds')}); {hint}")
-    return text
+    if not (text.startswith("+") and (delay := _interval_s(text))):
+        raise ValueError(f"{field}={text!r}: give it from now: +30m, +2h, +1d")
+    return (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat(timespec="seconds")
 
 
 def default_reply_deadline(hub: Hub, timeout_s: float | None, kind: str | None = "query") -> str | None:
@@ -287,18 +285,9 @@ async def clear_inbox(hub: Hub, me: str, before_seq: int) -> dict[str, Any]:
     return out
 
 
-def _interval_s(text: str) -> float | None:
-    """'30s' / '10m' / '5h' / '1d' (a leading + is allowed) in seconds; None if it is not one."""
-    text = text.lstrip("+")
-    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-    if text and text[-1] in units and text[:-1].replace(".", "", 1).isdigit():
-        return float(text[:-1]) * units[text[-1]]
-    return None
-
-
 async def remind_me(hub: Hub, me: str, at: str, text: str, every: str | None = None,
                     task_id: str | None = None) -> dict[str, Any]:
-    """The node puts `text` into the agent's inbox at `at` (ISO time with timezone, or +30s/+10m/+2h) as a message
+    """The node puts `text` into the agent's inbox at `at` (+30s/+10m/+2h from now) as a message
     that hands the agent the baton, so it wakes a session and waits in the inbox while
     none runs (D-066). every='5h' repeats it at that interval until cancel_reminder. task_id: the task a worker run
     sets it for: a post with no session gets that task run again when it fires (D-098)."""
@@ -308,16 +297,7 @@ async def remind_me(hub: Hub, me: str, at: str, text: str, every: str | None = N
         every_s = _interval_s(every)
         if not every_s:
             raise ValueError(f"every={every!r}: use an interval like 30m, 5h or 1d")
-    if (delay := _interval_s(at)) is not None and at.startswith("+"):
-        due = datetime.now(timezone.utc) + timedelta(seconds=delay)
-    else:
-        hint = f"at={at!r}: use an ISO time with timezone (e.g. 2026-09-25T18:00:00+09:00) or +30s / +10m / +2h"
-        try:
-            due = parse_iso(at)
-        except ValueError:
-            raise ValueError(hint) from None
-        if due.tzinfo is None:
-            raise ValueError(hint)
+    due = parse_iso(from_now(at, "at"))
     due_iso = due.astimezone(timezone.utc).isoformat(timespec="milliseconds")
     return {"reminder": hub.ledger.add_reminder(str(addr), due_iso, text, every_s, task_id), "due": due_iso,
             "every_s": every_s}
@@ -343,21 +323,8 @@ async def _read_receipts(hub: Hub, me: str, envs: list[Envelope], read: bool = T
             await hub.finish(env.task_id, result_body("complete", summary), record=False)   # a notice, not work
 
 
-def _eta(eta: str | None) -> str | None:
-    """An eta is an ISO time with timezone (D-076)."""
-    if eta is None:
-        return None
-    try:
-        when = parse_iso(eta)
-    except (TypeError, ValueError):
-        when = None
-    if when is None or when.tzinfo is None:
-        raise ValueError(f"eta={eta!r}: use an ISO time with timezone, e.g. 2026-10-03T09:00:00+00:00")
-    return eta
-
-
 async def accept_task(hub: Hub, me: str, task_id: str, eta: str | None = None) -> dict[str, Any]:
-    eta = _eta(eta)
+    eta = from_now(eta, "eta")
     if _check_actor(hub, _owned(hub, me, task_id)) == task_id:
         # A worker's task was accepted for it when the daemon started it: nothing to do, and no session claim
         return {"task_id": task_id, "accepted": True, "note": "already accepted for you when the worker started"}
@@ -420,7 +387,7 @@ async def report_progress(hub: Hub, me: str, message: str, task_id: str | None =
     body = {"reason": message} if msg_type == "BLOCKED" else {"state": new_state, "message": message}
     if next:
         body["next"] = next
-    if (eta := _eta(eta)):
+    if (eta := from_now(eta, "eta")):
         body["eta"] = eta                         # a new estimate: what a chase asks for (D-076)
         hub.ledger.update_task(task_id, "owner", eta=eta)
     ok = await hub.owner_transition(task_id, new_state, message, msg_type=msg_type, body=body)
@@ -653,21 +620,17 @@ async def fetch_artifact(hub: Hub, uri: str, dest_dir: str | None = None, sha256
 
 def _check_actor(hub: Hub, task: dict[str, Any]) -> str | None:
     """Every owner-side change (accept, reject, progress, result) is made by whoever holds the task, so a task is
-    never done twice and a running worker is not interrupted.
-    Who the caller is comes from the process tree: a process descending from a worker the daemon started (pid
-    and start time recorded) is that worker, whatever its environment says. MUTMUAS_TASK_ID can only add a
-    restriction (a process that claims to be a worker is treated as one), never prove anything.
+    never done twice and a running worker is not interrupted. The caller is a worker when the daemon started it
+    for a task (MUTMUAS_TASK_ID, which its MCP server inherits), else the session (D-102).
     - A worker acts on its own task only.
-    - A task held by the worker is changed only by that worker's processes.
+    - A task held by the worker is changed only by its worker.
     - A task held by the session is not changed by a worker.
     Returns the task the caller is the worker of (None: not a worker)."""
-    from .node import _ancestors, worker_tasks_of
-    proven = worker_tasks_of(hub.ledger, task["owner"], {os.getpid(), *_ancestors(os.getpid())})
-    worker_of = next(iter(proven), None) or _current_task()
+    worker_of = _current_task()
     if worker_of and task["task_id"] != worker_of:
         raise PermissionError(f"a worker process (task {worker_of}) acts only on its own task, not on "
                               f"{task['task_id']}, which belongs to the session or to another run")
-    if task.get("runner") == "worker" and task["task_id"] not in proven:
+    if task.get("runner") == "worker" and worker_of != task["task_id"]:
         raise PermissionError(f"{task['task_id']} is being done by the worker the daemon started; it is not "
                               "interrupted (D-032a): wait for its result (whoami: worker_running)")
     if task.get("runner") == "session" and worker_of == task["task_id"]:

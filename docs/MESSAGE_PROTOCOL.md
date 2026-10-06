@@ -64,8 +64,9 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
 - `reply` on a REQUEST: `required` (the default) means the owner owes a RESULT. `none` makes it a notice.
   The receiving session reading it, with a plain `inbox` and not `--peek`, closes the task with a read receipt
   (`RESULT complete "read by X (no reply requested)"`).
-- `deadline` (ISO 8601 with a timezone, or relative: `+30m`, `+2h`, `+1d`, more than zero) says when the reply is
-  needed. One already past is refused (D-098). Use `agentctl ask --due +2h`.
+- `deadline` says when the reply is needed, always from now: `+30m`, `+2h`, `+1d` (D-102: so one in the past
+  cannot be given). The requester's node turns it into an ISO time. Use `agentctl ask --due +2h`. Etas and
+  reminders are given the same way.
   - A REQUEST that wants a reply but names no deadline gets one from the requester's node:
     `default_reply_deadline_s` in node.yaml (default 4 h; `0` = no default), and for `kind` experiment or code
     `long_reply_deadline_s` (default 24 h; D-098). With `timeout_s` it is never earlier than `timeout_s` +
@@ -132,7 +133,7 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
     (opening a session, /mcp reconnect) every unread one again, oldest first. It does not push again and again
     while the session works; the Stop hook has the agent look before it ends a turn. Each push is counted
     (`messages.pushed`, `pushed_at`); `whoami` shows `inbox_unread`, `oldest_unread_s` and `last_push_at`.
-  - *eta*: `accept_task(eta=…)` and `report_progress(eta=…)` (ISO time with timezone) send the owner's estimate;
+  - *eta*: `accept_task(eta=…)` and `report_progress(eta=…)` (from now: `+2h`) send the owner's estimate;
     the requester's node keeps it (`check_task` shows it). When it has passed, the requester's node reminds the
     owner once (an UPDATE with `next`, asking for a new eta). No new eta within an hour: the requester is told,
     and the node's `escalate_to` addresses (the secretary) get a copy. A new eta starts over. WAITING (on a job
@@ -192,23 +193,19 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   registry card of an interactive agent then shows one of:
   - `session: online`, or `offline` (no heartbeat for 50 s, or the process has gone);
   - `unknown` (no mutmuas MCP server has ever run for it);
-  - `session_warning` when the session was started outside the agent's workdir. Claude Code keeps memory
-    per start directory, so a wrong start directory means an empty memory.
 - **One agent, one session.** The first session's MCP process holds the agent (a lease in the node
   ledger). The check and the write are one transaction, so two sessions starting together cannot both win.
-  - A second session acting as the same agent is told at once and receives no mail pushes.
-  - Its MCP tools (all but `whoami`) refuse to act.
-  - `agentctl` commands for that agent are refused too, unless they run inside the holding session: a
-    descendant of the session process, such as its shell. The ancestry comes from `/proc` or `ps` by absolute
-    path, and no environment variable exempts a process.
-  - Exceptions, because they show no mail content: `status`, `agents`, `find`, and `watch --headers-only`
-    (a notifier service outside the session: count, type and sender only). `whoami` is exempt only as an MCP
-    tool; `agentctl whoami` needs the session.
+  - A second session acting as the same agent is told at once and receives no mail pushes; its MCP tools (all
+    but `whoami`) refuse to act. When the holder closes, the other session takes over at its next heartbeat.
+  - Who acts is decided by how a process was started (D-102): the session's own MCP process holds the lease;
+    a worker the daemon started carries MUTMUAS_TASK_ID (its MCP server inherits it) and acts on its own task,
+    holding no lease. Setting that variable by hand is a person's mistake, not something the node guards.
+  - `agentctl` beside the holding session (a shell, a hook) may only read: `status`, `agents`, `find`,
+    `whoami`, `tasks`, `task`, `failures`, `inbox --peek`, `watch --headers-only`, and switch the session's own
+    work (`session off|on`). Anything that acts as the agent goes through the session's MCP tools.
   - Only a foreground `inbox` listing counts as having shown a message; `clear_inbox` marks read only messages
-    shown that way. Notifier reads (`watch`, pushes) do not count.
-  - The holder is told about the contender. When the holder closes, the other session takes over at its
-    next heartbeat. Two projects on one machine are two agents (e.g. `C:paper` and
-  `C:course`), not two sessions of one agent.
+    shown that way (ACKs and progress excepted, D-098). Notifier reads (`watch`, pushes) do not count.
+  - Two projects on one machine are two agents (e.g. `C:paper` and `C:course`), not two sessions of one agent.
 - **Follow-ups.** Every 30 s the requester's daemon checks the tasks it is owed. Each follow-up is sent
   once: an UPDATE to the requester with `next` set to the requester (so it wakes), copied as an FYI to
   `escalate_to` in node.yaml (e.g. the secretary). There are two:

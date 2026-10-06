@@ -4,7 +4,7 @@ G3 a request that needs a reply gets a default deadline; G2 the RESULT of my own
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from conftest import eventually, interactive, worker
 from mutmuas import tools
@@ -31,8 +31,10 @@ async def test_g3_a_request_that_needs_a_reply_gets_the_default_deadline(make_co
     assert got["request"].get("deadline_default") is True
     fyi = await tools.send_request(hub_a, "A:main", "B:desk", "notice", "g3", reply="none")
     assert "deadline" not in hub_a.ledger.task(fyi["task_id"], "requester")["request"]
-    own = await tools.send_request(hub_a, "A:main", "B:desk", "x", "g3", deadline="2030-01-01T00:00:00+00:00")
-    assert hub_a.ledger.task(own["task_id"], "requester")["request"]["deadline"] == "2030-01-01T00:00:00+00:00"
+    own = await tools.send_request(hub_a, "A:main", "B:desk", "x", "g3", deadline="+30d")
+    chosen = hub_a.ledger.task(own["task_id"], "requester")["request"]
+    assert parse_iso(chosen["deadline"]) - datetime.now(timezone.utc) > timedelta(days=29)
+    assert not chosen.get("deadline_default")
 
 
 async def test_g3_default_deadline_zero_means_off(make_config, cluster):

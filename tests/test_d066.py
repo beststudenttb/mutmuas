@@ -182,7 +182,8 @@ async def test_the_node_delivers_a_due_reminder_into_the_inbox(tmp_path):
     """No session and no lease needed: the reminder lands in the inbox and hands the post the baton."""
     _, ledger, daemon = _node(tmp_path, mode="interactive")
     try:
-        out = await tools.remind_me(daemon.hub, "B:desk", _iso(-1), "report progress to the secretary")
+        out = await tools.remind_me(daemon.hub, "B:desk", "+1s", "report progress to the secretary")
+        ledger.db.execute("UPDATE reminders SET due=? WHERE id=?", (_iso(-1), out["reminder"]))      # it is due
         await daemon._fire_reminders()
         [note] = await tools.inbox(daemon.hub, "B:desk", types=tools.WAKE)
         assert "report progress to the secretary" in note["body"]["message"] and note["from"] == "B:desk"
@@ -196,7 +197,8 @@ async def test_the_node_delivers_a_due_reminder_into_the_inbox(tmp_path):
 async def test_a_repeating_reminder_comes_back_after_its_interval(tmp_path):
     _, ledger, daemon = _node(tmp_path, mode="interactive")
     try:
-        out = await tools.remind_me(daemon.hub, "B:desk", _iso(-1), "progress ping", every="5h")
+        out = await tools.remind_me(daemon.hub, "B:desk", "+1s", "progress ping", every="5h")
+        ledger.db.execute("UPDATE reminders SET due=? WHERE id=?", (_iso(-1), out["reminder"]))      # it is due
         assert out["every_s"] == 5 * 3600
         await daemon._fire_reminders()
         await daemon._fire_reminders()

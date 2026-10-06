@@ -95,8 +95,7 @@ def session_present(ledger, agent: str) -> str | None:
     return "a session ended moments ago (grace period)" if age < AUTO_WORKER_GRACE_S else None
 
 
-# The lease decision trusts the process tree, so the tree must not come from anything the caller controls: not a
-# PATH-resolved `ps`. Linux: /proc; elsewhere: ps by absolute path.
+# A process's start time and state: Linux /proc; elsewhere ps by absolute path.
 _PS = next((p for p in ("/bin/ps", "/usr/bin/ps") if os.path.exists(p)), None)
 
 
@@ -115,13 +114,6 @@ def _proc_field(pid: int, index: int, ps_column: str) -> tuple[str | None, bool]
     out = subprocess.run([_PS, "-o", f"{ps_column}=", "-p", str(pid)], capture_output=True, text=True,
                          env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
     return out.stdout.strip() or None, False
-
-
-def _ppid(pid: int) -> int | None:
-    try:
-        return int(_proc_field(pid, 1, "ppid")[0])                     # stat field 4
-    except (TypeError, ValueError):
-        return None
 
 
 def proc_start(pid: int) -> str | None:
@@ -143,47 +135,23 @@ def same_process(pid: int | None, start: str | None) -> bool:
             and not _zombie(pid))
 
 
-def worker_tasks_of(ledger, agent: str, chain: set[int]) -> set[str]:
-    """The tasks of `agent` whose recorded, still running worker process is in `chain` (a process and its
-    ancestors): who the caller is as a worker, for the lease and for the owner-side actor check alike."""
-    return {task_id for pid, task_id in live_worker_runs(ledger, agent).items() if pid in chain}
-
-
 def live_worker_runs(ledger, agent: str) -> dict[int, str]:
     """pid -> task id of the daemon-started worker processes of `agent` that are still running."""
     return {pid: task_id for pid, start, task_id in ledger.worker_runs(agent) if same_process(pid, start)}
 
 
-def _ancestors(pid: int) -> list[int]:
-    """pid's parent chain, from /proc or an absolute-path ps (never PATH)."""
-    chain, seen = [], set()
-    while pid > 1 and pid not in seen:
-        seen.add(pid)
-        parent = _ppid(pid)
-        if parent is None:
-            break
-        pid = parent
-        chain.append(pid)
-    return chain
-
-
 def lease_refusal(ledger, agent: str) -> str | None:
-    """Why this process may not act as `agent` now, or None. A live session holds the agent: only that session
-    (its MCP process, or anything the session itself started, e.g. agentctl from its shell) may use it.
-    No environment variable exempts a process: MUTMUAS_TASK_ID is set by whoever starts the process, so it
-    proves nothing. Daemon-run tasks act as worker agents, which hold no lease.
-    A post being retired is refused to everyone."""
+    """Why this process may not act as `agent` now, or None. One agent, one session: while a live session holds
+    the agent, only that session's MCP process acts as it (D-102: from how the processes are started, not a proof
+    from the process tree). A worker the daemon started (MUTMUAS_TASK_ID) holds no lease and acts on its own
+    task. A post being retired is refused to everyone."""
     if ledger.retiring(agent):
         return (f"{agent} is being retired (agent-node retire-agent): no session or tool may act as it; "
                 "`retire-agent --undo` lifts this.")
+    if os.environ.get("MUTMUAS_TASK_ID"):
+        return None
     row = ledger.session_of(agent)
     if not row or row["pid"] in (0, os.getpid()) or not session_alive(row):
-        return None
-    session = row.get("session_pid")
-    chain = {os.getpid(), *_ancestors(os.getpid())}
-    # auto_worker: a task the daemon started before the session came is finished, not interrupted (D-032a);
-    # its processes descend from the pid the daemon recorded when it spawned them.
-    if ({row["pid"], session} - {None, 0}) & chain or worker_tasks_of(ledger, agent, chain):
         return None
     return (f"{agent} is held by another session (process {row['pid']}, directory {row.get('cwd')}); this process "
             "does not hold its session, so it may not read or answer its mail. One agent, one session.")

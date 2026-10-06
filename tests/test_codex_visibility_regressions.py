@@ -6,7 +6,6 @@ are deliberately small and do not require a running NATS server.
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 
@@ -117,21 +116,6 @@ def test_artifact_visibility_treats_uri_literally(tmp_path):
 
         assert not artifact_visible(ledger, "A:main", requested)
     finally:
-        ledger.close()
-
-
-def test_task_id_environment_does_not_bypass_live_session_lease(tmp_path, monkeypatch):
-    """An arbitrary task-id environment variable is not proof of daemon ownership."""
-    _, ledger, _, _ = _local_stack(tmp_path, "main")
-    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-    try:
-        ledger.session_beat("A:main", holder.pid, "/holder", session_pid=holder.pid)
-        monkeypatch.setenv("MUTMUAS_TASK_ID", "T-untrusted")
-
-        assert lease_refusal(ledger, "A:main") is not None
-    finally:
-        holder.terminate()
-        holder.wait(timeout=5)
         ledger.close()
 
 

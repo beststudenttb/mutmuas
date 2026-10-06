@@ -15,7 +15,7 @@ import shutil
 import signal
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -72,7 +72,10 @@ async def _with_hub(args, fn, *, require_bus: bool = True, watch: bool = False):
             delay = min(delay * 2, 30)
     try:
         command = getattr(getattr(args, "fn", None), "__name__", "")
-        if command not in LEASE_FREE and not (command == "cmd_watch" and getattr(args, "headers_only", False)):
+        reads_only = (command == "cmd_inbox" and getattr(args, "peek", False)
+                      and getattr(args, "clear_before", None) is None) or (
+            command == "cmd_watch" and getattr(args, "headers_only", False))
+        if command not in LEASE_FREE and not reads_only:
             from .node import lease_refusal
             refusal = lease_refusal(hub.ledger, str(hub.local_agent(_me(args))[0]))
             if refusal:
@@ -82,10 +85,10 @@ async def _with_hub(args, fn, *, require_bus: bool = True, watch: bool = False):
         await hub.close()
 
 
-# Commands that only read public state: allowed while another session holds the agent. Not `watch`: it shows mail
-# content (objective, summary, ...), so a second session could read the holder's mail through it. `watch --headers-only`
-# shows no content (count, type, sender) and stays lease-free, for notifier services that run outside the session.
-LEASE_FREE = {"cmd_status", "cmd_agents", "cmd_find", "cmd_session"}   # session: run from a shell beside it
+# Commands that may run beside the session that holds the agent (from a shell or a hook): they only read, or switch
+# the session's own work off and on. `inbox --peek` and `watch --headers-only` read without marking anything.
+LEASE_FREE = {"cmd_status", "cmd_agents", "cmd_find", "cmd_session", "cmd_whoami", "cmd_tasks", "cmd_task",
+              "cmd_failures"}
 
 
 def _parse_kv(pairs: list[str] | None) -> dict[str, Any]:
@@ -158,30 +161,12 @@ async def cmd_find(args, hub: Hub):
     _print(await tools.find_agent(hub, args.capability), args.json)
 
 
-def _parse_due(text: str | None) -> str | None:
-    """'+90m', '+2h', '+1d' (from now) or an ISO time with timezone -> ISO deadline."""
-    if not text:
-        return None
-    units = {"m": "minutes", "h": "hours", "d": "days"}
-    if text.startswith("+"):
-        if text[-1] not in units or not text[1:-1].replace(".", "", 1).isdigit():
-            raise SystemExit(f"--due {text!r}: use +90m, +2h, +1d or an ISO time with timezone")
-        return (datetime.now(timezone.utc) + timedelta(**{units[text[-1]]: float(text[1:-1])})).isoformat()
-    try:
-        when = parse_iso(text)
-    except ValueError:
-        raise SystemExit(f"--due {text!r}: use +90m, +2h, +1d or an ISO time with timezone") from None
-    if when.tzinfo is None:
-        raise SystemExit(f"--due {text!r} has no timezone (e.g. 2026-09-25T18:00:00+09:00)")
-    return when.isoformat()
-
-
 async def cmd_ask(args, hub: Hub):
     out = await tools.send_request(
         hub, _me(args), args.to, args.objective, args.reason or "requested via agentctl", kind=args.kind,
         inputs=_parse_kv(args.input) or None, expected_outputs=args.expect, acceptance_criteria=args.accept,
         constraints=args.constraint, timeout_s=args.timeout, priority=args.priority,
-        reply=args.reply, deadline=_parse_due(args.due), observers=args.observer,
+        reply=args.reply, deadline=args.due, observers=args.observer,
         artifacts=[{"uri": uri} for uri in args.artifact or []], leader=args.leader, project=args.project)
     if args.wait is not None:
         out = await tools.wait_for_result(hub, out["task_id"], args.wait, me=_me(args))
@@ -706,7 +691,7 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=float, help="task timeout on the owner side (s)")
     p.add_argument("--reply", choices=["required", "none"],
                    help="none: a notice, closed with a read receipt once they read it (default: required)")
-    p.add_argument("--due", metavar="WHEN", help="reply needed by: +90m, +2h, +1d or ISO time; overdue is followed up")
+    p.add_argument("--due", metavar="WHEN", help="reply needed within: +90m, +2h, +1d; overdue is followed up")
     p.add_argument("--observer", action="append", metavar="ADDR",
                    help="may also read this task's request and result (repeatable)")
     p.add_argument("--artifact", action="append", metavar="URI",
@@ -745,7 +730,7 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--task")
     p.add_argument("--state", choices=["RUNNING", "WAITING", "BLOCKED"])
     p.add_argument("--next", metavar="ADDR", help="whose move it is now (wakes them)")
-    p.add_argument("--eta", help="a new estimate (ISO time with timezone)")
+    p.add_argument("--eta", help="a new estimate from now: +2h, +1d")
     p = add("session", cmd_session, "my session: off = online but takes no work (the worker does); on = back",
             bus=False)
     p.add_argument("action", choices=["off", "on"])

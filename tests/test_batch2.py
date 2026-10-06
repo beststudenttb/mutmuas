@@ -111,10 +111,10 @@ async def test_an_eta_given_on_accepting_reaches_the_requester(tmp_path):
     agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
     agent.auto_worker = False
     owned_task(ledger, "T-e", ingest=True)
-    eta = _iso(3600)
     try:
-        await tools.accept_task(hub, "B:desk", "T-e", eta=eta)
-        assert ledger.task("T-e", "owner")["eta"] == eta
+        await tools.accept_task(hub, "B:desk", "T-e", eta="+1h")
+        eta = ledger.task("T-e", "owner")["eta"]
+        assert timedelta(minutes=59) < datetime.fromisoformat(eta) - datetime.now(timezone.utc) <= timedelta(hours=1)
         [ack] = _out(ledger, "ACK", "T-e")
         assert ack.body["eta"] == eta
         with pytest.raises(ValueError):

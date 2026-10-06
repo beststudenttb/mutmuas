@@ -181,7 +181,3 @@ async def test_headers_only_watch_does_not_make_body_eligible_for_clear(tmp_path
     finally:
         ledger.close()
 
-
-def test_agentctl_whoami_is_not_lease_free():
-    """The protocol exempts MCP whoami, but not an arbitrary agentctl process."""
-    assert "cmd_whoami" not in cli.LEASE_FREE

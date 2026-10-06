@@ -230,7 +230,7 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         project: the project the work belongs to (the recipient works in its directory for it); default: theirs.
         leader: true only when the leader asked for this task (it goes first in their queue).
         reply: required (the default: they owe you a RESULT) | none (a notice; closed once they read it).
-        deadline: ISO time with timezone by which you need the reply; overdue replies are followed up.
+        deadline: when you need the reply, from now (+2h, +1d); overdue replies are followed up.
         Returns a task_id; the message is durable even if the target is offline."""
         return dump(await tools.send_request(
             hub(), state["me"], to, objective, reason, kind=kind, inputs=inputs, expected_outputs=expected_outputs,
@@ -284,7 +284,7 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
 
     @server.tool()
     async def remind_me(at: str, text: str, every: str | None = None) -> str:
-        """Come back to something later: at (ISO time with timezone, or +10m / +2h) the node puts the text into
+        """Come back to something later: at (+10m / +2h / +1d from now) the node puts the text into
         your inbox, which wakes you like new mail (and waits there if no session runs). every (e.g. "5h") repeats
         it until cancel_reminder. Use it instead of promising to "check again in a while"."""
         return dump(await tools.remind_me(hub(), state["me"], at, text, every=every, task_id=worker_task))
@@ -303,8 +303,8 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
 
     @server.tool()
     async def accept_task(task_id: str, eta: str | None = None) -> str:
-        """Accept a task that was sent to you (interactive agents). eta: when you expect to deliver (ISO time with
-        timezone); the requester's node reminds you once it passes and asks for a new one."""
+        """Accept a task that was sent to you (interactive agents). eta: when you expect to deliver, from now
+        (+2h, +1d); the requester's node reminds you once it passes and asks for a new one."""
         return dump(await tools.accept_task(hub(), state["me"], task_id, eta=eta))
 
     @server.tool()
@@ -316,7 +316,7 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
     async def report_progress(message: str, task_id: str | None = None, state_: str | None = None,
                               next: str | None = None, eta: str | None = None) -> str:
         """Tell the requester about progress on a task you own. state_: RUNNING | WAITING | BLOCKED.
-        next: the address whose move it is now (wakes them). eta: a new estimate (ISO time with timezone),
+        next: the address whose move it is now (wakes them). eta: a new estimate from now (+2h, +1d),
         e.g. when you were reminded that the old one passed."""
         return dump(await tools.report_progress(hub(), state["me"], message, task_id, state_, next=next, eta=eta))
 

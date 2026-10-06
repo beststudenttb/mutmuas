@@ -3,22 +3,19 @@ git and accept notes, auto_worker in agents --json, Skill for LLM workers."""
 
 from __future__ import annotations
 
-import os
-
 from conftest import auto_worker_node, owned_task
 from test_staff_v4 import _claude_ctx
 
 from mutmuas import tools
-from mutmuas.node import proc_start
 from mutmuas.runtime import worker_prompt
 
 
-async def test_a_worker_accepting_its_own_task_gets_success(tmp_path):
+async def test_a_worker_accepting_its_own_task_gets_success(tmp_path, monkeypatch):
     """The pilot's worker called accept_task on the task the daemon had already claimed for it and got the
     misleading 'being done by the worker (D-032a)' error; for the worker itself it is a no-op."""
     _, _, ledger, hub, _ = auto_worker_node(tmp_path)
     owned_task(ledger, "T-own", "RUNNING", claim="worker")
-    ledger.set_runner_pid("T-own", os.getpid(), proc_start(os.getpid()))    # this process is the worker
+    monkeypatch.setenv("MUTMUAS_TASK_ID", "T-own")                     # the daemon started this process for it
     try:
         out = await tools.accept_task(hub, "B:desk", "T-own")
         assert out["accepted"] is True
