@@ -732,3 +732,29 @@ async def test_off_is_refused_without_a_worker_to_take_the_work(tmp_path, sessio
         assert (await tools.set_session_taking_work(hub, "B:desk", False))["session_takes_work"] is False
     finally:
         ledger.close()
+
+
+async def test_a_second_sessions_mcp_tools_refuse_to_act_but_whoami_answers(tmp_path, monkeypatch):
+    """The MCP server's own front door: while another live session holds the agent, every tool but whoami
+    refuses, and nothing is read or marked."""
+    from mutmuas.mcp_server import build_server
+
+    async def no_bus(cfg, *_args, **_kwargs):
+        return Hub(cfg, None, Ledger(cfg.db_path))
+    monkeypatch.setattr(Hub, "open", no_bus)
+    agent, cfg, ledger, _, _ = auto_worker_node(tmp_path)
+    owned_task(ledger, "T-s", ingest=True)
+    holder = Orphan("import time; time.sleep(30)")
+    ledger.session_beat("B:desk", holder.pid, str(agent.workdir_path), session_pid=holder.pid)
+    server = build_server(cfg, "B:desk")
+    try:
+        async with server.settings.lifespan(server):
+            for tool, args in (("inbox", {"only": "all"}), ("accept_task", {"task_id": "T-s"})):
+                out = await server.call_tool(tool, args)
+                assert "does not hold the agent" in out.content[0].text, tool
+            who = await server.call_tool("whoami", {})
+            assert "B:desk" in who.content[0].text
+        assert ledger.task("T-s", "owner")["status"] == "PENDING"
+    finally:
+        holder.kill()
+        ledger.close()

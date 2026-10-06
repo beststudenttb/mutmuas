@@ -121,6 +121,26 @@ async def test_agentctl_submit_result_takes_how_and_notes(monkeypatch):
     assert calls[0]["how"] == "h" and calls[0]["notes"] == "n"
 
 
+async def test_agentctl_submit_result_reads_the_rest_from_a_file(tmp_path, monkeypatch):
+    """A script worker writes its result as YAML and passes --file; the flags win over the file."""
+    calls = []
+
+    async def fake_submit(hub, me, status, summary, **kw):
+        calls.append((status, summary, kw))
+        return {}
+
+    monkeypatch.setattr(tools, "submit_result", fake_submit)
+    result = tmp_path / "result.yaml"
+    result.write_text("status: partial\nsummary: from the file\noutputs: {loss: 0.2}\nnotes: n\n"
+                      "artifacts: [{uri: 'artifact://p/B/desk/T-d/x.json'}]\n")
+    args = cli.agentctl_parser().parse_args(["submit-result", "--task", "T-d", "--file", str(result),
+                                             "--status", "complete", "--as", "B:desk"])
+    await cli.cmd_submit(args, None)
+    [(status, summary, kw)] = calls
+    assert (status, summary) == ("complete", "from the file")
+    assert kw["outputs"] == {"loss": 0.2} and kw["notes"] == "n" and kw["artifacts"][0]["uri"].endswith("x.json")
+
+
 def test_the_worker_prompt_leaves_the_log_to_the_node(tmp_path):
     from test_worker_setup import _claude_ctx
 
