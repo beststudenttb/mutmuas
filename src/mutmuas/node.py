@@ -722,6 +722,11 @@ class NodeDaemon:
                         runner.cancel()
                         await asyncio.gather(runner, return_exceptions=True)
                         raise
+                    if asyncio.current_task().cancelling():
+                        # this runner itself is stopped, just as its run ended: stop, never back to the queue
+                        # (C's Linux runs: the cancel was swallowed and the runner waited on its queue for good)
+                        raise
+                    # else the run was stopped on purpose (interrupt, pause): settled below, laid out again
             finally:
                 self._running.pop(task_id, None)
                 if (why := self._interrupted.pop(task_id, None)) is not None:
