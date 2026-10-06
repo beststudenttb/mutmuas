@@ -144,10 +144,7 @@ def lease_refusal(ledger, agent: str) -> str | None:
     """Why this process may not act as `agent` now, or None. One agent, one session: while a live session holds
     the agent, only that session's MCP process acts as it (D-102: from how the processes are started, not a proof
     from the process tree). A worker the daemon started (MUTMUAS_TASK_ID) holds no lease and acts on its own
-    task. A post being retired is refused to everyone."""
-    if ledger.retiring(agent):
-        return (f"{agent} is being retired (agent-node retire-agent): no session or tool may act as it; "
-                "`retire-agent --undo` lifts this.")
+    task."""
     if os.environ.get("MUTMUAS_TASK_ID"):
         return None
     row = ledger.session_of(agent)
