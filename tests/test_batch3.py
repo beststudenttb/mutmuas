@@ -114,7 +114,6 @@ async def test_a_reminder_without_a_task_only_goes_to_the_inbox(tmp_path):
 
 
 def test_the_brain_is_told_to_wait_on_children_not_on_a_done_file(tmp_path):
-    from mutmuas.config import NodeConfig
     from mutmuas.protocol import request_body
     from mutmuas.runtime import TaskContext, worker_prompt
     agent, cfg, ledger, hub, daemon = auto_worker_node(tmp_path)
@@ -287,23 +286,6 @@ async def test_a_relative_deadline_must_be_ahead(tmp_path, deadline):
     try:
         with pytest.raises(ValueError):
             await tools.send_request(hub, "B:desk", "C:far", "x", "y", deadline=deadline)
-    finally:
-        ledger.close()
-
-
-async def test_a_held_requests_relative_deadline_counts_from_its_release(tmp_path):
-    from mutmuas.protocol import result_body
-    agent, cfg, ledger, hub, daemon = auto_worker_node(tmp_path)
-    try:
-        dep = await tools.send_request(hub, "B:desk", "C:far", "train", "dep")
-        held = await tools.send_request(hub, "B:desk", "C:rl", "evaluate", "after", depends_on=[dep["task_id"]],
-                                        deadline="+2h")
-        assert "deadline" not in ledger.task(held["task_id"], "requester")["request"]     # not started yet
-        await daemon._on_reply(Envelope(type="RESULT", sender="C:far", to="B:desk", task_id=dep["task_id"],
-                                        body=result_body("complete", "trained")))
-        await daemon._release_held()
-        assert 7100 < _due_in_s(held, ledger) <= 7200
-        assert not ledger.task(held["task_id"], "requester")["request"].get("deadline_default")
     finally:
         ledger.close()
 

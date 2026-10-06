@@ -248,26 +248,6 @@ class Bus:
                                     headers={"Nats-Msg-Id": env.message_id})
         return bool(ack.duplicate)
 
-    async def history(self, subject_filter: str | None = None, limit: int = 500) -> list[tuple[str, bytes]]:
-        """Read raw messages back from the stream (audit). Uses an ephemeral ordered consumer."""
-        subject_filter = subject_filter or f"{self.names.msg_prefix}.>"
-        out: list[tuple[str, bytes]] = []
-        sub = await self.js.subscribe(subject_filter, ordered_consumer=True,
-                                      deliver_policy=api.DeliverPolicy.ALL)
-        try:
-            while len(out) < limit:
-                try:
-                    msg = await sub.next_msg(timeout=0.5)
-                except TimeoutError:
-                    break
-                except Exception as e:  # nats.errors.TimeoutError is not always builtins.TimeoutError
-                    if "Timeout" in type(e).__name__:
-                        break
-                    raise
-                out.append((msg.subject, msg.data))
-        finally:
-            await sub.unsubscribe()
-        return out
 
     # ---- key/value helpers --------------------------------------------
 

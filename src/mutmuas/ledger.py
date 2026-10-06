@@ -71,7 +71,6 @@ CREATE TABLE IF NOT EXISTS tasks (
     runner_start    TEXT,                    -- ... and its start time (pids get reused)
     stuck_pgid      INTEGER,                 -- a process group a stop could not end: nothing runs beside it
     eta             TEXT,                    -- the owner's estimate (D-076)
-    nudged_at       TEXT,                    -- requester side: the last nudge
     interrupts      TEXT,                    -- messages that stopped a run, for the next run (D-089)
     paused          INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, role)
@@ -136,14 +135,6 @@ CREATE TABLE IF NOT EXISTS failures (
 CREATE TABLE IF NOT EXISTS retiring (
     local_agent     TEXT PRIMARY KEY,
     at              TEXT NOT NULL
-);
-
--- Requests held by their sender until the tasks they depend on are done (D-073 batch 2, depends_on).
-CREATE TABLE IF NOT EXISTS held (
-    task_id         TEXT PRIMARY KEY,
-    envelope        TEXT NOT NULL,
-    depends_on      TEXT NOT NULL,           -- json list of task ids
-    created_at      TEXT NOT NULL
 );
 
 -- A post's brain batch (D-073): worker runs of (agent, project) resume this conversation until an idle spell.
@@ -295,11 +286,9 @@ class Ledger:
     def _project_filter(project: tuple[str, str] | None) -> tuple[str, tuple]:
         """project = (the session's project, the post's default project): leave out requests of other projects,
         which the worker takes (D-072). A request without `project` belongs to the default project."""
-        # a brain's internal subtasks (D-073) are its own work for its worker, never mail for the session
-        internal = " AND NOT (type = 'REQUEST' AND json_extract(envelope, '$.body.internal') IS 1)"
         if not project:
-            return internal, ()
-        return (internal + " AND NOT (type = 'REQUEST' AND COALESCE(json_extract(envelope, '$.body.project'), ?)"
+            return "", ()
+        return (" AND NOT (type = 'REQUEST' AND COALESCE(json_extract(envelope, '$.body.project'), ?)"
                 " IS NOT ?)", (project[1], project[0]))
 
     def unseen(self, local_agent: str, limit: int = 50, mark: bool = True,
@@ -606,45 +595,6 @@ class Ledger:
 
     def set_session_accepting(self, local_agent: str, accepting: bool) -> bool:
         cur = self.db.execute("UPDATE sessions SET accepting=? WHERE local_agent=?", (int(accepting), local_agent))
-        return cur.rowcount == 1
-
-    def hold_request(self, env: Envelope, depends_on: list[str]) -> None:
-        """A REQUEST that waits for other tasks (depends_on): its requester-side task exists, the message is not
-        queued yet."""
-        with self.tx() as db:
-            self._insert_task(db, env, role="requester", local_agent=env.sender, status="PENDING")
-            db.execute("INSERT INTO held (task_id, envelope, depends_on, created_at) VALUES (?,?,?,?)",
-                       (env.task_id, env.to_json().decode(), json.dumps(depends_on), now_iso()))
-
-    def held(self) -> list[dict[str, Any]]:
-        return [{"task_id": r["task_id"], "envelope": Envelope.from_json(r["envelope"]),
-                 "depends_on": json.loads(r["depends_on"])} for r in self.db.execute("SELECT * FROM held")]
-
-    def release_held(self, env: Envelope) -> bool:
-        """Queue the held REQUEST (its task already exists) and forget the hold, in one transaction; not if the
-        hold is gone (withdrawn meanwhile) or its task is closed."""
-        with self.tx() as db:
-            row = db.execute("SELECT t.status FROM held h JOIN tasks t ON t.task_id=h.task_id AND t.role='requester'"
-                             " WHERE h.task_id=?", (env.task_id,)).fetchone()
-            if row is None or row["status"] in TERMINAL_STATES:
-                db.execute("DELETE FROM held WHERE task_id=?", (env.task_id,))
-                return False
-            self._queue(db, env)                              # its task exists already: only the message is new
-            db.execute("UPDATE tasks SET request=?, updated_at=? WHERE task_id=? AND role='requester'",
-                       (json.dumps(env.body, ensure_ascii=False), now_iso(), env.task_id))
-            db.execute("DELETE FROM held WHERE task_id=?", (env.task_id,))
-        return True
-
-    def drop_held(self, task_id: str) -> bool:
-        return self.db.execute("DELETE FROM held WHERE task_id=?", (task_id,)).rowcount == 1
-
-    def held_ids(self) -> set[str]:
-        return {r[0] for r in self.db.execute("SELECT task_id FROM held")}
-
-    def claim_nudge(self, task_id: str, now: str, cutoff: str) -> bool:
-        """Take the nudge window of a requested task: True for one caller only (no nudge since `cutoff`)."""
-        cur = self.db.execute("UPDATE tasks SET nudged_at=? WHERE task_id=? AND role='requester'"
-                              " AND (nudged_at IS NULL OR nudged_at < ?)", (now, task_id, cutoff))
         return cur.rowcount == 1
 
     def brain_session(self, local_agent: str, project: str | None) -> str | None:

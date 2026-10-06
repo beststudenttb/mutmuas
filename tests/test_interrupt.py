@@ -341,26 +341,6 @@ async def test_a_job_ending_while_paused_leaves_the_task_paused(tmp_path):
         ledger.close()
 
 
-async def test_a_held_child_is_paused_and_not_sent_until_resumed(tmp_path):
-    from mutmuas.protocol import result_body
-    agent, _, ledger, hub, daemon = _node(tmp_path)
-    owned_task(ledger, "T-p", "RUNNING", ingest=True)
-    dep = await tools.send_request(hub, "B:desk", "C:far", "train", "dep", parent_task="T-x")
-    held = await tools.send_request(hub, "B:desk", "C:rl", "evaluate", "after", parent_task="T-p",
-                                    depends_on=[dep["task_id"]])
-    try:
-        await _deliver(daemon, agent, _update("T-p", pause=True))
-        await daemon._on_reply(Envelope(type="RESULT", sender="C:far", to="B:desk", task_id=dep["task_id"],
-                                        body=result_body("complete", "trained")))
-        await daemon._release_held()
-        assert not [e for e in ledger.outbox() if e.task_id == held["task_id"] and e.type == "REQUEST"]
-        await _deliver(daemon, agent, _update("T-p", resume=True))
-        await daemon._release_held()
-        assert [e for e in ledger.outbox() if e.task_id == held["task_id"] and e.type == "REQUEST"]
-    finally:
-        ledger.close()
-
-
 async def test_only_trusted_addresses_interrupt_and_priority_is_no_permission(tmp_path, blocking):
     agent, _, ledger, hub, daemon = _node(tmp_path)
     owned_task(ledger, "T-r", "ACCEPTED", ingest=True)

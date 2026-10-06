@@ -16,7 +16,7 @@ from typing import Any
 
 from .hub import Hub
 from .ids import Address, parse_iso
-from .visibility import acl, artifact_visible, is_participant, message_visible, short
+from .visibility import acl, artifact_visible, is_participant, short
 from .protocol import OPEN_STATES, TERMINAL_STATES, ArtifactRef, Envelope, request_body, result_body
 
 
@@ -52,25 +52,18 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                        deadline: str | None = None, artifacts: list[dict] | None = None,
                        parent_task: str | None = None, priority: str = "normal",
                        reply: str | None = None, observers: list[str] | None = None,
-                       leader: bool = False, project: str | None = None, internal: bool = False,
-                       model: str | None = None, depends_on: list[str] | None = None) -> dict[str, Any]:
+                       leader: bool = False, project: str | None = None) -> dict[str, Any]:
     default_deadline = None
-    after_s = None
-    if depends_on and deadline and deadline.startswith("+"):
-        _deadline(deadline)                                       # checked now, counted from the release
-        after_s, deadline = _interval_s(deadline), None
     deadline = _deadline(deadline)
-    if not deadline and reply != "none" and not depends_on:      # a held request gets it when it is sent
+    if not deadline and reply != "none":
         default_deadline = default_reply_deadline(hub, timeout_s, kind)
     body = request_body(objective, reason, kind=kind, inputs=inputs, expected_outputs=expected_outputs,
                         constraints=constraints, acceptance_criteria=acceptance_criteria,
                         deadline=deadline or default_deadline, timeout_s=timeout_s, reply=reply, observers=observers,
                         deadline_default=bool(default_deadline),  # the owner can tell it from a chosen one
                         leader=leader)
-    if after_s:
-        body["deadline_after_s"] = after_s        # held (depends_on): the deadline is set on release
     return await _send_request(hub, me, to, body, artifacts=artifacts, parent_task=parent_task, priority=priority,
-                               project=project, internal=internal, model=model, depends_on=depends_on)
+                               project=project)
 
 
 LONG_KINDS = ("experiment", "code")       # their default deadline is long_reply_deadline_s (D-098)
@@ -113,36 +106,10 @@ def default_reply_deadline(hub: Hub, timeout_s: float | None, kind: str | None =
 
 
 async def _send_request(hub: Hub, me: str, to: str, body: dict[str, Any], *, artifacts, parent_task, priority,
-                        project, internal, model, depends_on) -> dict[str, Any]:
+                        project) -> dict[str, Any]:
     default_deadline = body.get("deadline") if body.get("deadline_default") else None
-    if internal:
-        # D-073: a brain's own long work, run by its worker (never the session); sent to itself, in its project
-        if await hub.resolve(to) != str(hub.local_agent(me)[0]):
-            raise ValueError("an internal subtask is sent to yourself (to = your own address)")
-        body["internal"] = True
-        if model:
-            body["model"] = model
-        parent = parent_task or _current_task()
-        owner = hub.ledger.task(parent, "owner") if parent else None
-        if owner:
-            # a sub belongs to its parent's project
-            agent = hub.local_agent(me)[1]
-            inherited = agent.project_of(owner.get("request"))
-            if project and project != inherited:
-                raise ValueError(f"an internal subtask belongs to its parent's project ({inherited}), "
-                                 f"not {project}")
-            project = inherited
     if project:
         body["project"] = project                    # D-069: the recipient routes it to that project's directory
-    if depends_on:
-        unknown = [d for d in depends_on if hub.ledger.task(d) is None]
-        if unknown:
-            raise ValueError(f"depends_on names tasks this node does not know: {', '.join(unknown)}")
-        sender = str(hub.local_agent(me)[0])
-        foreign = [d for d in depends_on if not is_participant(hub.ledger, sender, d)]
-        if foreign:                                  # their results travel with it: only one's own tasks
-            raise PermissionError(f"depends_on may name only tasks {sender} takes part in, not {', '.join(foreign)}")
-        body["depends_on"] = list(depends_on)       # held here until they are done (D-073 batch 2)
     sender = str(hub.local_agent(me)[0])
     for ref in artifacts or []:
         # Attaching grants the recipient access (visibility.artifact_visible), so only what the sender may see
@@ -153,7 +120,7 @@ async def _send_request(hub: Hub, me: str, to: str, body: dict[str, Any], *, art
     target = await hub.card_or_none(to)
     task_id, delivery = await hub.request(
         me, to, body, artifacts=[ArtifactRef.from_dict(a) for a in artifacts or []],
-        parent_task=parent_task or _current_task(), priority=priority, hold_for=depends_on)
+        parent_task=parent_task or _current_task(), priority=priority)
     out = {"task_id": task_id, "to": await hub.resolve(to), "delivery": delivery}
     if default_deadline:
         out["note_deadline"] = (f"default deadline {default_deadline} (node.yaml default_reply_deadline_s, "
@@ -461,7 +428,6 @@ async def report_progress(hub: Hub, me: str, message: str, task_id: str | None =
             and any(c["status"] not in TERMINAL_STATES for c in hub.ledger.children(task_id))):
         # Waiting with open child tasks is waiting on them: the node wakes this task when they are done (D-066)
         hub.ledger.add_job(task_id, task["owner"], None, None, None, None, "child tasks", children=True)
-    hub.mark_sub_on_plan(task_id, "!" if new_state == "BLOCKED" else ">", message if new_state == "BLOCKED" else None)
     return {"task_id": task_id, "state": new_state, "sent": ok}
 
 
@@ -498,29 +464,6 @@ async def ask_question(hub: Hub, me: str, task_id: str, question: str, next: str
 async def answer(hub: Hub, me: str, task_id: str, text: str, next: str | None = None) -> dict[str, Any]:
     delivery = await hub.reply(me, task_id, "ANSWER", {"answer": text, **({"next": next} if next else {})})
     return {"task_id": task_id, "delivery": delivery}
-
-
-NUDGE_EVERY_S = 3 * 3600     # a task is nudged by hand at most this often (D-076 §5: "同一任务数小时一次")
-
-
-async def nudge(hub: Hub, me: str, task_id: str, note: str = "") -> dict[str, Any]:
-    """Wake the owner of a task of ours that seems stuck (D-073 batch 2): it must answer what it is doing, where
-    it is stuck and a new eta. A stalled worker is laid out again by its node. At most once in NUDGE_EVERY_S."""
-    task = hub.ledger.task(task_id, "requester")
-    if task is None or task["local_agent"] != str(hub.local_agent(me)[0]):
-        raise KeyError(f"{task_id} was not requested by {me} from this node")
-    if task["status"] in TERMINAL_STATES:
-        raise ValueError(f"{task_id} is {task['status']}: nothing to nudge")
-    now = datetime.now(timezone.utc)
-    if not hub.ledger.claim_nudge(task_id, now.isoformat(), (now - timedelta(seconds=NUDGE_EVERY_S)).isoformat()):
-        # one compare-and-set in the ledger, so two nudges at once (or from two processes) send one
-        raise PermissionError(f"{task_id} was nudged at {hub.ledger.task(task_id, 'requester')['nudged_at']}; "
-                              f"at most once in {NUDGE_EVERY_S // 3600} h")
-    text = (f"nudge from {me}: {note or 'how is it going?'} Reply with what you are doing, where you are stuck "
-            "and a new eta (report_progress eta=…).")
-    delivery = await hub.send(Envelope(type="UPDATE", sender=task["local_agent"], to=task["owner"], task_id=task_id,
-                                       body={"message": text, "next": task["owner"], "nudge": True}))
-    return {"task_id": task_id, "nudged": task["owner"], "delivery": delivery}
 
 
 async def set_session_taking_work(hub: Hub, me: str, on: bool) -> dict[str, Any]:
@@ -569,10 +512,6 @@ async def cancel_task(hub: Hub, me: str, task_id: str, reason: str = "") -> dict
     task = hub.ledger.task(task_id, "requester")
     if task is None:
         raise KeyError(f"{task_id} was not requested from this node")
-    if hub.ledger.drop_held(task_id):
-        # never sent (it waited for its dependencies): nobody else knows it, so no CANCEL goes out
-        hub.ledger.update_task(task_id, "requester", status="CANCELLED")
-        return {"task_id": task_id, "delivery": "withdrawn before it was sent"}
     delivery = await hub.reply(me, task_id, "CANCEL", {"reason": reason} if reason else {})
     # The requester has withdrawn; don't keep waiting on an owner that may never answer
     # (offline for good, or never received the REQUEST).
@@ -604,7 +543,6 @@ async def publish_artifact(hub: Hub, me: str, path: str, *, key: str | None = No
 async def add_observer(hub: Hub, me: str, task_id: str, observer: str) -> dict[str, Any]:
     """Let someone else read a task I take part in (requester, owner or observer): they get copies of its
     REQUEST and RESULT, and the other participants are told so that later RESULTs reach them too."""
-    from .ids import Address
     addr, _ = hub.local_agent(me)
     me_s = str(addr)
     if me_s not in acl(hub.ledger, task_id):
@@ -703,20 +641,6 @@ async def list_artifacts(hub: Hub, me: str | None = None) -> list[dict[str, Any]
     return [a for a in await hub.artifacts.list() if artifact_visible(hub.ledger, viewer, a["uri"])]
 
 
-async def history(hub: Hub, me: str | None = None, task_id: str | None = None, limit: int = 500) -> list[dict]:
-    """Messages from the stream that `me` sent or received. Everyone else's mail is not for `me`."""
-    viewer = str(hub.local_agent(me)[0])
-    rows = []
-    for _subject, data in await hub.bus.history(limit=limit):
-        try:
-            env = Envelope.from_json(data).to_dict()
-        except Exception:
-            continue
-        if (task_id is None or env.get("task_id") == task_id) and message_visible(viewer, env):
-            rows.append(env)
-    return rows
-
-
 async def fetch_artifact(hub: Hub, uri: str, dest_dir: str | None = None, sha256: str | None = None,
                          me: str | None = None) -> dict:
     if not artifact_visible(hub.ledger, str(hub.local_agent(me)[0]), uri):
@@ -759,35 +683,3 @@ def _owned(hub: Hub, me: str, task_id: str) -> dict[str, Any]:
     return task
 
 
-
-def internal_caller(hub: Hub) -> str | None:
-    """The internal subtask (D-073) whose worker the calling process descends from, if any. Decided from the
-    process tree (the worker's pid and start time are recorded when the daemon starts it), as for the lease and
-    _check_actor; MUTMUAS_TASK_ID can only add the restriction, never lift it."""
-    from .node import _ancestors, worker_tasks_of
-    chain = {os.getpid(), *_ancestors(os.getpid())}
-    ids = {t for a in hub.cfg.agents for t in worker_tasks_of(hub.ledger, str(Address(hub.cfg.node, a.id)), chain)}
-    if os.environ.get("MUTMUAS_TASK_ID"):
-        ids.add(os.environ["MUTMUAS_TASK_ID"])
-    for task_id in ids:
-        task = hub.ledger.task(task_id, "owner")
-        if ((task or {}).get("request") or {}).get("internal"):
-            return task_id
-    return None
-
-
-def _not_for_subs(fn):
-    """An internal subtask's worker sees no mail and sends none (D-073)."""
-    @functools.wraps(fn)
-    async def guarded(hub: Hub, *args, **kwargs):
-        if sub := internal_caller(hub):
-            raise PermissionError(f"{sub} is an internal subtask (D-073): its worker may only report progress, "
-                                  "register a job and submit its result")
-        return await fn(hub, *args, **kwargs)
-    return guarded
-
-
-for _name in ("send_request", "check_task", "wait_for_result", "inbox", "clear_inbox", "remind_me",
-              "cancel_reminder", "accept_task", "ask_question", "answer", "cancel_task", "add_observer",
-              "list_tasks", "history", "nudge"):
-    globals()[_name] = _not_for_subs(globals()[_name])

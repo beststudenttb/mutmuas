@@ -90,6 +90,3 @@ def artifact_visible(ledger: Ledger, viewer: str, uri: str) -> bool:
     return row is not None
 
 
-def message_visible(viewer: str, env: dict[str, Any]) -> bool:
-    """A message's body is for its sender and its recipient (observers get their own copies)."""
-    return viewer in (env.get("from"), env.get("to"))

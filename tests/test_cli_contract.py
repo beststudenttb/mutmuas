@@ -12,14 +12,10 @@ import pytest
 from mutmuas import cli, tools
 
 CASES = [
-    (["cancel", "T-1", "--reason", "why"], "cmd_cancel", "cancel_task", ("T-1", "why"), {}),
-    (["cancel", "T-1"], "cmd_cancel", "cancel_task", ("T-1", ""), {}),
-    (["accept", "T-1"], "cmd_accept", "accept_task", ("T-1",), {"eta": None}),
-    (["reject", "T-1", "no time"], "cmd_reject", "reject_task", ("T-1", "no time"), {}),
-    (["question", "T-1", "which one?", "--next", "B:x"], "cmd_question", "ask_question", ("T-1", "which one?"),
-     {"next": "B:x"}),
-    (["question", "T-1", "which one?"], "cmd_question", "ask_question", ("T-1", "which one?"), {"next": None}),
-    (["answer", "T-1", "this one", "--next", "B:x"], "cmd_answer", "answer", ("T-1", "this one"), {"next": "B:x"}),
+    (["session", "off"], "cmd_session", "set_session_taking_work", (False,), {}),
+    (["session", "on"], "cmd_session", "set_session_taking_work", (True,), {}),
+    (["update", "half done", "--task", "T-1", "--state", "WAITING", "--next", "B:x"], "cmd_update",
+     "report_progress", ("half done", "T-1", "WAITING"), {"next": "B:x", "eta": None}),
 ]
 
 
@@ -41,6 +37,7 @@ def test_short_command_calls_its_tool(argv, name, tool, targs, tkwargs, monkeypa
 
 
 def test_short_commands_hold_the_lease():
-    """None of them is lease-free: they act on tasks, so a second session may not use them."""
+    """Those that act on tasks are not lease-free (a second session may not use them); `session` is, on purpose:
+    it is run from a shell beside the session."""
     for argv, name, *_ in CASES:
-        assert name not in cli.LEASE_FREE
+        assert (name in cli.LEASE_FREE) == (name == "cmd_session")

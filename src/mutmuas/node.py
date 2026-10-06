@@ -20,7 +20,6 @@ import asyncio
 import contextlib
 import fcntl
 import itertools
-import json
 import logging
 import os
 import platform
@@ -42,7 +41,7 @@ from .ledger import is_info
 from .protocol import (OPEN_STATES, REQUEST_KINDS, TERMINAL_STATES, ArtifactRef, Envelope, ProtocolError,
                        reply_required, result_body, task_state_for_result)
 from .runtime import TaskContext, group_alive, make_runtime, stop_group
-from .visibility import CARD_KEYS, accepts_kinds, acl, artifact_visible, is_participant, short
+from .visibility import CARD_KEYS, accepts_kinds, acl, short
 from .worktree import GitError, Worktree
 
 log = logging.getLogger(__name__)
@@ -233,9 +232,6 @@ class NodeDaemon:
         # (0 = the leader's task, task created_at, tie-break, task_id): the leader's tasks first, the rest in the
         # order they came (D-049). created_at is the ledger's, so recover() (newest first) keeps that order too.
         self._queues: dict[str, asyncio.PriorityQueue[tuple[int, str, int, str]]] = {}
-        # internal subtasks of an auto_worker post (D-073): their own pool (max_concurrent), so the brain's queue
-        # (one at a time: one conversation) never waits behind a long sub
-        self._internal: dict[str, asyncio.PriorityQueue[tuple[int, str, int, str]]] = {}
         self._arrivals = itertools.count()
         self._queued: dict[str, set[str]] = {}               # task ids queued or running, per agent
         self._running: dict[str, asyncio.Task] = {}          # task_id -> runner task
@@ -270,10 +266,6 @@ class NodeDaemon:
                 brains = 1 if agent.auto_worker else max(1, agent.max_concurrent)   # a brain runs one at a time
                 for i in range(brains):
                     self._spawn(self._runner(agent, addr, self._queues[addr]), f"run:{addr}:{i}")
-                if agent.auto_worker:
-                    self._internal[addr] = asyncio.PriorityQueue()
-                    for i in range(max(1, agent.max_concurrent)):
-                        self._spawn(self._runner(agent, addr, self._internal[addr]), f"sub:{addr}:{i}")
         self._spawn(self._heartbeat(), "heartbeat")
         self._spawn(self._outbox_loop(), "outbox")
         await self.recover()
@@ -653,12 +645,9 @@ class NodeDaemon:
                                        body={"reason": denial})
             return "rejected"
         await hub.publish_task_record(env.task_id)
-        position = None
-        if not env.body.get("internal"):              # a sub has its own line on its brain's plan (D-073)
-            hub.add_inbox_line(hub.ledger.task(env.task_id, "owner"))
-            position = self._position(env.to, env.task_id)
-        if (agent.mode == "worker" or env.body.get("internal")
-                or (agent.auto_worker and not self._session_takes(agent, env.to, env.task_id))):
+        hub.add_inbox_line(hub.ledger.task(env.task_id, "owner"))
+        position = self._position(env.to, env.task_id)
+        if agent.mode == "worker" or (agent.auto_worker and not self._session_takes(agent, env.to, env.task_id)):
             await self._accept(env.task_id, position)
             self._enqueue(env.to, env.task_id)
             await self._notify(agent, env.to, env.task_id,      # status layer only: the lead is no participant
@@ -679,7 +668,7 @@ class NodeDaemon:
         mine = bool((task.get("request") or {}).get("leader"))
         ahead = [t for t in self.hub.ledger.tasks(role="owner", local_agent=addr,
                                                   statuses=("PENDING", "ACCEPTED", "RUNNING"), limit=None)
-                 if not (t.get("request") or {}).get("internal") and t["task_id"] != task_id
+                 if t["task_id"] != task_id
                  and t["created_at"] <= task["created_at"]
                  and (not mine or (t.get("request") or {}).get("leader"))]
         return len(ahead) + 1
@@ -690,16 +679,6 @@ class NodeDaemon:
         needed = REQUEST_KINDS[env.body.get("kind", "query")]
         if not agent.has(needed):
             return f"permission denied: {env.to} lacks {needed} required for kind={env.body.get('kind', 'query')}"
-        if env.body.get("internal"):
-            if env.sender != env.to:
-                return "refused: an internal subtask is sent by an agent to itself (D-073)"
-            if not agent.auto_worker:
-                # a brain, its batch and its sub pool are a post's
-                return f"refused: internal subtasks are for a post with auto_worker; {env.to} has none"
-            parent = self.hub.ledger.task(env.body.get("parent_task") or "", "owner")
-            if parent and agent.project_of(env.body) != agent.project_of(parent.get("request")):
-                return (f"refused: an internal subtask belongs to its parent's project "
-                        f"({agent.project_of(parent.get('request'))}), not {agent.project_of(env.body)}")
         if project := agent.project_of(env.body):
             try:
                 check_token(str(project), "project")
@@ -800,9 +779,8 @@ class NodeDaemon:
             return
         self._queued[addr].add(task_id)
         task = self.hub.ledger.task(task_id, "owner")
-        queue = self._internal.get(addr) if task["request"].get("internal") else None
-        (queue or self._queues[addr]).put_nowait((0 if task["request"].get("leader") else 1, task["created_at"],
-                                                  next(self._arrivals), task_id))
+        self._queues[addr].put_nowait((0 if task["request"].get("leader") else 1, task["created_at"],
+                                       next(self._arrivals), task_id))
 
     async def _runner(self, agent: AgentConfig, addr: str, queue: asyncio.PriorityQueue) -> None:
         while True:
@@ -847,10 +825,8 @@ class NodeDaemon:
             # Claim it for the worker in one transaction with the session check: never done twice, and while
             # the leader's session is there, a task that has not started yet is his to decide (D-032a).
             addr = task["owner"]
-            internal = (task.get("request") or {}).get("internal")         # a sub is never the session's
             refused = hub.ledger.claim_task(task_id, "worker", ("ACCEPTED", "RUNNING"),
-                                            refuse_if=None if internal else
-                                            lambda: self._session_takes(agent, addr, task_id))
+                                            refuse_if=lambda: self._session_takes(agent, addr, task_id))
             if refused:
                 if "session" in refused and task["status"] == "ACCEPTED":
                     # Release the claim first: a stop between the two steps leaves ACCEPTED + no runner, which recover
@@ -871,7 +847,7 @@ class NodeDaemon:
         hub.ledger.update_task(task_id, "owner", result_draft=None)
         # a post's brain (D-073): its runs share one conversation per project while work keeps coming (claude-code;
         # Codex starts afresh each run until its session id can be read back)
-        brain = agent.auto_worker and not request.body.get("internal") and agent.runtime == "claude-code"
+        brain = agent.auto_worker and agent.runtime == "claude-code"
         project = agent.project_of(request.body)
         notes = [n for n in hub.ledger.task(task_id, "owner").get("interrupts") or []]
         if notes:
@@ -1027,7 +1003,6 @@ class NodeDaemon:
                     last_follow_up = asyncio.get_running_loop().time()
                     await self._follow_ups()
                     await self._chase_etas()
-                await self._release_held()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -1256,13 +1231,8 @@ class NodeDaemon:
 
     async def _cascade(self, env: Envelope, kind: str) -> None:
         """Pause and resume travel down parent_task to the open child tasks, on whatever node they run (D-089)."""
-        held = self.hub.ledger.held_ids()
         for child in self.hub.ledger.children(env.task_id):
             if child["status"] in TERMINAL_STATES:
-                continue
-            if child["task_id"] in held:
-                # not sent yet (depends_on): it waits here, paused, until resumed
-                self.hub.ledger.update_task(child["task_id"], "requester", paused=int(kind == "pause"))
                 continue
             await self.hub.send(Envelope(
                 type="UPDATE", sender=child["local_agent"], to=child["owner"], task_id=child["task_id"],
@@ -1272,7 +1242,7 @@ class NodeDaemon:
                                              "next": child["owner"]}))
 
     def _on_nudge(self, agent: AgentConfig, env: Envelope) -> None:
-        """A nudge from the requester (or an eta chase): a worker's task that is neither running nor queued is
+        """An eta chase (D-076): a worker's task that is neither running nor queued is
         laid out again (a stalled worker); a session is woken by the message itself (next)."""
         task = self.hub.ledger.task(env.task_id, "owner")
         if (not task or env.sender != task["requester"] or task["status"] not in ("ACCEPTED", "RUNNING")
@@ -1321,55 +1291,9 @@ class NodeDaemon:
                 await self._follow_up(t, "eta_silent", f"{t['owner']} gave no new eta after its eta {eta} passed "
                                                        f"for {t['task_id']}: wait, or hand it to someone else")
 
-    async def _release_held(self) -> None:
-        """Requests held until the tasks they depend on are done (depends_on): sent with those results and their
-        artifacts once all are done; if one failed, was refused or withdrawn, not sent: the requester is told."""
-        hub = self.hub
-        for held in hub.ledger.held():
-            if (hub.ledger.task(held["task_id"], "requester") or {}).get("paused"):
-                continue                                      # its parent is paused (D-089)
-            deps = {d: hub.ledger.task(d) for d in held["depends_on"]}
-            failed = [d for d, t in deps.items() if t and t["status"] in TERMINAL_STATES
-                      and (t["status"] != "COMPLETED" or t.get("result_status") == "failed")]
-            env = held["envelope"]
-            if failed:
-                hub.ledger.drop_held(env.task_id)
-                text = f"{env.task_id} was not sent: it depends on {', '.join(failed)}, which did not complete"
-                hub.ledger.update_task(env.task_id, "requester", status="FAILED", result_status="failed",
-                                       result=result_body("failed", text))
-                note = Envelope(type="UPDATE", sender=env.sender, to=env.sender, task_id=env.task_id,
-                                body={"message": text, "next": env.sender})
-                hub.ledger.ingest(note)
-                hub.ledger.mark_handled(note.message_id)
-                continue
-            if not all(t and t["status"] == "COMPLETED" for t in deps.values()):
-                continue
-            # what travels with it is checked again for its sender now: only tasks it takes part in, only artifacts it
-            # may see itself
-            sender = env.sender
-            deps = {d: t for d, t in deps.items() if is_participant(hub.ledger, sender, d)}
-            env.body["dependencies"] = [{"task_id": d, "owner": t["owner"], "status": t.get("result_status"),
-                                         "summary": short((t.get("result") or {}).get("summary") or "", 300)}
-                                        for d, t in deps.items()]
-            env.artifacts = [*env.artifacts, *(ArtifactRef.from_dict(a) for t in deps.values()
-                                               for a in t.get("output_refs") or []
-                                               if artifact_visible(hub.ledger, sender, a.get("uri", "")))]
-            if (after := env.body.pop("deadline_after_s", None)) and not env.body.get("deadline"):
-                # a relative deadline (+2h) given with depends_on counts from now, its release (D-098)
-                env.body["deadline"] = (datetime.now(timezone.utc) + timedelta(seconds=after)
-                                        ).isoformat(timespec="seconds")
-            if not env.body.get("deadline") and env.body.get("reply") != "none":
-                from .tools import default_reply_deadline     # its reply clock starts now that it is sent
-                if (due := default_reply_deadline(hub, env.body.get("timeout_s"), env.body.get("kind"))):
-                    env.body.update(deadline=due, deadline_default=True)
-            if not hub.ledger.release_held(env):
-                continue                                      # withdrawn meanwhile: never sent
-            await hub.try_publish(env)
-            await hub.copy_to_observers(sender, env, env.body.get("observers") or [])
-
     async def _expire_brains(self) -> None:
-        """End a brain batch (D-073) after brain_batch_idle_s without a brain run, unless one of the post's subs
-        still runs or one of its tasks waits on a job: the next run then starts a new conversation and picks up
+        """End a brain batch (D-073) after brain_batch_idle_s without a brain run, unless one of its tasks waits on a
+        job or runs: the next run then starts a new conversation and picks up
         from HANDOFF/PLAN. The brain updates those every run, so nothing is lost by forgetting the id."""
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=self.cfg.brain_batch_idle_s)
         ledger = self.hub.ledger
@@ -1377,12 +1301,11 @@ class NodeDaemon:
             agent = self._agent_cfg(row["local_agent"])
             if agent is None or parse_iso(row["updated_at"]) > cutoff:
                 continue
-            # busy, per project: a sub of it still open, a task waiting on a job, or a brain run under way or queued
+            # busy, per project: a task waiting on a job, or a brain run under way or queued
             busy = [t for t in ledger.tasks(role="owner", local_agent=row["local_agent"], statuses=OPEN_STATES,
                                             limit=None)
                     if (agent.project_of(t.get("request")) or "") == row["project"]
-                    and ((t.get("request") or {}).get("internal") or ledger.jobs(t["task_id"])
-                         or t["status"] in ("RUNNING", "ACCEPTED"))]
+                    and (ledger.jobs(t["task_id"]) or t["status"] in ("RUNNING", "ACCEPTED"))]
             if not busy:
                 ledger.forget_brain(row["local_agent"], row["project"])
 
@@ -1415,10 +1338,7 @@ class NodeDaemon:
         Nothing is chased while the owner's node itself is offline (a closed laptop): the clock waits."""
         hub = self.hub
         now = datetime.now(timezone.utc)
-        held = hub.ledger.held_ids()            # not sent yet: nobody owes us a reply
         for t in hub.ledger.tasks(role="requester", statuses=OPEN_STATES, limit=None):
-            if t["task_id"] in held:
-                continue
             request = t.get("request") or {}
             if not reply_required(request):
                 continue
@@ -1539,9 +1459,6 @@ class NodeDaemon:
             if agent.mode == "interactive":      # an accepted task is RUNNING until its result is submitted
                 running = [t["task_id"] for t in owned_open if t["status"] == "RUNNING"]
             state = state_override or ("working" if running else "idle")
-            pending = None
-            with contextlib.suppress(Exception):
-                pending = await bus.inbox_pending(Address(self.cfg.node, agent.id))
             card = {
                 "address": addr, "node": self.cfg.node, "agent_id": agent.id, "display": agent.display,
                 "role": agent.role, "provider": agent.provider, "mode": agent.mode,

@@ -173,10 +173,8 @@ class Hub:
 
     async def request(self, sender: str | None, to: str, body: dict[str, Any], *,
                       artifacts: list[ArtifactRef] | None = None, parent_task: str | None = None,
-                      priority: str = "normal", task_id: str | None = None,
-                      hold_for: list[str] | None = None) -> tuple[str, str]:
-        """Send a REQUEST. Returns (task_id, delivery). hold_for: task ids it depends on (D-073 batch 2): the
-        request is kept on this node ("held") until they are done, then sent with their results."""
+                      priority: str = "normal", task_id: str | None = None) -> tuple[str, str]:
+        """Send a REQUEST. Returns (task_id, delivery)."""
         addr, agent = self.local_agent(sender)
         if not agent.has("REQUEST_TASK"):
             raise PermissionDenied(f"{addr} lacks REQUEST_TASK permission")
@@ -186,10 +184,6 @@ class Hub:
             body = {**body, "parent_task": parent_task}
         env = Envelope(type="REQUEST", sender=str(addr), to=await self.resolve(to), body=body,
                        task_id=task_id or new_task_id(), priority=priority, artifacts=artifacts or [])
-        if hold_for:
-            env.validate()
-            self.ledger.hold_request(env, hold_for)
-            return env.task_id, "held"
         delivery = await self.send(env)
         await self.copy_to_observers(str(addr), env, body.get("observers") or [])
         return env.task_id, delivery
@@ -357,18 +351,6 @@ class Hub:
         log.info("task %s -> %s (%s)", task_id, status, message)
         return True
 
-    def mark_sub_on_plan(self, task_id: str, marker: str, note: str | None = None) -> None:
-        """An internal subtask (D-073) does not write PLAN.md: the node marks its line on its brain's plan, in the
-        project directory the sub belongs to (the brain's own)."""
-        task = self.ledger.task(task_id, "owner")
-        request = (task or {}).get("request") or {}
-        if not request.get("internal"):
-            return
-        agent = self.local_agent(task["owner"])[1]
-        board = agent.home(agent.project_of(request)) / "PLAN.md"
-        if board.is_file():
-            rewrite_plan(board, lambda text: mark_plan_line(text, task_id, marker, note))
-
     def add_inbox_line(self, task: dict[str, Any]) -> None:
         """Arriving work goes on the post's plan, in the 收件 section (spec v1.1 §3.1): one unchecked line naming
         the task; the agent moves it into its plan when it takes the work, and delivery removes it."""
@@ -434,9 +416,6 @@ class Hub:
         await self.try_publish(env)
         await self.publish_task_record(task_id)
         log.info("task %s finished: %s", task_id, result["status"])
-        if (task.get("request") or {}).get("internal"):
-            # a sub's line on its brain's plan (D-073); the brain itself adds and rearranges the lines
-            self.mark_sub_on_plan(task_id, "!" if result["status"] == "failed" else "x", result.get("summary"))
         self.drop_inbox_line(task_id)
         if workdir:
             workdir.mkdir(parents=True, exist_ok=True)          # as a run does; a post may not have run yet

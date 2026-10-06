@@ -117,31 +117,6 @@ async def test_clear_inbox_only_clears_what_inbox_has_shown(make_config, cluster
     assert [m["task_id"] for m in left] == [later["task_id"]]           # the unseen one is still unread
 
 
-async def test_send_on_a_task_only_by_its_participants_and_only_to_the_other_one(make_config, cluster, tmp_path):
-    a = make_config("A", [interactive("main"), interactive("other")])
-    b = make_config("B", [interactive("desk")])
-    await cluster.start(a)
-    await cluster.start(b)
-    hub_a = await cluster.client(a)
-    sent = await tools.send_request(hub_a, "A:main", "B:desk", "review", "send test")
-    agentctl = Path(sys.executable).parent / "agentctl"
-
-    body = tmp_path / "update.yaml"
-    body.write_text("message: progress note\n")
-
-    def send(as_agent, to):
-        return subprocess.run([str(agentctl), "send", to, "--type", "UPDATE", "--task", sent["task_id"],
-                               "--file", str(body), "--config", str(a.path), "--as", as_agent],
-                              capture_output=True, text=True, timeout=60)
-    outsider = send("A:other", "B:desk")
-    assert outsider.returncode != 0 and "not the requester or owner" in outsider.stderr
-    wrong_peer = send("A:main", "A:other")
-    assert wrong_peer.returncode != 0 and "go to B:desk" in wrong_peer.stderr
-    ok = send("A:main", "B:desk")
-    assert ok.returncode == 0, ok.stderr
-
-
-
 async def test_a_notifier_read_does_not_count_as_shown(make_config, cluster):
     a = make_config("A", [interactive("main")])
     b = make_config("B", [interactive("desk")])

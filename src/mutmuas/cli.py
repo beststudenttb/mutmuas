@@ -24,9 +24,9 @@ import yaml
 from . import __version__, tools
 from .bus import Bus, BusUnavailable
 from .config import ConfigError, NodeConfig, dump_config, find_config, load_config
-from .hub import Hub, is_online, PermissionDenied
+from .hub import Hub, is_online
 from .ids import Address, parse_iso
-from .protocol import ArtifactRef, Envelope, ProtocolError
+from .protocol import ProtocolError
 
 # --------------------------------------------------------------------------- helpers
 
@@ -72,9 +72,6 @@ async def _with_hub(args, fn, *, require_bus: bool = True, watch: bool = False):
             delay = min(delay * 2, 30)
     try:
         command = getattr(getattr(args, "fn", None), "__name__", "")
-        if command not in SUB_COMMANDS and (sub := tools.internal_caller(hub)):     # by process tree (D-073)
-            raise SystemExit(f"error: {sub} is an internal subtask (D-073): its worker sees no mail and sends "
-                             "none; it may only report progress, register a job and submit its result")
         if command not in LEASE_FREE and not (command == "cmd_watch" and getattr(args, "headers_only", False)):
             from .node import lease_refusal
             refusal = lease_refusal(hub.ledger, str(hub.local_agent(_me(args))[0]))
@@ -88,9 +85,7 @@ async def _with_hub(args, fn, *, require_bus: bool = True, watch: bool = False):
 # Commands that only read public state: allowed while another session holds the agent. Not `watch`: it shows mail
 # content (objective, summary, ...), so a second session could read the holder's mail through it. `watch --headers-only`
 # shows no content (count, type, sender) and stays lease-free, for notifier services that run outside the session.
-SUB_COMMANDS = {"cmd_update", "cmd_job", "cmd_submit", "cmd_status"}      # all an internal subtask may run
-LEASE_FREE = {"cmd_status", "cmd_agents", "cmd_find", "cmd_session"}   # session: run from a shell beside it      # not whoami: MCP whoami is exempt in the MCP layer
-                                                          # only
+LEASE_FREE = {"cmd_status", "cmd_agents", "cmd_find", "cmd_session"}   # session: run from a shell beside it
 
 
 def _parse_kv(pairs: list[str] | None) -> dict[str, Any]:
@@ -155,10 +150,6 @@ async def cmd_agents(args, hub: Hub):
               f"{','.join(c.get('capabilities', []))}")
 
 
-async def cmd_observe(args, hub: Hub):
-    _print(await tools.add_observer(hub, _me(args), args.task_id, args.observer), args.json)
-
-
 async def cmd_whoami(args, hub: Hub):
     _print(await tools.whoami(hub, _me(args)), args.json)
 
@@ -191,39 +182,9 @@ async def cmd_ask(args, hub: Hub):
         inputs=_parse_kv(args.input) or None, expected_outputs=args.expect, acceptance_criteria=args.accept,
         constraints=args.constraint, timeout_s=args.timeout, priority=args.priority,
         reply=args.reply, deadline=_parse_due(args.due), observers=args.observer,
-        artifacts=[{"uri": uri} for uri in args.artifact or []], leader=args.leader, project=args.project,
-        depends_on=args.depends_on)
+        artifacts=[{"uri": uri} for uri in args.artifact or []], leader=args.leader, project=args.project)
     if args.wait is not None:
         out = await tools.wait_for_result(hub, out["task_id"], args.wait, me=_me(args))
-    _print(out, args.json)
-
-
-async def cmd_send(args, hub: Hub):
-    data = _load_file(args.file) if args.file else {}
-    body = dict(data.get("body", data))
-    artifacts = data.get("artifacts", []) if "body" in data else body.pop("artifacts", [])
-    msg_type = args.type.upper()
-    if msg_type == "REQUEST":
-        fields = ("kind", "inputs", "expected_outputs", "constraints", "acceptance_criteria", "timeout_s", "deadline",
-                  "reply", "observers", "leader")
-        unknown = sorted(set(body) - set(fields) - {"objective", "reason", "priority"})
-        if unknown:   # never drop content silently; free-form data belongs in inputs
-            raise SystemExit(f"error: unknown REQUEST field(s) {unknown}; put free-form data under 'inputs'. "
-                             f"Allowed: objective, reason, priority, {', '.join(fields)}")
-        out = await tools.send_request(
-            hub, _me(args), args.to, body.get("objective") or args.objective or "", body.get("reason") or "",
-            artifacts=artifacts, priority=body.get("priority", "normal"),
-            **{k: body[k] for k in fields if k in body})
-    else:
-        if not args.task:
-            raise SystemExit(f"{msg_type} needs --task")
-        # Through Hub.reply: only the task's requester or owner may send on it, and only to the other one .
-        try:
-            delivery = await hub.reply(_me(args), args.task, msg_type, body,
-                                       [ArtifactRef.from_dict(a) for a in artifacts], to=await hub.resolve(args.to))
-        except (PermissionDenied, KeyError) as e:
-            raise SystemExit(f"error: {e}")
-        out = {"task_id": args.task, "delivery": delivery}
     _print(out, args.json)
 
 
@@ -265,18 +226,6 @@ async def cmd_task(args, hub: Hub):
     for m in view.get("thread") or []:
         print(f"  {m.get('timestamp')}  {m.get('type'):<8} {m.get('from')} -> {m.get('to')}  "
               f"{tools._note(m)[:90]}" + (f"  [{m['delivery']}]" if m.get("delivery") == "queued" else ""))
-
-
-async def cmd_result(args, hub: Hub):
-    if args.wait is not None:
-        out = await tools.wait_for_result(hub, args.task_id, args.wait, me=_me(args))
-    else:
-        out = await tools.check_task(hub, args.task_id, me=_me(args))
-    _print(out, args.json)
-    if args.fetch and out.get("output_refs"):
-        for ref in out["output_refs"]:
-            path = await hub.artifacts.fetch(ArtifactRef.from_dict(ref), args.fetch)
-            print(f"fetched {ref['uri']} -> {path}")
 
 
 async def cmd_inbox(args, hub: Hub):
@@ -359,25 +308,9 @@ def _desktop_notify(title: str, text: str, dry_run: bool = False) -> None:
         subprocess.run(["notify-send", title, text], capture_output=True)
 
 
-async def cmd_cancel(args, hub: Hub):
-    _print(await tools.cancel_task(hub, _me(args), args.task_id, args.reason or ""), args.json)
-
-
-async def cmd_accept(args, hub: Hub):
-    _print(await tools.accept_task(hub, _me(args), args.task_id, eta=args.eta), args.json)
-
-
-async def cmd_reject(args, hub: Hub):
-    _print(await tools.reject_task(hub, _me(args), args.task_id, args.reason), args.json)
-
-
 async def cmd_update(args, hub: Hub):
     _print(await tools.report_progress(hub, _me(args), args.message, args.task, args.state, next=args.next,
                                        eta=args.eta), args.json)
-
-
-async def cmd_nudge(args, hub: Hub):
-    _print(await tools.nudge(hub, _me(args), args.task_id, args.note or ""), args.json)
 
 
 async def cmd_session(args, hub: Hub):
@@ -404,14 +337,6 @@ async def cmd_submit(args, hub: Hub):
                                         if k in data}), args.json)
 
 
-async def cmd_question(args, hub: Hub):
-    _print(await tools.ask_question(hub, _me(args), args.task_id, args.text, next=args.next), args.json)
-
-
-async def cmd_answer(args, hub: Hub):
-    _print(await tools.answer(hub, _me(args), args.task_id, args.text, next=args.next), args.json)
-
-
 async def cmd_artifact(args, hub: Hub):
     if args.action == "publish":
         out = await tools.publish_artifact(hub, _me(args), args.target, key=args.key, description=args.description,
@@ -431,19 +356,6 @@ async def cmd_failures(args, hub: Hub):
     for r in rows:
         print(f"{r['at']}  {r['stage']:<10} {r['address'] or '-':<18} {r['task_id'] or '-':<30} "
               f"{r['attempt'] or '':<2} {r['error'][:90]}")
-
-
-async def cmd_history(args, hub: Hub):
-    """Audit trail from the message stream: the messages I sent or received."""
-    rows = await tools.history(hub, _me(args), args.task, args.limit)
-    if args.json:
-        return _print(rows, True)
-    for r in rows:
-        if r.get("invalid"):
-            print(f"(invalid message on {r['subject']})")
-            continue
-        print(f"{r['timestamp']}  {r['type']:<8} {r['from']:<22} -> {r['to']:<22} task {r['task_id']}  "
-              f"{tools._note(r)[:70]}")
 
 
 def cmd_mcp(args):
@@ -776,9 +688,6 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--capability")
     p.add_argument("--online", action="store_true")
     add("whoami", cmd_whoami, "my own details: open tasks, unread, session (private, from this node)", bus=False)
-    p = add("observe", cmd_observe, "let another agent read a task I take part in (add an observer)", bus=False)
-    p.add_argument("task_id")
-    p.add_argument("observer")
     p = add("find", cmd_find, "best agent for a capability/role")
     p.add_argument("capability")
     p = add("ask", cmd_ask, "send a REQUEST quickly")
@@ -789,8 +698,6 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--reason")
     p.add_argument("--kind", default="query", choices=["query", "artifact", "experiment", "code"])
     p.add_argument("--project", help="the project the work belongs to (default: the recipient's)")
-    p.add_argument("--depends-on", action="append", metavar="TASK",
-                   help="hold it here until this task (repeatable) is done; sent with its result")
     p.add_argument("--input", action="append", help="key=value (value may be JSON)")
     p.add_argument("--expect", action="append", help="expected output (repeatable)")
     p.add_argument("--accept", action="append", help="acceptance criterion (repeatable)")
@@ -806,21 +713,11 @@ def agentctl_parser() -> argparse.ArgumentParser:
                    help="attach an artifact you published or received (repeatable): only an attached one may be "
                         "fetched by the recipient, not a URI written in the text")
     p.add_argument("--wait", type=float, nargs="?", const=600, help="wait for the result (s)")
-    p = add("send", cmd_send, "send a message from a YAML file", bus=False)
-    p.add_argument("to")
-    p.add_argument("--type", default="REQUEST")
-    p.add_argument("--file")
-    p.add_argument("--task")
-    p.add_argument("--objective")
     p = add("tasks", cmd_tasks, "tasks on this node (--all: every node)", bus=False)
     p.add_argument("--all", action="store_true")
     p.add_argument("--limit", type=int, default=50)
     p = add("task", cmd_task, "one task with its full message history", bus=False)
     p.add_argument("task_id")
-    p = add("result", cmd_result, "result of a task", bus=False)
-    p.add_argument("task_id")
-    p.add_argument("--wait", type=float, nargs="?", const=600)
-    p.add_argument("--fetch", metavar="DIR", help="download result artifacts into DIR")
     p = add("inbox", cmd_inbox, "messages addressed to me", bus=False)
     p.add_argument("--all", action="store_true", help="include already seen messages")
     p.add_argument("--peek", action="store_true", help="do not mark messages as read")
@@ -843,24 +740,12 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--headers-only", action="store_true",
                    help="announce count, type and sender only, no content; works without holding the session "
                         "(for notifier services)")
-    p = add("cancel", cmd_cancel, "cancel a task I requested", bus=False)
-    p.add_argument("task_id")
-    p.add_argument("--reason")
-    p = add("accept", cmd_accept, "accept a task sent to me", bus=False)
-    p.add_argument("task_id")
-    p.add_argument("--eta", help="when you expect to deliver (ISO time with timezone)")
-    p = add("reject", cmd_reject, "reject a task sent to me", bus=False)
-    p.add_argument("task_id")
-    p.add_argument("reason")
     p = add("update", cmd_update, "progress update on a task I own", bus=False)
     p.add_argument("message")
     p.add_argument("--task")
     p.add_argument("--state", choices=["RUNNING", "WAITING", "BLOCKED"])
     p.add_argument("--next", metavar="ADDR", help="whose move it is now (wakes them)")
     p.add_argument("--eta", help="a new estimate (ISO time with timezone)")
-    p = add("nudge", cmd_nudge, "remind the owner of a task I requested that seems stuck", bus=False)
-    p.add_argument("task_id")
-    p.add_argument("--note")
     p = add("session", cmd_session, "my session: off = online but takes no work (the worker does); on = back",
             bus=False)
     p.add_argument("action", choices=["off", "on"])
@@ -882,14 +767,6 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--next", metavar="ADDR", help="whose move it is now (wakes them)")
     p.add_argument("--how", help="how it was done (goes into the post's worker-log.md line)")
     p.add_argument("--notes", help="anything worth noting (worker-log.md line)")
-    p = add("question", cmd_question, "ask the other side of a task", bus=False)
-    p.add_argument("task_id")
-    p.add_argument("text")
-    p.add_argument("--next", metavar="ADDR", help="whose move it is now (wakes them)")
-    p = add("answer", cmd_answer, "answer a question on a task", bus=False)
-    p.add_argument("task_id")
-    p.add_argument("text")
-    p.add_argument("--next", metavar="ADDR", help="whose move it is now (wakes them)")
     p = add("artifact", cmd_artifact, "publish | fetch | list artifacts")
     p.add_argument("action", choices=["publish", "fetch", "list"])
     p.add_argument("target", nargs="?", help="path (publish) or URI (fetch)")
@@ -900,9 +777,6 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--dest")
     p = add("failures", cmd_failures, "errors this node skipped and recorded (supervision, D-040)", bus=False)
     p.add_argument("--limit", type=int, default=50)
-    p = add("history", cmd_history, "raw audit trail from the message stream")
-    p.add_argument("--task")
-    p.add_argument("--limit", type=int, default=500)
     p = sub.add_parser("mcp", help="run the MCP server (stdio) for Claude Code / Codex")
     _common(p)
     p.add_argument("--channel", action="store_true",

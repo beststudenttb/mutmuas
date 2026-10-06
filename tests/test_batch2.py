@@ -1,17 +1,13 @@
 """D-073 batch 2 (spec v1.1 §3.1/3.4/3.5/3.6, §5.1; D-076 §6): the node writes arriving work into the plan and
 tells the sender its place in the queue; push state per message and a push of all unread mail when the MCP server
-starts; an eta on accepting, chased once it passes; requests held until the tasks they depend on are done; nudge;
-a session that takes no work."""
+starts; an eta on accepting, chased once it passes; a session that takes no work."""
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
-import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from conftest import Orphan, auto_worker_node, backdate_deadline, owned_task
+from conftest import Orphan, auto_worker_node, owned_task
 
 from mutmuas import tools
 from mutmuas.protocol import Envelope, request_body, result_body
@@ -177,63 +173,7 @@ async def test_work_waiting_on_a_job_or_subtasks_is_not_chased(tmp_path, monkeyp
 # --------------------------------------------------------------------------- depends_on
 
 
-async def test_a_request_is_held_until_what_it_depends_on_is_done(tmp_path):
-    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
-    _requested(ledger, "T-dep")
-    try:
-        sent = await tools.send_request(hub, "B:desk", "C:far", "evaluate the model", "after training",
-                                        depends_on=["T-dep"])
-        assert sent["delivery"] == "held" and not _out(ledger, "REQUEST", sent["task_id"])
-        await daemon._release_held()
-        assert not _out(ledger, "REQUEST", sent["task_id"])
-        await daemon._on_reply(Envelope(type="RESULT", sender="C:far", to="B:desk", task_id="T-dep",
-                                        body=result_body("complete", "weights at runs/x")))
-        await daemon._release_held()
-        [req] = _out(ledger, "REQUEST", sent["task_id"])
-        assert req.body["depends_on"] == ["T-dep"] and "weights at runs/x" in str(req.body["dependencies"])
-    finally:
-        ledger.close()
-
-
-async def test_a_failed_dependency_stops_the_request_and_tells_its_sender(tmp_path):
-    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
-    _requested(ledger, "T-dep")
-    try:
-        sent = await tools.send_request(hub, "B:desk", "C:far", "evaluate", "after training", depends_on=["T-dep"])
-        await daemon._on_reply(Envelope(type="REJECT", sender="C:far", to="B:desk", task_id="T-dep",
-                                        body={"reason": "no GPU"}))
-        await daemon._release_held()
-        assert not _out(ledger, "REQUEST", sent["task_id"])
-        assert ledger.task(sent["task_id"], "requester")["status"] == "FAILED"
-        notes = await tools.inbox(hub, "B:desk", peek=True, types=tools.WAKE)
-        assert any(n["task_id"] == sent["task_id"] and "T-dep" in n["body"]["message"] for n in notes)
-    finally:
-        ledger.close()
-
-
-async def test_depends_on_names_a_task_this_node_knows(tmp_path):
-    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
-    try:
-        with pytest.raises(ValueError, match="T-nowhere"):
-            await tools.send_request(hub, "B:desk", "C:far", "x", "y", depends_on=["T-nowhere"])
-    finally:
-        ledger.close()
-
-
 # --------------------------------------------------------------------------- nudge
-
-
-async def test_a_nudge_wakes_the_owner_once_in_a_while(tmp_path):
-    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
-    _requested(ledger, "T-n")
-    try:
-        await tools.nudge(hub, "B:desk", "T-n", "is it running?")
-        [n] = _out(ledger, "UPDATE", "T-n")
-        assert n.body["nudge"] is True and n.body["next"] == "C:far" and "is it running?" in n.body["message"]
-        with pytest.raises(PermissionError, match="nudged"):
-            await tools.nudge(hub, "B:desk", "T-n")
-    finally:
-        ledger.close()
 
 
 async def test_a_nudge_requeues_a_workers_stalled_task(tmp_path):
@@ -322,61 +262,6 @@ async def test_the_start_push_covers_every_unread_message_oldest_first(tmp_path)
         ledger.close()
 
 
-async def test_depends_on_needs_a_task_the_sender_takes_part_in(tmp_path):
-    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
-    private = Envelope(type="REQUEST", sender="B:other", to="C:private", task_id="T-private",
-                       body=request_body("synthetic private task", "test"))
-    ledger.queue_outgoing(private)
-    ledger.update_task("T-private", "requester", status="COMPLETED", result_status="complete",
-                       result=result_body("complete", "NOT-FOR-B:desk"))
-    try:
-        with pytest.raises(PermissionError, match="T-private"):
-            await tools.send_request(hub, "B:desk", "C:far", "evaluate", "test", depends_on=["T-private"])
-    finally:
-        ledger.close()
-
-
-async def test_a_withdrawn_held_request_is_never_sent(tmp_path):
-    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
-    _requested(ledger, "T-dep")
-    try:
-        held = await tools.send_request(hub, "B:desk", "C:far", "evaluate", "test", depends_on=["T-dep"])
-        await tools.cancel_task(hub, "B:desk", held["task_id"], "obsolete")
-        await daemon._on_reply(Envelope(type="RESULT", sender="C:far", to="B:desk", task_id="T-dep",
-                                        body=result_body("complete", "done")))
-        await daemon._release_held()
-        assert ledger.task(held["task_id"], "requester")["status"] == "CANCELLED"
-        assert not _out(ledger, "REQUEST", held["task_id"]) and ledger.held() == []
-    finally:
-        ledger.close()
-
-
-async def test_a_held_request_is_not_chased_and_gets_its_deadline_on_release(tmp_path, monkeypatch):
-    agent, cfg, ledger, hub, daemon = auto_worker_node(tmp_path)
-    cfg.escalate_to = ["B:secretary"]
-
-    async def card(_):
-        return {"online": True, "mode": "worker"}
-    monkeypatch.setattr(hub, "card_or_none", card)
-    _requested(ledger, "T-dep")
-    try:
-        held = await tools.send_request(hub, "B:desk", "C:far", "evaluate", "test", depends_on=["T-dep"],
-                                        deadline="+1h")
-        backdate_deadline(ledger, held["task_id"], "2000-01-01T00:00:00+00:00")
-        quiet = await tools.send_request(hub, "B:desk", "C:far", "evaluate", "test", depends_on=["T-dep"])
-        await daemon._follow_ups()
-        await daemon._chase_etas()
-        assert not [e for e in ledger.outbox() if e.task_id == held["task_id"]]
-        assert "deadline" not in ledger.task(quiet["task_id"], "requester")["request"]     # starts on release
-        await daemon._on_reply(Envelope(type="RESULT", sender="C:far", to="B:desk", task_id="T-dep",
-                                        body=result_body("complete", "done")))
-        await daemon._release_held()
-        [req] = _out(ledger, "REQUEST", quiet["task_id"])
-        assert req.body.get("deadline") and req.body.get("deadline_default")
-    finally:
-        ledger.close()
-
-
 async def test_off_is_refused_without_a_worker_to_take_the_work(tmp_path, session):
     agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
     ledger.session_beat("B:desk", session.pid, str(agent.workdir_path), session_pid=session.pid)
@@ -386,29 +271,6 @@ async def test_off_is_refused_without_a_worker_to_take_the_work(tmp_path, sessio
             await tools.set_session_taking_work(hub, "B:desk", False)
         agent.auto_worker = True
         assert (await tools.set_session_taking_work(hub, "B:desk", False))["session_takes_work"] is False
-    finally:
-        ledger.close()
-
-
-async def test_two_nudges_at_once_send_one(tmp_path, monkeypatch):
-    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
-    _requested(ledger, "T-nudge")
-    original, entered, both = hub.send, [], asyncio.Event()
-
-    async def yielded_send(env):
-        entered.append(env)
-        if len(entered) == 2:
-            both.set()
-        if len(entered) < 2:                           # give the second nudge every chance to get in too
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(both.wait(), 0.5)
-        return await original(env)
-    monkeypatch.setattr(hub, "send", yielded_send)
-    try:
-        results = await asyncio.gather(tools.nudge(hub, "B:desk", "T-nudge"), tools.nudge(hub, "B:desk", "T-nudge"),
-                                       return_exceptions=True)
-        assert sum(not isinstance(r, Exception) for r in results) == 1
-        assert len([e for e in ledger.outbox() if e.task_id == "T-nudge" and e.body.get("nudge")]) == 1
     finally:
         ledger.close()
 

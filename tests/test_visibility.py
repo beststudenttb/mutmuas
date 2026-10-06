@@ -56,7 +56,6 @@ async def test_no_exit_shows_content_to_non_participants(make_config, cluster, t
         assert not leaks(await hub.task_view(task_id, viewer)), viewer
         assert not leaks(await tools.check_task(hub, task_id, me=viewer)), viewer
         assert not leaks(await hub.all_tasks(viewer=viewer)), viewer
-        assert not leaks(await tools.history(hub, viewer)), viewer
         assert ref["uri"] not in json.dumps(await tools.list_artifacts(hub, viewer)), viewer
         assert "error" in await tools.fetch_artifact(hub, ref["uri"], str(hub.cfg.data_path / "dl"), me=viewer)
         assert not leaks(await tools.inbox(hub, viewer, include_seen=True)), viewer
@@ -74,7 +73,6 @@ async def test_no_exit_shows_content_to_non_participants(make_config, cluster, t
         view = await hub.task_view(task_id, viewer)
         assert "SECRET-RESULT" in json.dumps(view) and "SECRET-REASON" in json.dumps(view), viewer
     assert ref["uri"] in json.dumps(await tools.list_artifacts(hub_b, "B:desk"))
-    assert "SECRET-RESULT" in json.dumps(await tools.history(hub_a, "A:main", task_id))
 
 
 async def test_observers_get_the_content_and_become_participants(make_config, cluster, tmp_path):

@@ -65,8 +65,7 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   The receiving session reading it, with a plain `inbox` and not `--peek`, closes the task with a read receipt
   (`RESULT complete "read by X (no reply requested)"`).
 - `deadline` (ISO 8601 with a timezone, or relative: `+30m`, `+2h`, `+1d`, more than zero) says when the reply is
-  needed. One already past is refused (D-098); a relative one on a request held for `depends_on` counts from its
-  release. Use `agentctl ask --due +2h`.
+  needed. One already past is refused (D-098). Use `agentctl ask --due +2h`.
   - A REQUEST that wants a reply but names no deadline gets one from the requester's node:
     `default_reply_deadline_s` in node.yaml (default 4 h; `0` = no default), and for `kind` experiment or code
     `long_reply_deadline_s` (default 24 h; D-098). With `timeout_s` it is never earlier than `timeout_s` +
@@ -123,8 +122,7 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
     session's task is marked the same way and the session reads the message.
   - Pause and resume travel down `parent_task` to the open child tasks on whatever node they run, and from
     there further down; CANCEL already did (D-066). They go as the child's requester, so no trust is needed
-    for that. A child held until its dependencies are done (depends_on) is paused where it waits and is not
-    sent until resumed.
+    for that.
 - **Follow-up and receipts** (D-073 batch 2, D-076):
   - *Arriving work goes on the plan*: the owner's node adds `- [ ] <task> from <sender>: <first line>` to the
     `## 收件` section of the project's PLAN.md, and the receipt (the PENDING UPDATE, or a worker's ACK) says its
@@ -138,35 +136,18 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
     the requester's node keeps it (`check_task` shows it). When it has passed, the requester's node reminds the
     owner once (an UPDATE with `next`, asking for a new eta). No new eta within an hour: the requester is told,
     and the node's `escalate_to` addresses (the secretary) get a copy. A new eta starts over. WAITING (on a job
-    or subtasks) and BLOCKED work is not chased; an owner whose node is offline is not chased; a session that is
-    gone with no worker behind it is reported instead of chased.
-  - *depends_on*: `send_request(depends_on=[…])` names tasks this node knows. The request is held on the
-    sender's node (`delivery: held`) and sent once they are all done, with their summaries in
-    `body.dependencies` and their artifacts attached. Only tasks the sender takes part in can be named, and
-    only artifacts it may see travel with it (checked again when it is sent). If one failed, was refused or
-    withdrawn, it is not sent: it fails and its sender is told. Withdrawing a held request drops it (no CANCEL
-    goes out). While held it is not chased, and its default reply deadline starts when it is sent.
-  - *nudge*: `nudge(task_id, note)` reminds the owner of a task we requested: it is woken (`next`) and must
-    answer what it does, where it is stuck and a new eta. At most once in three hours per task. The owner's
-    node lays out again a worker's task that is neither running nor queued.
+    or child tasks) and BLOCKED work is not chased; an owner whose node is offline is not chased; a session that is
+    gone with no worker behind it is reported instead of chased. The chase also lays out again a worker's task
+    that is neither running nor queued (a stalled worker).
   - *off*: `agentctl session off` (the launcher's `mutmuas <post> off`) keeps the session online but gives
     it no work: the worker takes new requests and the session's inbox leaves them out; `session on` undoes it.
     A post without a worker (auto_worker) cannot switch off: nobody else would take the work.
-- **Brain and subs** (D-073): a post's worker runs are its *brain*. With claude-code, its runs for one project
+- **Brain** (D-073): a post's worker runs are its *brain*. With claude-code, its runs for one project
   share one conversation (`claude -p --resume`) while work keeps coming; after `brain_batch_idle_s` (node.yaml,
-  default 1800) with no brain run, no sub running and no job waited on, the node forgets the conversation and the
-  next run starts afresh from HANDOFF/PLAN (the brain updates them every run). Brain runs of a post are serial.
-  Codex brains start afresh each run for now. A brain's long work goes to *internal subtasks*:
-  `send_request(to=<itself>, internal=true, model=…)`, only for a post with `auto_worker`. The owner's node
-  refuses one from anyone else, for a plain worker address, or for another project than its parent's (it always
-  belongs to its parent's project). It is always run by the worker (never the session, even one online), from
-  its own pool (`max_concurrent`), on the requested model or the latest Sonnet. It is left out of the session's
-  inbox. Its worker, recognised by the process tree like the lease, gets only `report_progress`,
-  `submit_result` and `add_job`: MCP, agentctl and the mail functions underneath refuse the rest. This is a
-  division of work, not a sandbox: the worker runs as the same user and could read the node's files directly.
-  It writes its outputs under `runs/<task>/` and does not write PLAN/HANDOFF: the node marks the line
-  naming it on the brain's PLAN.md (`[>]` on progress, `[x] — summary` when done, `[!] — why` when failed or
-  blocked). The brain waits for its subs with `add_job(children=True)`.
+  default 1800) with no brain run and no job waited on, the node forgets the conversation and the next run starts
+  afresh from HANDOFF/PLAN (the brain updates them every run). Brain runs of a post are serial. Codex brains start
+  afresh each run for now. A brain's long work runs as a background job (`add_job`) or as child tasks it waits on
+  (`add_job(children=True)`).
 - **Waiting on child tasks** (D-066): requests an owner sends while working on a task carry `parent_task` (set
   automatically inside a worker run). `add_job(children=True)` makes the task wait on its direct children; so does
   reporting `state: WAITING` while a child is open. The wait ends once every child has a result, was refused or
@@ -181,7 +162,7 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
 ### Waking, presence and follow-ups
 
 - **A post with no session** (auto_worker, its session not there): nothing can be pushed to it, so the node runs
-  its brain again when a message names it `next` (a child's QUESTION or BLOCKED, an ANSWER, a nudge) or when a
+  its brain again when a message names it `next` (a child's QUESTION or BLOCKED, an ANSWER) or when a
   reminder it set comes due (D-098). The task woken is the one the message is about, or, for a child task it
   asked for, the parent it belongs to (`parent_task`); a reminder set in a worker run wakes that run's task, one
   without a task (a session's) only lands in the inbox. A child's RESULT does not wake the parent by itself (the
@@ -277,10 +258,9 @@ There are four layers (`src/mutmuas/visibility.py`):
   itself one.
 - **Participants** come from what the node persisted for the task: its requester, its owner, the `observers`
   listed on its request, and agents holding an observer row. Sending mail on a task makes nobody a
-  participant. Only the requester or owner may send on a task: `reply`, `question`, `answer`, and `send`
-  with `--task`.
+  participant. Only the requester or owner may send on a task: `reply`, `question`, `answer`.
 - `observers` go on a REQUEST (`agentctl ask --observer`), or any participant adds them later with
-  `add_observer` / `agentctl observe`.
+  `add_observer`.
   - Observers receive FYI copies of the REQUEST and RESULT. The copies never wake them.
   - Each copy lists the task's participants. The observer's node keeps a copy only if both the sender and
     the recipient are on that list.

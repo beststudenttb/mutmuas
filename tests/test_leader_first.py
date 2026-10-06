@@ -51,7 +51,7 @@ async def test_the_sessions_inbox_lists_the_leaders_mail_first(tmp_path):
         ledger.close()
 
 
-async def test_ask_and_send_carry_the_leader_mark(monkeypatch, tmp_path):
+async def test_ask_carries_the_leader_mark(monkeypatch, tmp_path):
     sent = []
 
     async def fake_send_request(hub, me, to, objective, reason, **kw):
@@ -62,11 +62,7 @@ async def test_ask_and_send_carry_the_leader_mark(monkeypatch, tmp_path):
     parser = cli.agentctl_parser()
     await cli.cmd_ask(parser.parse_args(["ask", "B:desk", "obj", "--leader", "--as", "A:me"]), None)
     await cli.cmd_ask(parser.parse_args(["ask", "B:desk", "obj", "--as", "A:me"]), None)
-    request = tmp_path / "r.json"
-    request.write_text('{"objective": "obj", "reason": "r", "leader": true}')
-    await cli.cmd_send(parser.parse_args(["send", "B:desk", "--type", "REQUEST", "--file", str(request),
-                                          "--as", "A:me"]), None)
-    assert sent == [True, False, True]
+    assert sent == [True, False]
 
 
 async def test_a_restart_queues_tasks_in_the_order_they_came(tmp_path):

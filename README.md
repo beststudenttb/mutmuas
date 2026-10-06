@@ -55,12 +55,9 @@ Two real machines: follow `docs/DEPLOYMENT.md`.
 ```
 agentctl status | agents | find <capability>
 agentctl ask <to> "<objective>" --reason … --kind query|artifact|experiment|code [--input k=v] [--wait]
-agentctl send <to> --file request.yaml
-agentctl tasks [--all] | task <id> | result <id> [--wait] [--fetch DIR] | cancel <id>
-agentctl inbox | accept | reject | update | submit-result | question | answer     (owner side)
-agentctl artifact publish <path> | fetch <uri> | list
-agentctl history [--task <id>]
-agentctl mcp --as A:lead                      # MCP server for Claude Code / Codex
+agentctl tasks [--all] | task <id> | inbox | whoami | failures | session off|on | watch
+agentctl update | job add | submit-result | artifact publish|fetch|list     (script workers: they have no MCP)
+agentctl mcp --as A:lead                      # MCP server for Claude Code / Codex: agents work through it
 
 agent-node init | join | start | service [--write] | server-config | doctor
 ```
