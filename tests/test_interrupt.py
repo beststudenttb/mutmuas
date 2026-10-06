@@ -822,3 +822,48 @@ async def test_a_paused_pending_task_stays_paused_after_a_restart(tmp_path):
         assert task["status"] == "WAITING" and task["paused"] and "T-r" not in daemon._queued["B:desk"]
     finally:
         ledger.close()
+
+
+def _requester_node(tmp_path):
+    """A:main on its own node (no bus): what it sends stays in its outbox, from where the test delivers it."""
+    from mutmuas.config import AgentConfig, NodeConfig
+    from mutmuas.hub import Hub
+    from mutmuas.ledger import Ledger
+    cfg = NodeConfig(project="p", node="A", data_dir=str(tmp_path / "A"),
+                     agents=[AgentConfig(id="main", mode="interactive")]).validate()
+    ledger = Ledger(cfg.db_path)
+    return ledger, Hub(cfg, None, ledger)
+
+
+async def test_the_requester_pauses_resumes_and_interrupts_with_control_task(tmp_path, blocking):
+    agent, cfg, ledger, hub, daemon = _node(tmp_path)
+    cfg.trusted_controllers = ["A:main"]
+    a_ledger, a_hub = _requester_node(tmp_path)
+
+    def sent(type_):
+        return [e for e in a_ledger.outbox() if e.type == type_][-1]
+    task_id = (await tools.send_request(a_hub, "A:main", "B:desk", "train it", "test"))["task_id"]
+    await _deliver(daemon, agent, sent("REQUEST"))
+    runner = await _running(daemon, agent, task_id)
+    try:
+        await tools.control_task(a_hub, "A:main", task_id, "pause", "hold on")
+        await _deliver(daemon, agent, sent("UPDATE"))
+        await _settle(lambda: ledger.task(task_id, "owner")["status"] == "WAITING")
+        assert ledger.task(task_id, "owner")["paused"]
+        await tools.control_task(a_hub, "A:main", task_id, "resume", "go on")
+        await _deliver(daemon, agent, sent("UPDATE"))
+        await asyncio.wait_for(blocking.started.wait(), 5)
+        blocking.started.clear()
+        await tools.control_task(a_hub, "A:main", task_id, "interrupt", "use env v2")
+        await _deliver(daemon, agent, sent("UPDATE"))
+        await asyncio.wait_for(blocking.started.wait(), 5)
+        assert len(blocking.runs) == 3 and "use env v2" in worker_prompt(blocking.runs[-1])
+        with pytest.raises(ValueError):
+            await tools.control_task(a_hub, "A:main", task_id, "stop", "x")
+        with pytest.raises(PermissionError):                       # the owner does not control its own task
+            await tools.control_task(hub, "B:desk", task_id, "pause", "x")
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        ledger.close()
+        a_ledger.close()

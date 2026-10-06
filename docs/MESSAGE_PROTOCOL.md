@@ -108,6 +108,9 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
     may interrupt or pause any of its posts (at first only the secretary: the leader's word comes relayed by
     the secretary). Anyone else may pause and resume only a task it requested, sent to the address that owns
     it. `priority: high` and `leader: true` grant nothing: they only order what is allowed.
+  - Sent with the MCP tool `control_task(task_id, pause|resume|interrupt, message)`: an UPDATE from the task's
+    requester to its owner, so a trusted controller too controls the tasks it requested (the secretary relays
+    the leader's requests); `interrupt` then stops whatever that post runs.
   - An UPDATE or ANSWER from a trusted controller interrupts a worker in the middle of a run when it is about
     the task that worker runs, or carries `interrupt: true` (then it stops whatever the post's worker runs). The
     owner's node stops the run (the whole process group: what ignores SIGTERM gets SIGKILL), keeps the message

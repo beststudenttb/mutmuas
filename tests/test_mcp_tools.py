@@ -3,6 +3,7 @@
 When the MCP server starts it pushes every unread message once more, oldest first."""
 
 import json
+import os
 import sys
 
 from conftest import auto_worker_node, interactive, worker
@@ -26,12 +27,14 @@ async def test_agent_delegates_through_mcp(make_config, cluster, tmp_path):
     await cluster.start(b)
 
     params = StdioServerParameters(command=sys.executable, args=["-m", "mutmuas.cli", "mcp", "--as", "A:main"],
-                                   env={"MUTMUAS_CONFIG": str(a.path), "PATH": "/usr/bin:/bin"}, cwd=str(tmp_path))
+                                   env={"MUTMUAS_CONFIG": str(a.path), "PATH": "/usr/bin:/bin",
+                                        "PYTHONPATH": os.pathsep.join(sys.path)},   # the code under test
+                                   cwd=str(tmp_path))
     async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
         await session.initialize()
         names = {t.name for t in (await session.list_tools()).tools}
         assert {"find_agent", "send_request", "wait_for_result", "fetch_artifact", "submit_result",
-                "publish_artifact", "inbox", "list_agents", "check_task"} <= names
+                "publish_artifact", "inbox", "list_agents", "check_task", "control_task"} <= names
 
         me = await call(session, "whoami")
         assert me["address"] == "A:main"

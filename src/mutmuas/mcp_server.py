@@ -350,6 +350,13 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         return dump(await tools.answer(hub(), state["me"], task_id, answer, next=next))
 
     @server.tool()
+    async def control_task(task_id: str, action: str, message: str) -> str:
+        """Pause, resume or interrupt a task you requested. action: pause | resume | interrupt. pause stops its
+        run and keeps it waiting until resume; interrupt stops the run and lays the task out again with your
+        message first (only if the owner's node trusts you: trusted_controllers)."""
+        return dump(await tools.control_task(hub(), state["me"], task_id, action, message))
+
+    @server.tool()
     async def publish_artifact(path: str, description: str = "", backend: str = "object",
                                task_id: str | None = None) -> str:
         """Upload a file or directory and get a reference to put in messages.

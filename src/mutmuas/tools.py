@@ -430,6 +430,22 @@ async def ask_question(hub: Hub, me: str, task_id: str, question: str, next: str
     return {"task_id": task_id, "delivery": delivery}
 
 
+CONTROLS = ("pause", "resume", "interrupt")
+
+
+async def control_task(hub: Hub, me: str, task_id: str, action: str, message: str) -> dict[str, Any]:
+    """Pause, resume or interrupt a task I requested (D-089): an UPDATE to its owner. The owner's node decides what
+    it may do: pause and resume for the requester, interrupt only for an address in its trusted_controllers."""
+    if action not in CONTROLS:
+        raise ValueError(f"action={action!r}: one of {', '.join(CONTROLS)}")
+    addr, _ = hub.local_agent(me)
+    task = hub.ledger.task(task_id, "requester")
+    if task is None or task["local_agent"] != str(addr):
+        raise PermissionError(f"{addr} did not request {task_id}: only its requester controls it")
+    delivery = await hub.reply(me, task_id, "UPDATE", {"message": message, action: True})
+    return {"task_id": task_id, "action": action, "delivery": delivery}
+
+
 async def answer(hub: Hub, me: str, task_id: str, text: str, next: str | None = None) -> dict[str, Any]:
     delivery = await hub.reply(me, task_id, "ANSWER", {"answer": text, **({"next": next} if next else {})})
     return {"task_id": task_id, "delivery": delivery}
