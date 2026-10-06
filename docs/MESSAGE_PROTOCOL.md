@@ -114,8 +114,10 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
     (`interrupts`); an LLM worker's prompt starts with them.
   - An UPDATE or ANSWER from a trusted controller interrupts a worker in the middle of a run when it is about
     the task that worker runs, or carries `interrupt: true`. About a task of the post, `interrupt: true` acts on
-    that task alone (its run is stopped if it runs; it is laid out again with the message either way); about
-    anything else (the secretary, as owner, on a task the post asked it for) it stops whatever the post runs. The
+    that task alone (its run is stopped if it runs; it is laid out again with the message either way). It stops
+    whatever the post runs only when it comes from the owner of a task the post asked for (the secretary, on a
+    task the post asked it for). An interrupt about a task the owner's node does not know yet (it came before
+    the REQUEST) does nothing, and is not applied to that REQUEST when it arrives. The
     owner's node stops the run (the whole process group: what ignores SIGTERM gets SIGKILL), keeps the message
     on the task (`tasks.interrupts`) and lays the task out again; the next run's prompt starts with it, and a
     brain resumes the same conversation. The node names a new brain conversation itself (`claude -p

@@ -111,6 +111,8 @@ async def test_high_priority_with_interrupt_stops_whatever_the_post_runs(tmp_pat
     owned_task(ledger, "T-r", "ACCEPTED", ingest=True)
     runner = await _running(daemon, agent, "T-r")
     try:
+        ledger.queue_outgoing(Envelope(type="REQUEST", sender="B:desk", to="B:secretary", task_id="T-other",
+                                       body={"objective": "o", "reason": "r"}))     # B:desk asked B:secretary for it
         await _deliver(daemon, agent, _update("T-other", sender="B:secretary", priority="high", interrupt=True))
         await asyncio.wait_for(blocking.started.wait(), 5)
         assert "stop using the old environment" in worker_prompt(blocking.runs[1])
@@ -469,6 +471,8 @@ async def test_a_trusted_interrupt_of_the_post_reaches_its_old_workers(tmp_path,
     ledger.set_runner_pid("T-r", 12345, "synthetic-start")
     try:
         await daemon.recover()
+        ledger.queue_outgoing(Envelope(type="REQUEST", sender="B:desk", to="B:secretary", task_id="T-other",
+                                       body={"objective": "o", "reason": "r"}))     # B:desk asked B:secretary for it
         await _deliver(daemon, agent, _update("T-other", sender="B:secretary", interrupt=True))
         assert stopped == [12345] and "T-r" in daemon._queued["B:desk"]
     finally:
@@ -805,6 +809,8 @@ async def test_an_interrupt_of_the_post_reaches_the_live_worker_of_a_waiting_tas
     ledger.set_runner_pid("T-r", 12345, "synthetic-start")
     ledger.update_task("T-r", "owner", attempts=2)
     try:
+        ledger.queue_outgoing(Envelope(type="REQUEST", sender="B:desk", to="B:secretary", task_id="T-other",
+                                       body={"objective": "o", "reason": "r"}))     # B:desk asked B:secretary for it
         await _deliver(daemon, agent, _update("T-other", sender="B:secretary", interrupt=True))
         assert stopped == [12345] and "T-r" in daemon._queued["B:desk"]
         assert ledger.task("T-r", "owner")["attempts"] == 0                  # the next run starts afresh
@@ -923,3 +929,45 @@ def test_a_script_worker_finds_the_interrupt_in_its_task_json(tmp_path):
         assert ctx.payload()["interrupts"] == ["UPDATE from B:secretary on T-r: use env v2"]
     finally:
         ledger.close()
+
+
+async def test_trusted_controller_interrupting_another_requesters_queued_task_hits_only_it(tmp_path, blocking):
+    """B:secretary (trusted) marks interrupt on T-x (someone else's task of the post, not running) while T-y runs."""
+    agent, cfg, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-y", "ACCEPTED", ingest=True)
+    owned_task(ledger, "T-x", "ACCEPTED", ingest=True)
+    runner = await _running(daemon, agent, "T-y")
+    try:
+        n = len(blocking.runs)
+        await _deliver(daemon, agent, _update("T-x", sender="B:secretary", interrupt=True))
+        await asyncio.sleep(0.5)
+        assert ledger.task("T-x", "owner").get("interrupts")
+        assert not ledger.task("T-y", "owner").get("interrupts")
+        assert len(blocking.runs) == n
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        ledger.close()
+
+
+async def test_control_task_interrupt_arriving_before_its_request_does_not_stop_the_post(tmp_path, blocking):
+    """The owner has no row for X yet (its REQUEST not delivered / still in an outbox): the residual post-level branch."""
+    agent, cfg, ledger, hub, daemon = _node(tmp_path)
+    cfg.trusted_controllers = ["A:main"]
+    a_ledger, a_hub = _requester_node(tmp_path)
+    owned_task(ledger, "T-y", "ACCEPTED", ingest=True)
+    runner = await _running(daemon, agent, "T-y")
+    try:
+        x = (await tools.send_request(a_hub, "A:main", "B:desk", "my task", "test"))["task_id"]
+        n = len(blocking.runs)
+        await tools.control_task(a_hub, "A:main", x, "interrupt", "use env v2")
+        await _deliver(daemon, agent, [e for e in a_ledger.outbox() if e.type == "UPDATE"][-1])  # REQUEST not yet
+        await asyncio.sleep(0.5)
+        y = ledger.task("T-y", "owner")
+        assert not y.get("interrupts"), f"T-y was interrupted by A:main's control of {x}: {y.get('interrupts')}"
+        assert len(blocking.runs) == n
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        ledger.close()
+        a_ledger.close()
