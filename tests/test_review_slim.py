@@ -152,3 +152,56 @@ async def test_retire_waits_for_a_running_plain_worker(node):  # noqa: F811
     ledger.set_runner_pid("T-run", os.getpid(), proc_start(os.getpid()))   # mode: worker: no runner claim
     with pytest.raises(PermissionError, match="worker is running"):
         await retire(path, "plain")
+
+
+# --------------------------------------------------------------------------- review of 2016ae0 (E1): a worker task that
+# registered a job and then reported BLOCKED is laid out again when the job ends or it is named next (B:ops probes)
+
+
+async def test_job_end_wakes_a_blocked_worker_task(tmp_path):
+    _, ledger, daemon = _plain_node(tmp_path)
+    owned_task(ledger, "T-j", "RUNNING", ingest=True)
+    job = Orphan("import time; time.sleep(60)")
+    await tools.add_job(daemon.hub, "B:desk", "T-j", pid=job.pid, note="training")
+    await daemon.hub.owner_transition("T-j", "BLOCKED", "also needs a dataset")   # what report_progress(BLOCKED) does
+    assert ledger.jobs("T-j")
+    try:
+        job.terminate()
+        job.wait(5)
+        await daemon._check_jobs()
+        assert ledger.jobs("T-j") == []
+        task = ledger.task("T-j", "owner")
+        assert "T-j" in daemon._queued["B:desk"], task["status"]
+    finally:
+        ledger.close()
+
+
+async def test_named_next_wakes_a_blocked_worker_task_with_a_job(tmp_path):
+    """_wake_task ends the jobs, hands over to _wake_for_job, and that goes to _settle while still BLOCKED."""
+    _, ledger, daemon = _plain_node(tmp_path)
+    owned_task(ledger, "T-j", "RUNNING", ingest=True)
+    job = Orphan("import time; time.sleep(60)")
+    await tools.add_job(daemon.hub, "B:desk", "T-j", pid=job.pid, note="training")
+    await daemon.hub.owner_transition("T-j", "BLOCKED", "needs an answer")
+    try:
+        await daemon._wake_task(ledger.task("T-j", "owner"), "named next")
+        assert ledger.jobs("T-j") == []                 # the wait was ended ...
+        assert "T-j" in daemon._queued["B:desk"], ledger.task("T-j", "owner")["status"]   # ... so it must run
+    finally:
+        job.terminate()
+        ledger.close()
+
+
+async def test_a_mode_worker_run_records_its_process(tmp_path):
+    """A real mode: worker run through _execute: the process the daemon started is the one in runner_pid."""
+    import sys
+    agent, ledger, daemon = _plain_node(tmp_path)
+    mark = tmp_path / "pid"
+    agent.command = [sys.executable, "-c", f"import os; open({str(mark)!r}, 'w').write(str(os.getpid()))"]
+    owned_task(ledger, "T-x", "ACCEPTED", ingest=True)
+    try:
+        await daemon._execute(agent, "T-x")
+        task = ledger.task("T-x", "owner")
+        assert task["runner"] is None and task["runner_pid"] == int(mark.read_text())
+    finally:
+        ledger.close()

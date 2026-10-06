@@ -1092,6 +1092,8 @@ class NodeDaemon:
         agent = self._agent_cfg(owner)
         if agent.mode == "worker" or (agent.auto_worker and task.get("runner") != "session"):
             hub.ledger.update_task(task_id, "owner", attempts=0)
+            if hub.ledger.task(task_id, "owner")["status"] == "BLOCKED":    # _settle leaves BLOCKED alone: the
+                await hub.owner_transition(task_id, "ACCEPTED", text)       # job's end (or next) lifts it
             await self._settle(task_id, text)            # laid out again, a fresh run
             return
         # A session: a note in its own inbox that hands it the baton (next), which wakes it like a REQUEST. The task

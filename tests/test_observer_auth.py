@@ -1,6 +1,6 @@
-"""D-102 re-review probe (positive): observer copies across three nodes under the generated per-node NATS
-permissions. Requester A, owner B, observer C (C never saw the task, so it must check the copy against B's
-shared task record). Put under tests/ and run."""
+"""Observer copies across three nodes under the generated per-node NATS permissions (D-102, from B:ops's
+review): requester A, owner B, observer C. C never saw the task, so it checks each copy against B's shared task
+record, which only B's node may write."""
 import asyncio
 import json
 
