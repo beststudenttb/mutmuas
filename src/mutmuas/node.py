@@ -448,7 +448,10 @@ class NodeDaemon:
 
     async def _handle(self, agent: AgentConfig, env: Envelope) -> str | None:
         state = await self._handle_message(agent, env)
-        if env.type != "REQUEST" and env.body.get("next") == env.to and not env.body.get("fyi") \
+        # not a REQUEST (it starts its own work), not a RESULT (a child's end is the children job's to judge: the
+        # parent wakes once all are done), not pause/resume/interrupt (handled as control: B:ops review of d385143)
+        if env.type not in ("REQUEST", "RESULT") and env.body.get("next") == env.to and not env.body.get("fyi") \
+                and not any(env.body.get(k) for k in ("pause", "resume", "interrupt")) \
                 and state not in ("rejected", "dropped", "unverified"):
             what = env.body.get("question") or env.body.get("reason") or env.body.get("answer") \
                 or env.body.get("message") or ""
@@ -465,12 +468,12 @@ class NodeDaemon:
     async def _wake_named(self, addr: str, task_id: str | None, why: str) -> None:
         """A post with no session is named next, or its reminder fires (D-098): nothing pushes to it, so its
         brain is run again: its own task, or the task a child of it belongs to (parent_task). A task waiting on a
-        job has the wait ended with the reason; a BLOCKED one is laid out again. A session, a paused task, one
-        that runs or is queued, or a closed one is left as it is. A reminder with no task wakes the post's
-        waiting tasks."""
+        job has the wait ended with the reason; a BLOCKED one is laid out again. A session that takes the task, a
+        paused task, one that runs or is queued, or a closed one is left as it is. A reminder with no task wakes
+        nothing."""
         agent = self._agent_cfg(addr)
         ledger = self.hub.ledger
-        if agent is None or not agent.auto_worker or session_present(ledger, addr):
+        if agent is None or not agent.auto_worker:
             return
         targets = []
         if task_id:
@@ -481,11 +484,13 @@ class NodeDaemon:
             elif asked and asked["local_agent"] == addr and asked.get("parent_task"):
                 parent = ledger.task(asked["parent_task"], "owner")
                 targets = [parent] if parent and parent["owner"] == addr else []
-        else:
-            targets = [t for t in ledger.tasks(role="owner", local_agent=addr, statuses=("WAITING",), limit=None)
-                       if ledger.jobs(t["task_id"]) and not (t.get("request") or {}).get("internal")]
+        # a reminder with no task (a session set it) only lands in the inbox: it would wake every waiting task of
+        # the post, each time it repeats (B:ops review of d385143)
         for task in targets:
-            await self._wake_task(task, why)
+            # per task, as the worker's claim decides it: a session switched off, or one in another project,
+            # leaves the work to the worker (secretary's review of d385143)
+            if not self._session_takes(agent, addr, task["task_id"]):
+                await self._wake_task(task, why)
 
     async def _wake_task(self, task: dict[str, Any], why: str) -> None:
         hub, task_id = self.hub, task["task_id"]
@@ -494,9 +499,10 @@ class NodeDaemon:
             return
         jobs = hub.ledger.jobs(task_id)
         if jobs:
+            ended = f"woken: {why} (this ended your wait on every job of the task: add_job again if you still wait)"
             for job in jobs:
-                hub.ledger.end_job(job["job_id"], f"woken: {why}")
-            await self._wake_for_job(task, jobs[-1], f"woken: {why}")
+                hub.ledger.end_job(job["job_id"], ended)
+            await self._wake_for_job(task, jobs[-1], ended)
         elif task["status"] in ("BLOCKED", "WAITING"):
             hub.ledger.update_task(task_id, "owner", attempts=0)
             await hub.owner_transition(task_id, "ACCEPTED", f"woken: {why}")
@@ -770,6 +776,12 @@ class NodeDaemon:
         fields: dict[str, Any] = {"last_message": env.message_id}
         if env.body.get("eta"):
             fields["eta"] = env.body["eta"]          # the owner's estimate (D-076): chased once it passes
+            deadline = (task.get("request") or {}).get("deadline")
+            with contextlib.suppress(TypeError, ValueError):
+                if (deadline and parse_iso(env.body["eta"]) > parse_iso(deadline)
+                        and ledger.notice_once(env.task_id, f"eta_after_deadline:{env.body['eta']}")):
+                    await self._follow_up(task, "eta_after_deadline", f"{task['owner']} expects to deliver "
+                                          f"{env.task_id} by {env.body['eta']}, after your deadline {deadline}")
         status = REQUESTER_TRANSITIONS.get(env.type)
         if env.type == "UPDATE":
             status = env.body.get("state")
@@ -1346,6 +1358,10 @@ class NodeDaemon:
             env.artifacts = [*env.artifacts, *(ArtifactRef.from_dict(a) for t in deps.values()
                                                for a in t.get("output_refs") or []
                                                if artifact_visible(hub.ledger, sender, a.get("uri", "")))]
+            if (after := env.body.pop("deadline_after_s", None)) and not env.body.get("deadline"):
+                # a relative deadline (+2h) given with depends_on counts from now, its release (D-098)
+                env.body["deadline"] = (datetime.now(timezone.utc) + timedelta(seconds=after)
+                                        ).isoformat(timespec="seconds")
             if not env.body.get("deadline") and env.body.get("reply") != "none":
                 from .tools import default_reply_deadline     # its reply clock starts now that it is sent
                 if (due := default_reply_deadline(hub, env.body.get("timeout_s"), env.body.get("kind"))):
@@ -1416,8 +1432,10 @@ class NodeDaemon:
                 continue
             deadline = request.get("deadline")
             with contextlib.suppress(TypeError, ValueError):
-                # an owner that gave an eta is chased by its eta (_chase_etas), not as overdue (D-098)
-                if (deadline and not t.get("eta") and parse_iso(deadline) < now
+                # an owner that gave an eta is chased by its eta (_chase_etas) while that eta is ahead and the task
+                # is one _chase_etas chases (not WAITING / BLOCKED), not as overdue (D-098; B:ops review)
+                eta_chased = (t.get("eta") and parse_iso(t["eta"]) > now and t["status"] not in ("WAITING", "BLOCKED"))
+                if (deadline and not eta_chased and parse_iso(deadline) < now
                         and hub.ledger.notice_once(t["task_id"], "overdue")):
                     await self._follow_up(t, "overdue", f"{t['owner']} has not replied to {t['task_id']} "
                                                         f"(deadline {deadline}, status {t['status']})")

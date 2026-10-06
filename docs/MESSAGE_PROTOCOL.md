@@ -64,8 +64,9 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
 - `reply` on a REQUEST: `required` (the default) means the owner owes a RESULT. `none` makes it a notice.
   The receiving session reading it, with a plain `inbox` and not `--peek`, closes the task with a read receipt
   (`RESULT complete "read by X (no reply requested)"`).
-- `deadline` (ISO 8601 with a timezone, or relative: `+30m`, `+2h`, `+1d`) says when the reply is needed. One
-  already past is refused (D-098). Use `agentctl ask --due +2h`.
+- `deadline` (ISO 8601 with a timezone, or relative: `+30m`, `+2h`, `+1d`, more than zero) says when the reply is
+  needed. One already past is refused (D-098); a relative one on a request held for `depends_on` counts from its
+  release. Use `agentctl ask --due +2h`.
   - A REQUEST that wants a reply but names no deadline gets one from the requester's node:
     `default_reply_deadline_s` in node.yaml (default 4 h; `0` = no default), and for `kind` experiment or code
     `long_reply_deadline_s` (default 24 h; D-098). With `timeout_s` it is never earlier than `timeout_s` +
@@ -183,9 +184,11 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   its brain again when a message names it `next` (a child's QUESTION or BLOCKED, an ANSWER, a nudge) or when a
   reminder it set comes due (D-098). The task woken is the one the message is about, or, for a child task it
   asked for, the parent it belongs to (`parent_task`); a reminder set in a worker run wakes that run's task, one
-  without a task the post's waiting tasks. A task waiting on a job has the wait ended with the reason (the run
+  without a task (a session's) only lands in the inbox. A child's RESULT does not wake the parent by itself (the
+  children wait does, once all are done), nor does a pause / resume / interrupt (control). A task waiting on a job has the wait ended with the reason (the run
   adds the job again if it still waits); a BLOCKED one is laid out again; a paused, running, queued or closed one
-  is left alone.
+  is left alone. Whether a session takes the work is decided per task as for the worker's claim: a session
+  switched off, or one in another project, leaves it to the worker, so the brain is woken.
 - **ACKs and progress** (an ACK, or an UPDATE that names nobody next and is not a nudge, copy, follow-up or FYI)
   are read as they arrive: they stay in `inbox --all` / check_task but never count as unread, and `clear_inbox`
   clears an older backlog of them even if no listing showed it (D-098).
@@ -230,6 +233,7 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   `escalate_to` in node.yaml (e.g. the secretary). There are two:
   - `overdue`: a reply is required, the deadline has passed, and there is no RESULT yet; not when the owner
     gave an eta: then the eta is chased instead (D-098);
+  - `eta_after_deadline`: the owner's eta is later than the deadline (once per eta; D-098);
   - `session_offline`: the owner is interactive, its node is up, its session is offline, and the request
     is still PENDING.
 

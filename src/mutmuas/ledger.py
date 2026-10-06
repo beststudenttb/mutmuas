@@ -162,9 +162,11 @@ TASK_JSON_FIELDS = ("request", "result", "result_draft", "input_refs", "output_r
 # Informational inbound mail (D-098): an ACK, or an UPDATE that names nobody next and is none of the special kinds
 # (nudge, observer copy or grant, follow-up, an FYI copy to a node lead). It is read as it is handled, so it
 # never piles up as unread.
-INFO_KEYS = ("next", "nudge", "copy_of", "observers_add", "follow_up", "fyi")
+INFO_KEYS = ("next", "nudge", "copy_of", "observers_add", "follow_up", "fyi", "pause", "resume", "interrupt")
+# A key counts when it holds something: absent, null, false, "", [] and {} are all "not set", in SQL as in Python.
 INFO_SQL = ("(type='ACK' OR (type='UPDATE' AND "
-            + " AND ".join(f"json_extract(envelope,'$.body.{k}') IS NULL" for k in INFO_KEYS) + "))")
+            + " AND ".join(f"COALESCE(json_extract(envelope,'$.body.{k}'), 0) IN (0, '', '[]', '{{}}')"
+                           for k in INFO_KEYS) + "))")
 
 
 def is_info(env) -> bool:

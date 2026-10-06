@@ -93,14 +93,22 @@ async def test_a_reminder_set_in_a_run_wakes_that_task(tmp_path):
         ledger.close()
 
 
-async def test_a_reminder_without_a_task_wakes_the_brains_waiting_tasks(tmp_path):
+async def test_a_reminder_without_a_task_only_goes_to_the_inbox(tmp_path):
+    """B:ops review of d385143: a reminder a session set (no task), e.g. every 5 h, woke every waiting task of the
+    post each time. It only lands in the inbox; one set in a worker run wakes its task (above)."""
     agent, cfg, ledger, hub, daemon = auto_worker_node(tmp_path)
     try:
-        await _waiting_brain(ledger, hub)
-        await tools.remind_me(hub, "B:desk", "+1s", "hourly self-check")
+        owned_task(ledger, "T-a", "WAITING", claim="worker", ingest=True)
+        ledger.add_job("T-a", "B:desk", 999999, None, "/tmp/log", None, "training a")
+        owned_task(ledger, "T-b", "WAITING", claim="worker", ingest=True)
+        ledger.add_job("T-b", "B:desk", 999998, None, "/tmp/log", None, "training b")
+        await tools.remind_me(hub, "B:desk", "+1s", "leader: look at the paper draft", every="5h")
         ledger.db.execute("UPDATE reminders SET due='2000-01-01T00:00:00.000+00:00'")
         await daemon._fire_reminders()
-        assert ledger.task("T-p", "owner")["status"] == "ACCEPTED" and "T-p" in daemon._queued["B:desk"]
+        assert [ledger.task(t, "owner")["status"] for t in ("T-a", "T-b")] == ["WAITING", "WAITING"]
+        assert ledger.jobs("T-a") and ledger.jobs("T-b") and not daemon._queued["B:desk"]
+        assert any("paper draft" in (m["body"].get("message") or "")
+                   for m in await tools.inbox(hub, "B:desk", peek=True))
     finally:
         ledger.close()
 
@@ -232,5 +240,161 @@ async def test_an_overdue_task_whose_owner_gave_an_eta_is_chased_by_the_eta(tmp_
         await daemon._follow_ups()
         follow_ups = [e for e in ledger.outbox() if e.body.get("follow_up") == "overdue"]
         assert bool(follow_ups) is chased
+    finally:
+        ledger.close()
+
+
+# --------------------------------------------------------------------------- secretary/C review of d385143
+
+
+@pytest.mark.parametrize("session", ["off", "other project"])
+async def test_a_session_that_leaves_the_work_to_the_worker_does_not_stop_the_wake(tmp_path, session):
+    agent, cfg, ledger, hub, daemon = auto_worker_node(tmp_path)
+    try:
+        child = await _waiting_brain(ledger, hub)
+        cwd = agent.workdir_path
+        if session == "other project":
+            cwd = agent.workdir_path / "other"
+            cwd.mkdir(parents=True)
+        ledger.session_beat("B:desk", os.getpid(), str(cwd), session_pid=os.getpid())
+        if session == "off":
+            ledger.set_session_accepting("B:desk", False)
+        await _deliver(daemon, agent, Envelope(type="QUESTION", sender="C:far", to="B:desk", task_id=child,
+                                               body={"question": "which camera?", "next": "B:desk"}))
+        assert ledger.task("T-p", "owner")["status"] == "ACCEPTED" and "T-p" in daemon._queued["B:desk"]
+    finally:
+        ledger.close()
+
+
+@pytest.mark.parametrize("body,info", [({"next": ""}, True), ({"fyi": False}, True), ({"next": None}, True),
+                                       ({"next": "B:desk"}, False), ({"fyi": True}, False)])
+def test_info_is_the_same_in_python_and_in_sql(tmp_path, body, info):
+    from mutmuas.ledger import INFO_SQL, is_info
+    agent, cfg, ledger, hub, daemon = auto_worker_node(tmp_path)
+    try:
+        env = Envelope(type="UPDATE", sender="C:far", to="B:desk", task_id="T-x", body={"message": "m", **body})
+        ledger.ingest(env)
+        in_sql = ledger.db.execute(f"SELECT {INFO_SQL} FROM messages WHERE message_id=?",
+                                   (env.message_id,)).fetchone()[0]
+        assert is_info(env) is info and bool(in_sql) is info
+    finally:
+        ledger.close()
+
+
+@pytest.mark.parametrize("deadline", ["+0m", "+0s", "-5m"])
+async def test_a_relative_deadline_must_be_ahead(tmp_path, deadline):
+    agent, cfg, ledger, hub, daemon = auto_worker_node(tmp_path)
+    try:
+        with pytest.raises(ValueError):
+            await tools.send_request(hub, "B:desk", "C:far", "x", "y", deadline=deadline)
+    finally:
+        ledger.close()
+
+
+async def test_a_held_requests_relative_deadline_counts_from_its_release(tmp_path):
+    from mutmuas.protocol import result_body
+    agent, cfg, ledger, hub, daemon = auto_worker_node(tmp_path)
+    try:
+        dep = await tools.send_request(hub, "B:desk", "C:far", "train", "dep")
+        held = await tools.send_request(hub, "B:desk", "C:rl", "evaluate", "after", depends_on=[dep["task_id"]],
+                                        deadline="+2h")
+        assert "deadline" not in ledger.task(held["task_id"], "requester")["request"]     # not started yet
+        await daemon._on_reply(Envelope(type="RESULT", sender="C:far", to="B:desk", task_id=dep["task_id"],
+                                        body=result_body("complete", "trained")))
+        await daemon._release_held()
+        assert 7100 < _due_in_s(held, ledger) <= 7200
+        assert not ledger.task(held["task_id"], "requester")["request"].get("deadline_default")
+    finally:
+        ledger.close()
+
+
+async def test_an_eta_after_the_deadline_is_told_to_the_requester_once(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    agent, cfg, ledger, hub, daemon = auto_worker_node(tmp_path)
+    try:
+        sent = await tools.send_request(hub, "B:desk", "C:far", "x", "y", deadline="+1h")
+        late = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat(timespec="seconds")
+        for _ in range(2):
+            await daemon._on_reply(Envelope(type="UPDATE", sender="C:far", to="B:desk", task_id=sent["task_id"],
+                                            body={"state": "RUNNING", "message": "on it", "eta": late}))
+        told = [e for e in ledger.outbox() if e.body.get("follow_up") == "eta_after_deadline"]
+        assert len([e for e in told if e.to == "B:desk"]) == 1
+    finally:
+        ledger.close()
+
+
+async def test_the_wake_tells_the_brain_its_wait_has_ended(tmp_path):
+    agent, cfg, ledger, hub, daemon = auto_worker_node(tmp_path)
+    try:
+        child = await _waiting_brain(ledger, hub)
+        await _deliver(daemon, agent, Envelope(type="QUESTION", sender="C:far", to="B:desk", task_id=child,
+                                               body={"question": "which camera?", "next": "B:desk"}))
+        [job] = ledger.jobs("T-p", open_only=False)
+        assert "add_job again" in job["ended"]
+    finally:
+        ledger.close()
+
+
+async def test_a_resume_of_a_paused_task_waiting_on_a_job_keeps_it_waiting(tmp_path):
+    agent, cfg, ledger, hub, daemon = auto_worker_node(tmp_path)
+    try:
+        owned_task(ledger, "T-j", "WAITING", claim="worker", ingest=True)
+        ledger.add_job("T-j", "B:desk", 999999, None, "/tmp/log", None, "training")
+        ledger.update_task("T-j", "owner", paused=1)
+        await _deliver(daemon, agent, Envelope(type="UPDATE", sender="A:sender", to="B:desk", task_id="T-j",
+                                               body={"message": "resume", "resume": True, "next": "B:desk"}))
+        task = ledger.task("T-j", "owner")
+        assert not task["paused"] and task["status"] == "WAITING" and ledger.jobs("T-j")
+        assert "T-j" not in daemon._queued["B:desk"]
+    finally:
+        ledger.close()
+
+
+async def test_a_childs_result_leaves_the_parent_waiting_for_its_other_children(tmp_path):
+    agent, cfg, ledger, hub, daemon = auto_worker_node(tmp_path)
+    try:
+        c1 = await _waiting_brain(ledger, hub)
+        await tools.send_request(hub, "B:desk", "C:far", "eval", "part of T-p", parent_task="T-p")
+        await _deliver(daemon, agent, Envelope(type="RESULT", sender="C:far", to="B:desk", task_id=c1,
+                                               body={"status": "complete", "summary": "ok", "next": "B:desk"}))
+        assert ledger.task("T-p", "owner")["status"] == "WAITING" and ledger.jobs("T-p")
+        assert "T-p" not in daemon._queued["B:desk"]
+    finally:
+        ledger.close()
+
+
+@pytest.mark.parametrize("status,eta_h,chased", [("RUNNING", 1, False), ("WAITING", 1, True),
+                                                 ("BLOCKED", 1, True), ("RUNNING", -1, True)])
+async def test_overdue_is_held_back_only_while_the_eta_will_still_be_chased(tmp_path, monkeypatch, status, eta_h,
+                                                                           chased):
+    from datetime import datetime, timedelta, timezone
+    from conftest import backdate_deadline
+    agent, cfg, ledger, hub, daemon = auto_worker_node(tmp_path)
+    try:
+        sent = await tools.send_request(hub, "B:desk", "C:far", "x", "y", deadline="+1h")
+        backdate_deadline(ledger, sent["task_id"], "2020-01-01T00:00:00+00:00")
+        eta = (datetime.now(timezone.utc) + timedelta(hours=eta_h)).isoformat(timespec="seconds")
+        ledger.update_task(sent["task_id"], "requester", status=status, eta=eta)
+
+        async def online(addr):
+            return {"online": True, "mode": "interactive", "auto_worker": True}
+        monkeypatch.setattr(hub, "card_or_none", online)
+        await daemon._follow_ups()
+        assert bool([e for e in ledger.outbox() if e.body.get("follow_up") == "overdue"]) is chased
+    finally:
+        ledger.close()
+
+
+@pytest.mark.parametrize("control", ["pause", "resume", "interrupt"])
+def test_a_control_message_is_not_informational(tmp_path, control):
+    from mutmuas.ledger import INFO_SQL, is_info
+    agent, cfg, ledger, hub, daemon = auto_worker_node(tmp_path)
+    try:
+        env = Envelope(type="UPDATE", sender="B:secretary", to="B:desk", task_id="T-x",
+                       body={"message": "m", control: True})
+        ledger.ingest(env)
+        in_sql = ledger.db.execute(f"SELECT {INFO_SQL} FROM messages WHERE message_id=?",
+                                   (env.message_id,)).fetchone()[0]
+        assert not is_info(env) and not in_sql
     finally:
         ledger.close()

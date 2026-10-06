@@ -55,6 +55,10 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                        leader: bool = False, project: str | None = None, internal: bool = False,
                        model: str | None = None, depends_on: list[str] | None = None) -> dict[str, Any]:
     default_deadline = None
+    after_s = None
+    if depends_on and deadline and deadline.startswith("+"):
+        _deadline(deadline)                                       # checked now, counted from the release
+        after_s, deadline = _interval_s(deadline), None
     deadline = _deadline(deadline)
     if not deadline and reply != "none" and not depends_on:      # a held request gets it when it is sent
         default_deadline = default_reply_deadline(hub, timeout_s, kind)
@@ -63,6 +67,8 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                         deadline=deadline or default_deadline, timeout_s=timeout_s, reply=reply, observers=observers,
                         deadline_default=bool(default_deadline),  # the owner can tell it from a chosen one
                         leader=leader)
+    if after_s:
+        body["deadline_after_s"] = after_s        # held (depends_on): the deadline is set on release
     return await _send_request(hub, me, to, body, artifacts=artifacts, parent_task=parent_task, priority=priority,
                                project=project, internal=internal, model=model, depends_on=depends_on)
 
@@ -77,6 +83,8 @@ def _deadline(text: str | None) -> str | None:
         return None
     now = datetime.now(timezone.utc)
     if text.startswith("+") and (delay := _interval_s(text)) is not None:
+        if delay <= 0:
+            raise ValueError(f"deadline={text!r}: a relative deadline must be ahead (+30m, +2h, +1d)")
         return (now + timedelta(seconds=delay)).isoformat(timespec="seconds")
     hint = f"deadline={text!r}: use an ISO time with timezone (e.g. 2026-10-07T18:00:00+09:00) or +30m / +2h / +1d"
     try:
