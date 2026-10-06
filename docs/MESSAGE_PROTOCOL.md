@@ -200,12 +200,16 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
     but `whoami`) refuse to act. When the holder closes, the other session takes over at its next heartbeat.
   - Who acts is decided by how a process was started (D-102): the session's own MCP process holds the lease;
     a worker the daemon started carries MUTMUAS_TASK_ID (its MCP server inherits it) and acts on its own task,
-    holding no lease. Setting that variable by hand is a person's mistake, not something the node guards.
+    holding no lease. The variable is checked against the ledger: it names a task of this agent whose worker
+    process (the pid and start time the daemon recorded) still runs; otherwise the process is no worker.
   - `agentctl` beside the holding session (a shell, a hook) may only read: `status`, `agents`, `find`,
     `whoami`, `tasks`, `task`, `failures`, `inbox --peek`, `watch --headers-only`, and switch the session's own
-    work (`session off|on`). Anything that acts as the agent goes through the session's MCP tools.
+    work (`session off|on`). Anything that acts as the agent goes through the session's MCP tools: `agentctl
+    update`, `submit`, `artifact` and the like from the session's own shell are refused (D-102); a running
+    worker's processes may use them for its own task.
   - Only a foreground `inbox` listing counts as having shown a message; `clear_inbox` marks read only messages
-    shown that way (ACKs and progress excepted, D-098). Notifier reads (`watch`, pushes) do not count.
+    shown that way (ACKs and progress excepted, D-098). Notifier reads (`watch`, pushes) and a shell's
+    `agentctl inbox --peek` do not count.
   - Two projects on one machine are two agents (e.g. `C:paper` and `C:course`), not two sessions of one agent.
 - **Follow-ups.** Every 30 s the requester's daemon checks the tasks it is owed. Each follow-up is sent
   once: an UPDATE to the requester with `next` set to the requester (so it wakes), copied as an FYI to
@@ -247,10 +251,8 @@ There are four layers (`src/mutmuas/visibility.py`):
   inbox counts or session directory; the agent reads those itself with `whoami`. The task KV has no reason,
   inputs, thread, result or artifact references.
 - Every tool filters by viewer:
-  - `task`, `result` and MCP `check_task` return nothing to non-participants, and the status layer to
-    coordinators;
+  - `task` and MCP `check_task` return nothing to non-participants, and the status layer to coordinators;
   - `tasks --all` lists the viewer's own tasks, or every status record for a coordinator;
-  - `history` lists only messages the viewer sent or received;
   - `artifact list` and `fetch` cover only artifacts the viewer published or was sent.
 - `coordinators` is set in the HR-issued node.yaml, e.g. `[B:claude-secretary]`; an agent cannot make
   itself one.
@@ -262,7 +264,8 @@ There are four layers (`src/mutmuas/visibility.py`):
   - Observers receive FYI copies of the REQUEST and RESULT. The copies never wake them.
   - Each copy lists the task's participants. The observer's node keeps a copy only if both the sender and
     the recipient are on that list, and the sender is the task's requester or owner: from its own records, or
-    from the shared task record, which the requester's node writes before it sends the copies (D-102).
+    from the shared task record. The owner's node forwards the REQUEST's copies after it has written that
+    record (a node writes only its own task records), and RESULT copies come after it too (D-102).
   - Every other participant is told `observers_add`, so the requester's side also forwards a later RESULT.
 - A worker's `notify` lead gets the status layer only: task id, a short objective, status.
 - Artifacts: the object store keeps no description (it travels in the participants' ArtifactRef).

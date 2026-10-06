@@ -49,13 +49,22 @@ async def test_session_cannot_reject_a_running_worker_task(tmp_path):
         ledger.close()
 
 
+def _be_the_worker_of(ledger, monkeypatch, task_id):
+    """This process is the worker the daemon started for task_id: its task, a live runner, MUTMUAS_TASK_ID."""
+    import os
+    from mutmuas.node import proc_start
+    owned_task(ledger, task_id, "RUNNING", claim="worker")
+    ledger.set_runner_pid(task_id, os.getpid(), proc_start(os.getpid()))
+    monkeypatch.setenv("MUTMUAS_TASK_ID", task_id)
+
+
 @pytest.mark.asyncio
 async def test_worker_may_not_accept_another_task_as_the_session(tmp_path, monkeypatch):
     """A daemon-run worker's MCP server must not claim another task on the same address for the session."""
     _, ledger, hub = _auto_worker(tmp_path)
     task_id = "T-review-other"
     owned_task(ledger, task_id)
-    monkeypatch.setenv("MUTMUAS_TASK_ID", "T-review-worker")
+    _be_the_worker_of(ledger, monkeypatch, "T-review-worker")
     try:
         with pytest.raises(PermissionError, match="worker|session"):
             await tools.accept_task(hub, "B:desk", task_id)
@@ -72,7 +81,7 @@ async def test_worker_may_not_deliver_the_sessions_other_task(tmp_path, monkeypa
     owned_task(ledger, task_id)
     assert ledger.claim_task(task_id, "session", ("PENDING",)) is None
     ledger.update_task(task_id, "owner", status="RUNNING")
-    monkeypatch.setenv("MUTMUAS_TASK_ID", "T-review-worker")
+    _be_the_worker_of(ledger, monkeypatch, "T-review-worker")
     try:
         with pytest.raises(PermissionError, match="session"):
             await tools.submit_result(hub, "B:desk", "complete", "wrong worker delivered",

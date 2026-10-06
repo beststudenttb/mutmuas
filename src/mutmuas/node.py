@@ -140,12 +140,24 @@ def live_worker_runs(ledger, agent: str) -> dict[int, str]:
     return {pid: task_id for pid, start, task_id in ledger.worker_runs(agent) if same_process(pid, start)}
 
 
+def worker_task(ledger, agent: str | None = None) -> str | None:
+    """The task this process works on as a worker: MUTMUAS_TASK_ID, which the daemon sets when it starts a run, if
+    that task is this agent's and its worker process still runs (D-102: checked against the ledger, not taken on
+    trust)."""
+    task_id = os.environ.get("MUTMUAS_TASK_ID")
+    task = ledger.task(task_id, "owner") if task_id else None
+    if task and (agent is None or task["owner"] == agent) and same_process(task.get("runner_pid"),
+                                                                           task.get("runner_start")):
+        return task_id
+    return None
+
+
 def lease_refusal(ledger, agent: str) -> str | None:
     """Why this process may not act as `agent` now, or None. One agent, one session: while a live session holds
     the agent, only that session's MCP process acts as it (D-102: from how the processes are started, not a proof
-    from the process tree). A worker the daemon started (MUTMUAS_TASK_ID) holds no lease and acts on its own
-    task."""
-    if os.environ.get("MUTMUAS_TASK_ID"):
+    from the process tree). A worker the daemon started for a task of this agent that is still running holds no
+    lease and acts on its own task."""
+    if worker_task(ledger, agent):
         return None
     row = ledger.session_of(agent)
     if not row or row["pid"] in (0, os.getpid()) or not session_alive(row):
@@ -204,7 +216,7 @@ class NodeDaemon:
         self._recheck: set[str] = set()                      # recovered tasks whose old worker still ran
         self._cancel_requested: set[str] = set()
         self._stopped_runs: dict[str, str] = {}              # task -> why: runs a control stopped (D-089), settled at their end
-        self._background: set[asyncio.Task] = set()          # e.g. observer-copy checks against the task KV
+        self._background: set[asyncio.Task] = set()          # e.g. sending observer copies after observers_add
         self._outbox_wake = asyncio.Event()
         self.started = asyncio.Event()
         self.code_version = _code_version()
@@ -257,8 +269,7 @@ class NodeDaemon:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
-        # background jobs (e.g. the unbounded observer-copy verifier) use the Hub too: end them before closing it ;
-        # recover() schedules the verifiers again at the next start
+        # background jobs use the Hub too: end them before closing it
         background = list(self._background)
         for task in background:
             task.cancel()
@@ -485,9 +496,9 @@ class NodeDaemon:
     async def _on_observer_copy(self, env: Envelope) -> str | None:
         """A copy of a task's REQUEST or RESULT for an observer. Who takes part is never taken from the copy
         itself: the sender must be the task's requester or owner, from this node's records when it knows the task,
-        else from the shared task record. That record is written before the copies are sent (hub.copy_to_observers),
-        so it is there when a copy arrives (D-102). It is a consistency check, not an authorisation boundary: any
-        node credential can write the task KV (D-008)."""
+        else from the shared task record. The owner's node writes that record before it forwards the REQUEST's
+        copies, and a RESULT comes after it, so it is there when a copy arrives (D-102). A node may write only its
+        own task records (server permissions), so the record names the owner's view of the task."""
         copy = env.body.get("copy_of") or {}
         if copy.get("type") not in ("REQUEST", "RESULT") or not copy.get("from") or not copy.get("to"):
             return "rejected"
@@ -547,8 +558,8 @@ class NodeDaemon:
             self.hub.ledger.record_failure(stage, error, address, task_id, attempt)
 
     def _background_job(self, coro) -> None:
-        """A job outside the daemon's fixed loops (see _spawn), e.g. an observer-copy verifier that may run as long
-        as the daemon: keep a reference, log a failure; stop() cancels and awaits every one before closing the Hub."""
+        """A job outside the daemon's fixed loops (see _spawn), e.g. sending observer copies: keep a reference, log a
+        failure; stop() cancels and awaits every one before closing the Hub."""
         task = asyncio.create_task(coro)
         self._background.add(task)
 
@@ -574,6 +585,9 @@ class NodeDaemon:
                                        body={"reason": denial})
             return "rejected"
         await hub.publish_task_record(env.task_id)
+        # the REQUEST's observer copies go from here, after the record: an observer's node checks a copy against
+        # it as it arrives (D-102; a node may write only its own task records)
+        await hub.copy_to_observers(env.to, env, env.body.get("observers") or [])
         hub.add_inbox_line(hub.ledger.task(env.task_id, "owner"))
         position = self._position(env.to, env.task_id)
         if agent.mode == "worker" or (agent.auto_worker and not self._session_takes(agent, env.to, env.task_id)):
@@ -674,7 +688,7 @@ class NodeDaemon:
             log.info("message about task %s (%s) kept in inbox only", env.task_id, env.type)
             return None
         if env.sender != task["owner"]:
-            # Only the persisted owner speaks for the task: anyone else's RESULT/UPDATE must not change it .
+            # Only the persisted owner speaks for the task: anyone else's RESULT/UPDATE must not change it.
             log.warning("ignored %s about %s from %s: not its owner %s", env.type, env.task_id, env.sender,
                         task["owner"])
             return "rejected"
@@ -1110,7 +1124,7 @@ class NodeDaemon:
         text = f"{env.type} from {env.sender} on {env.task_id}: {short(env.body.get('message') or env.body.get('answer') or '', 400)}"
         if kind == "interrupt" and env.body.get("interrupt"):
             targets = [t["task_id"] for t in hub.ledger.tasks(role="owner", local_agent=addr,
-                                                              statuses=("ACCEPTED", "RUNNING"), limit=None)
+                                                              statuses=("ACCEPTED", "RUNNING", "WAITING"), limit=None)
                        if t["task_id"] in self._running or self._old_worker(t)]
         else:
             targets = [env.task_id]
@@ -1118,7 +1132,9 @@ class NodeDaemon:
             task = hub.ledger.task(task_id, "owner")
             if not task or task["owner"] != addr or task["status"] in TERMINAL_STATES:
                 continue
-            if kind != "interrupt":
+            if kind == "interrupt":
+                hub.ledger.update_task(task_id, "owner", attempts=0)       # the next run starts afresh
+            else:
                 hub.ledger.update_task(task_id, "owner", paused=int(kind == "pause"))
             self._note_interrupt(task_id, {"pause": "paused by ", "resume": "resumed by "}.get(kind, "") + text)
             why = {"pause": f"paused by {env.sender}", "resume": f"resumed by {env.sender}"}.get(
@@ -1298,6 +1314,8 @@ class NodeDaemon:
         if task["status"] == "PENDING":
             if task.get("runner") == "worker":
                 hub.ledger.release_task(task_id, "worker")
+            if task.get("paused"):
+                await self._settle(task_id, "paused")      # waits for resume like any paused task
             return
         if self._worker_alive(task):
             if hub.ledger.notice_once(task_id, "old-worker-running"):

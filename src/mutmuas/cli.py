@@ -223,11 +223,12 @@ async def cmd_inbox(args, hub: Hub):
     more = None
     if args.all or args.since or args.wait is not None:
         rows = await tools.inbox(hub, _me(args), include_seen=args.all, peek=args.peek, wait_s=args.wait,
-                                 types=types, since=args.since)
+                                 types=types, since=args.since, show=not args.peek)
     else:
         # a look at the mail: the newest page, and what it left out (D-074)
+        # --peek (a hook, a shell beside the session) does not count as the session having seen the mail
         page = await tools.inbox_page(hub, _me(args), peek=args.peek, types=types, before_seq=args.before_seq,
-                                      leader_before_seq=args.leader_before_seq)
+                                      leader_before_seq=args.leader_before_seq, show=not args.peek)
         rows = page["messages"]
         if page.get("next"):
             key, value = next(iter(page["next"].items()))

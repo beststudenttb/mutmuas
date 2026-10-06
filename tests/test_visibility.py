@@ -207,23 +207,55 @@ async def test_codex_shared_records_hold_only_the_agreed_fields(make_config, clu
         assert set(card) <= allowed, set(card) - allowed
 
 
-async def test_the_requester_writes_the_task_record_before_its_observer_copies(tmp_path, monkeypatch):
-    """D-102: an observer's node checks a copy against the shared task record as it arrives, so the requester's
-    node writes that record before the copies go out (no waiting and retrying for the owner's record)."""
+async def test_the_requester_writes_no_record_of_another_node_and_sends_no_request_copy(tmp_path):
+    """B:ops review of the slimming (probe): a node may write only its own task records (server permissions), so
+    the requester's node must not write the owner's record; the owner forwards the REQUEST's copies."""
     from conftest import auto_worker_node
+    from mutmuas.server_config import node_permissions
+    agent, cfg, ledger, hub, daemon = auto_worker_node(tmp_path)          # node B
+    written, sent = [], []
+
+    class FakeBus:
+        connected = True
+        names = type("N", (), {"tasks_kv": f"mm_{cfg.project}_tasks",
+                               "task_key": staticmethod(lambda owner, t: f"{owner.node}.{owner.agent}.{t}")})()
+
+        async def kv_put(self, bucket, key, rec):
+            written.append(f"$KV.{bucket}.{key}")
+
+        async def publish(self, env):
+            sent.append(env.to)
+    hub.bus = FakeBus()
+    try:
+        await tools.send_request(hub, "B:desk", "C:far", "x", "y", observers=["D:watch"])
+        own = f"$KV.mm_{cfg.project}_tasks.{cfg.node}."
+        assert all(w.startswith(own) for w in written), written
+        assert f"$KV.mm_{cfg.project}_tasks.{cfg.node}.>" in node_permissions(cfg.project, cfg.node)["publish"]
+        assert sent == ["C:far"]                                       # no copy to D:watch from the requester
+    finally:
+        ledger.close()
+
+
+async def test_the_owner_forwards_the_request_copies_after_its_record(tmp_path, monkeypatch):
+    from conftest import auto_worker_node
+    from mutmuas.protocol import Envelope, request_body
     agent, cfg, ledger, hub, daemon = auto_worker_node(tmp_path)
     order = []
 
-    async def record(task_id, role="owner"):
-        order.append(("record", role))
+    async def record(task_id):
+        order.append("record")
 
     async def send(env):
-        order.append(("send", env.to))
+        order.append(("send", env.to, env.body.get("copy_of", {}).get("type")))
         return "sent"
     monkeypatch.setattr(hub, "publish_task_record", record)
     monkeypatch.setattr(hub, "send", send)
+    monkeypatch.setattr(hub, "try_publish", lambda env: send(env))
+    body = request_body("x", "y", observers=["D:watch"])
+    env = Envelope(type="REQUEST", sender="A:sender", to="B:desk", task_id="T-o", body=body)
+    ledger.ingest(env)
     try:
-        await tools.send_request(hub, "B:desk", "C:far", "x", "y", observers=["D:watch"])
-        assert order == [("send", "C:far"), ("record", "requester"), ("send", "D:watch")]
+        await daemon._on_request(agent, env)
+        assert order[0] == "record" and ("send", "D:watch", "REQUEST") in order
     finally:
         ledger.close()

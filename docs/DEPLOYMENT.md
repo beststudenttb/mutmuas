@@ -298,6 +298,11 @@ tail -f ~/.mutmuas/visual_rl/B/node.log
 ls ~/.mutmuas/visual_rl/B/runs/  # per-task agent output (<task>.<UTC start time>.attempt<N>.log, one per run)
 ```
 
+While an agent's session is online, a shell beside it only reads (the commands above with `inbox --peek`, and
+`watch --headers-only`) and switches the session's work (`session off|on`). `agentctl update`, `submit`, `artifact`
+and the other commands that act as the agent are refused there: the session acts through its MCP tools, and a
+running worker's own processes act on its task (MESSAGE_PROTOCOL.md, "One agent, one session").
+
 ## 8. Recovery
 
 | Situation | What happens / what to do |

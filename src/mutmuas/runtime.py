@@ -378,8 +378,8 @@ def group_alive(pgid: int) -> bool:
 
 def _group_gone(pgid: int, sig: int) -> bool:
     """Whether the group is gone after sending it sig. Members that are zombies (dead, not yet reaped by their
-    parent) count as gone: Linux lets kill() reach a zombie, macOS answers EPERM for a group of zombies only
-. A live member we may not signal is not gone."""
+    parent) count as gone: Linux lets kill() reach a zombie, macOS answers EPERM for a group of zombies only. A
+    live member we may not signal is not gone."""
     try:
         os.killpg(pgid, sig)
     except ProcessLookupError:

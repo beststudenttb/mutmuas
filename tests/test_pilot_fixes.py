@@ -3,10 +3,13 @@ git and accept notes, auto_worker in agents --json, Skill for LLM workers."""
 
 from __future__ import annotations
 
+import os
+
 from conftest import auto_worker_node, owned_task
 from test_staff_v4 import _claude_ctx
 
 from mutmuas import tools
+from mutmuas.node import proc_start
 from mutmuas.runtime import worker_prompt
 
 
@@ -15,6 +18,7 @@ async def test_a_worker_accepting_its_own_task_gets_success(tmp_path, monkeypatc
     misleading 'being done by the worker (D-032a)' error; for the worker itself it is a no-op."""
     _, _, ledger, hub, _ = auto_worker_node(tmp_path)
     owned_task(ledger, "T-own", "RUNNING", claim="worker")
+    ledger.set_runner_pid("T-own", os.getpid(), proc_start(os.getpid()))    # this process is the running worker
     monkeypatch.setenv("MUTMUAS_TASK_ID", "T-own")                     # the daemon started this process for it
     try:
         out = await tools.accept_task(hub, "B:desk", "T-own")
@@ -26,19 +30,19 @@ async def test_a_worker_accepting_its_own_task_gets_success(tmp_path, monkeypatc
 
 
 async def test_a_plain_workers_accept_does_not_hand_its_task_to_the_session(tmp_path, monkeypatch):
-    """A worker-mode task has no runner claim; an accept from its worker must not claim it for the session,
-    or the worker's own submit_result is refused afterwards."""
+    """An accept from the worker the daemon started must not claim its task for the session, or the worker's own
+    submit_result is refused afterwards."""
     _, _, ledger, hub, _ = auto_worker_node(tmp_path)
-    owned_task(ledger, "T-own", "RUNNING")
+    owned_task(ledger, "T-own", "RUNNING", claim="worker")              # as the daemon leaves it when it starts a run
+    ledger.set_runner_pid("T-own", os.getpid(), proc_start(os.getpid()))    # this process is the running worker
     monkeypatch.setenv("MUTMUAS_TASK_ID", "T-own")
     try:
         assert (await tools.accept_task(hub, "B:desk", "T-own"))["accepted"] is True
-        assert ledger.task("T-own", "owner")["runner"] is None
+        assert ledger.task("T-own", "owner")["runner"] == "worker"
         out = await tools.submit_result(hub, "B:desk", "complete", "done", task_id="T-own")
         assert out["recorded"] is True                                     # not refused as the session's task
     finally:
         ledger.close()
-
 
 
 def test_the_worker_prompt_says_the_task_is_already_accepted(tmp_path):

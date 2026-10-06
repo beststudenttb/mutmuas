@@ -113,6 +113,7 @@ async def retire(config: Path | str, agent_id: str, hand_over: str | None = None
 
 async def _retire(path, cfg, agent, hand_over, dry_run, keep_mailbox) -> dict[str, Any]:
     from .node import live_worker_runs, session_present
+    from .runtime import group_alive
     from .tools import cancel_task
     addr = str(Address(cfg.node, agent.id))
     # one try at the bus: with it the card goes offline now, without it at the node's next start
@@ -123,6 +124,11 @@ async def _retire(path, cfg, agent, hand_over, dry_run, keep_mailbox) -> dict[st
             raise PermissionError(f"{addr}: {why}; close its session first")
         if live_worker_runs(ledger, addr):
             raise PermissionError(f"{addr}: its worker is running a task; wait for it or cancel it first")
+        # a process group a stop could not end runs on whatever its task's state, also after the daemon stopped
+        if stuck := [t["task_id"] for t in ledger.tasks(role="owner", local_agent=addr, limit=None)
+                     if t.get("stuck_pgid") and group_alive(t["stuck_pgid"])]:
+            raise PermissionError(f"{addr}: a process group a stop could not end still runs for {', '.join(stuck)}; "
+                                  "it must end first")
         pending = await hub.bus.inbox_pending(Address.parse(addr)) if hub.bus else None
         if pending and not keep_mailbox:         # unread mail is not thrown away
             raise PermissionError(f"{addr}: {pending} unread message(s) wait in its mailbox; have them read (start "

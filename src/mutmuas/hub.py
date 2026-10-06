@@ -182,7 +182,6 @@ class Hub:
         env = Envelope(type="REQUEST", sender=str(addr), to=await self.resolve(to), body=body,
                        task_id=task_id or new_task_id(), priority=priority, artifacts=artifacts or [])
         delivery = await self.send(env)
-        await self.copy_to_observers(str(addr), env, body.get("observers") or [])
         return env.task_id, delivery
 
     async def copy_to_observers(self, sender: str, original: Envelope, observers: list[str]) -> None:
@@ -190,9 +189,6 @@ class Hub:
         visibility.py). Each copy carries the task's participants, so the observer's node can check that it
         came from one of them. FYI only: it never wakes them."""
         people = sorted(acl(self.ledger, original.task_id) | {original.sender, original.to, *observers})
-        if original.type == "REQUEST" and observers:
-            # the record goes out before the copies, so an observer's node can check a copy as it arrives
-            await self.publish_task_record(original.task_id, role="requester")
         for observer in observers:
             if observer in (original.sender, original.to):
                 continue
@@ -313,10 +309,9 @@ class Hub:
 
     # ---- owner side ---------------------------------------------------
 
-    async def publish_task_record(self, task_id: str, role: str = "owner") -> None:
-        """Mirror a task into the shared task KV so any node can observe it: the owner's node keeps it current;
-        the requester's node writes the first one when it sends copies to observers (D-102)."""
-        task = self.ledger.task(task_id, role)
+    async def publish_task_record(self, task_id: str) -> None:
+        """Mirror an owned task into the shared task KV so any node can observe it (only the owner's node may)."""
+        task = self.ledger.task(task_id, "owner")
         if task is None or self.bus is None:
             return
         # Only the status layer goes to the shared KV (readable by every node): no reason, inputs, thread,

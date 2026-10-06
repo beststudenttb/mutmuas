@@ -55,6 +55,8 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                        reply: str | None = None, observers: list[str] | None = None,
                        leader: bool = False, project: str | None = None) -> dict[str, Any]:
     default_deadline = None
+    for observer in observers or []:
+        Address.parse(observer)        # before anything goes out: a bad one is refused, not half sent
     deadline = from_now(deadline, "deadline")
     if not deadline and reply != "none":
         default_deadline = default_reply_deadline(hub, timeout_s, kind)
@@ -84,8 +86,8 @@ def from_now(text: str | None, field: str) -> str | None:
     and reminders are written (D-102): one in the past, or without a timezone, cannot be given."""
     if text is None:
         return None
-    if not (text.startswith("+") and (delay := _interval_s(text))):
-        raise ValueError(f"{field}={text!r}: give it from now: +30m, +2h, +1d")
+    if not (text.startswith("+") and (delay := _interval_s(text)) and delay >= 1):
+        raise ValueError(f"{field}={text!r}: give it from now, at least a second: +30m, +2h, +1d")
     return (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat(timespec="seconds")
 
 
@@ -195,7 +197,7 @@ def _wake_view(hub: Hub, me: str, types: tuple[str, ...] | None) -> tuple[str | 
 
 async def inbox_page(hub: Hub, me: str, peek: bool = False, types: tuple[str, ...] | None = None,
                      before_seq: int | None = None, leader_before_seq: int | None = None,
-                     limit: int = 50) -> dict[str, Any]:
+                     limit: int = 50, show: bool = True) -> dict[str, Any]:
     """inbox() for a session looking at its mail, plus what the page left out (D-074): how many unread the cursor
     covers, how many it lists, how many older ones it did not, and `next`, the cursor for the following page.
     Paging has two stages: the leader's mail first (leader_before_seq), then the other
@@ -205,7 +207,7 @@ async def inbox_page(hub: Hub, me: str, peek: bool = False, types: tuple[str, ..
     count = functools.partial(hub.ledger.unseen_count, str(addr), types, next_to=next_to, own_results=own_results,
                               project=_project_view(hub, me))        # the same view the listing has (D-072)
     total = count(before_seq=before_seq, leader_before_seq=leader_before_seq)
-    rows = await inbox(hub, me, limit=limit, peek=peek, types=types, before_seq=before_seq,
+    rows = await inbox(hub, me, limit=limit, peek=peek, types=types, before_seq=before_seq, show=show,
                        leader_before_seq=leader_before_seq)
     page: dict[str, Any] = {"messages": rows, "unread": total, "listed": len(rows),
                             "older_unlisted": max(0, total - len(rows))}
@@ -408,13 +410,13 @@ async def submit_result(hub: Hub, me: str, status: str, summary: str, *, task_id
     task = _owned(hub, me, task_id)
     if task["status"] in TERMINAL_STATES:
         return {"task_id": task_id, "error": f"task already {task['status']}; result not changed"}
-    _check_actor(hub, task)
+    worker_of = _check_actor(hub, task)
     body = result_body(status, summary, outputs=outputs, evidence=evidence, limitations=limitations,
                        follow_up=follow_up, how=how, notes=notes)
     if next:
         body["next"] = next
     refs = [ArtifactRef.from_dict(a) for a in artifacts or []]
-    if task_id == _current_task():
+    if worker_of == task_id:
         # Inside a daemon-run task: store a draft; the daemon sends it when the process exits.
         hub.ledger.update_task(task_id, "owner", result_draft={**body, "artifacts": [r.to_dict() for r in refs]})
         return {"task_id": task_id, "recorded": True, "status": status,
@@ -619,12 +621,13 @@ async def fetch_artifact(hub: Hub, uri: str, dest_dir: str | None = None, sha256
 def _check_actor(hub: Hub, task: dict[str, Any]) -> str | None:
     """Every owner-side change (accept, reject, progress, result) is made by whoever holds the task, so a task is
     never done twice and a running worker is not interrupted. The caller is a worker when the daemon started it
-    for a task (MUTMUAS_TASK_ID, which its MCP server inherits), else the session (D-102).
+    for a task that is still running (node.worker_task), else the session (D-102).
     - A worker acts on its own task only.
     - A task held by the worker is changed only by its worker.
     - A task held by the session is not changed by a worker.
     Returns the task the caller is the worker of (None: not a worker)."""
-    worker_of = _current_task()
+    from .node import worker_task
+    worker_of = worker_task(hub.ledger, task["owner"])
     if worker_of and task["task_id"] != worker_of:
         raise PermissionError(f"a worker process (task {worker_of}) acts only on its own task, not on "
                               f"{task['task_id']}, which belongs to the session or to another run")
