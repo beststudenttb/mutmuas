@@ -114,3 +114,41 @@ def test_a_time_from_now_is_at_least_a_second(text):
     with pytest.raises(ValueError, match="at least a second"):
         tools.from_now(text, "deadline")
     assert tools.from_now("+1s", "deadline")
+
+
+# --------------------------------------------------------------------------- re-review of 9b979ac (R1): a mode: worker
+# run is never claimed 'worker', yet the daemon records its process all the same (B:ops probes)
+
+
+async def test_the_daemon_records_the_process_of_an_unclaimed_run(tmp_path):
+    _, _, ledger, _, _ = auto_worker_node(tmp_path)
+    owned_task(ledger, "T-own", "RUNNING")
+    try:
+        ledger.set_runner_pid("T-own", os.getpid(), proc_start(os.getpid()))
+        assert ledger.task("T-own", "owner")["runner_pid"] == os.getpid()
+    finally:
+        ledger.close()
+
+
+async def test_a_plain_worker_may_not_close_another_task_of_its_agent(tmp_path, monkeypatch):
+    _, _, ledger, hub, _ = auto_worker_node(tmp_path)
+    owned_task(ledger, "T-mine", "RUNNING")
+    owned_task(ledger, "T-other", "RUNNING")
+    ledger.set_runner_pid("T-mine", os.getpid(), proc_start(os.getpid()))   # what _record_worker does
+    monkeypatch.setenv("MUTMUAS_TASK_ID", "T-mine")
+    try:
+        with pytest.raises(PermissionError):
+            await tools.submit_result(hub, "B:desk", "complete", "not mine", task_id="T-other")
+    finally:
+        ledger.close()
+
+
+async def test_retire_waits_for_a_running_plain_worker(node):  # noqa: F811
+    path, cfg, ledger, post = node
+    run = Envelope(type="REQUEST", sender="C:lead", to="C:plain", task_id="T-run", body=request_body("run", "test"))
+    ledger.ingest(run)
+    ledger.create_owned_task(run)
+    ledger.update_task("T-run", "owner", status="RUNNING")
+    ledger.set_runner_pid("T-run", os.getpid(), proc_start(os.getpid()))   # mode: worker: no runner claim
+    with pytest.raises(PermissionError, match="worker is running"):
+        await retire(path, "plain")

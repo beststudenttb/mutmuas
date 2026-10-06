@@ -30,15 +30,15 @@ async def test_a_worker_accepting_its_own_task_gets_success(tmp_path, monkeypatc
 
 
 async def test_a_plain_workers_accept_does_not_hand_its_task_to_the_session(tmp_path, monkeypatch):
-    """An accept from the worker the daemon started must not claim its task for the session, or the worker's own
-    submit_result is refused afterwards."""
+    """A worker-mode task has no runner claim; an accept from its worker must not claim it for the session,
+    or the worker's own submit_result is refused afterwards."""
     _, _, ledger, hub, _ = auto_worker_node(tmp_path)
-    owned_task(ledger, "T-own", "RUNNING", claim="worker")              # as the daemon leaves it when it starts a run
+    owned_task(ledger, "T-own", "RUNNING")                                  # mode: worker leaves it unclaimed
     ledger.set_runner_pid("T-own", os.getpid(), proc_start(os.getpid()))    # this process is the running worker
     monkeypatch.setenv("MUTMUAS_TASK_ID", "T-own")
     try:
         assert (await tools.accept_task(hub, "B:desk", "T-own"))["accepted"] is True
-        assert ledger.task("T-own", "owner")["runner"] == "worker"
+        assert ledger.task("T-own", "owner")["runner"] is None
         out = await tools.submit_result(hub, "B:desk", "complete", "done", task_id="T-own")
         assert out["recorded"] is True                                     # not refused as the session's task
     finally:

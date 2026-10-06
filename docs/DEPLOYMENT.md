@@ -360,8 +360,12 @@ Known risks (protections removed on purpose; one line each):
 
 - An old worker's children that outlive their leader after a daemon crash are not looked for; a retry can run
   next to them.
-- An observer copy whose owner publishes its task record only much later (owner offline for long) is dropped
-  after a few tries.
+- Observer copies of a REQUEST are sent by the owner's node once it has the request (D-102), so they arrive
+  only when that node is up. During a rolling upgrade a new requester with an old owner sends none (the old code
+  left them to the requester): they come once the owner's node runs the new code. A copy that reaches an
+  observer without any record of the task (no bus at the observer) is dropped and logged.
+- A worker's send_request takes its own task as parent_task by default (MUTMUAS_TASK_ID), unchecked; the
+  daemon sets that variable, so it is the worker's task unless a person sets it by hand.
 - A session started from the wrong directory (empty memory, other rules) is not told so.
 - A `.claude/settings.json` in or above a worker's project directory that allows tools is trusted.
 - The session holding an agent does not learn that a second session tried to take it over.

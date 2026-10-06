@@ -413,14 +413,16 @@ class Ledger:
                         " AND runner=?", (task_id, runner))
 
     def set_runner_pid(self, task_id: str, pid: int | None, start: str | None = None) -> None:
-        self.db.execute("UPDATE tasks SET runner_pid=?, runner_start=? WHERE task_id=? AND role='owner'"
-                        " AND runner='worker'", (pid, start, task_id))
+        """The process the daemon started for a run, auto_worker (runner 'worker') or mode: worker (no claim)
+        alike: only the daemon writes it, so a pid here always means a daemon-started run."""
+        self.db.execute("UPDATE tasks SET runner_pid=?, runner_start=? WHERE task_id=? AND role='owner'",
+                        (pid, start, task_id))
 
     def worker_runs(self, local_agent: str) -> list[tuple[int, str | None, str]]:
         """(pid, start time, task id) of the processes the daemon started for this agent's unfinished tasks."""
         rows = self.db.execute(
             "SELECT runner_pid, runner_start, task_id FROM tasks WHERE role='owner' AND local_agent=?"
-            " AND runner='worker' AND runner_pid IS NOT NULL"
+            " AND runner_pid IS NOT NULL"
             f" AND status NOT IN ({','.join('?' * len(TERMINAL_STATES))})",
             (local_agent, *TERMINAL_STATES)).fetchall()
         return [(r[0], r[1], r[2]) for r in rows]
