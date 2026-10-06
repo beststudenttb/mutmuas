@@ -145,6 +145,8 @@ class Hub:
 
     async def send(self, env: Envelope) -> str:
         """Outbox first, then try to publish. Returns 'sent' or 'queued' (daemon will retry)."""
+        if env.body.get("next"):            # like `to`: the receiving node knows itself by address, not by alias
+            env.body["next"] = await self.resolve(env.body["next"])
         env.validate()
         self.ledger.queue_outgoing(env)
         return await self.try_publish(env)

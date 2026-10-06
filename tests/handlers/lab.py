@@ -131,6 +131,16 @@ elif action == "block_only":
 
     asyncio.run(with_hub(run))
 
+elif action == "block_once":
+    # Blocked until the requester has answered (the test creates inputs["flag"]), then done.
+    if not Path(inputs["flag"]).exists():
+        async def run(hub):
+            await tools.report_progress(hub, me, "need the dataset path from the requester", state="BLOCKED")
+
+        asyncio.run(with_hub(run))
+    else:
+        print(json.dumps({"status": "complete", "summary": "unblocked"}))
+
 elif action == "evil_commit":
     # A hostile agent: commit, then plant an fsmonitor and hooks in its
     # own clone, so that anything running git in this clone afterwards (i.e. the daemon) would trigger them.

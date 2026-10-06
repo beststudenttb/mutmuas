@@ -374,3 +374,21 @@ async def test_clear_inbox_closes_notices_without_claiming_they_were_read(make_c
     summary = result["result"]["summary"]
     assert result["status"] == "COMPLETED"
     assert "cleared by B:desk without reading" in summary and "read by" not in summary
+
+
+async def test_next_given_as_a_display_alias_names_the_post_by_its_address(tmp_path, monkeypatch):
+    """The receiving node wakes a post only when `next` is its address; an alias (B:b1) is resolved when sent,
+    like `to`, or nothing would ever wake it."""
+    from conftest import auto_worker_node, owned_task
+    _, _, ledger, hub, _ = auto_worker_node(tmp_path)
+    owned_task(ledger, "T-n", "RUNNING", ingest=True)
+
+    async def resolve(target):
+        return {"A:a1": "A:sender"}.get(target, target)
+    monkeypatch.setattr(hub, "resolve", resolve)
+    try:
+        await tools.ask_question(hub, "B:desk", "T-n", "which dataset?", next="A:a1")
+        [question] = [e for e in ledger.outbox() if e.type == "QUESTION"]
+        assert question.body["next"] == "A:sender"
+    finally:
+        ledger.close()
