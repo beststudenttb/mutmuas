@@ -63,10 +63,10 @@ class AgentConfig:
     notify: list[str] = field(default_factory=list)   # e.g. ["B:main"]: told whenever this worker takes or
                                                       # finishes a task, so a node's lead knows what runs there
     env: dict[str, str] = field(default_factory=dict)
-    # Whether the RESULT of this agent's own request (one that wants a reply) wakes its session (no-stall
-    # design, G2). Per agent, not per node: a lead may want it while the leader's project seat on the same node
-    # does not (C's review of 6a5e2f1). Off by default: the leader found RESULT wake-ups disruptive while
-    # chatting (test_wake_filter_ignores_results_of_my_own_requests); turning it on is the leader's decision.
+    # Whether the RESULT of this agent's own request (one that wants a reply) wakes its session (no-stall design, G2).
+    # Per agent, not per node: a lead may want it while the leader's project seat on the same node does not. Off by
+    # default: the leader found RESULT wake-ups disruptive while chatting
+    # (test_wake_filter_ignores_results_of_my_own_requests); turning it on is the leader's decision.
     wake_on_own_results: bool = False
 
     def validate(self) -> None:
@@ -110,7 +110,7 @@ class AgentConfig:
 
     def project_entry(self, name: str) -> str | None:
         """`name` if it is exactly the on-disk name of a real directory (not a link) right under the post
-        directory, else None. One identity for a project everywhere (Codex review of fe64cee): a case variant on a
+        directory, else None. One identity for a project everywhere: a case variant on a
         case-insensitive file system or a link is not a second name for it."""
         home = self.workdir_path
         try:
@@ -221,7 +221,7 @@ class NodeConfig:
     def validate(self) -> NodeConfig:
         check_token(self.project, "project")
         check_token(self.node, "node id")
-        # a control permission: a list of full addresses, or a scalar would authorize by substring (Codex review)
+        # a control permission: a list of full addresses, or a scalar would authorize by substring
         if not isinstance(self.trusted_controllers, list) or not all(
                 isinstance(a, str) and _is_address(a) for a in self.trusted_controllers):
             raise ConfigError(f"trusted_controllers must be a list of addresses like [B:claude-secretary], "
@@ -283,7 +283,7 @@ def load_config(path: str | Path) -> NodeConfig:
             a["workdir"] = rel(a.get("workdir", "."))
             if a.get("repo"):
                 a["repo"] = rel(a["repo"])
-            if isinstance(a.get("code_dirs"), list):          # Codex review of 6c2a60a
+            if isinstance(a.get("code_dirs"), list):
                 a["code_dirs"] = [rel(d) for d in a["code_dirs"]]
     raw_nats = raw.pop("nats", {}) or {}
     for key in ("credentials_file", "tls_ca", "tls_cert", "tls_key"):

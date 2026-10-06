@@ -96,8 +96,8 @@ def session_present(ledger, agent: str) -> str | None:
     return "a session ended moments ago (grace period)" if age < AUTO_WORKER_GRACE_S else None
 
 
-# The lease decision trusts the process tree, so the tree must not come from anything the caller controls:
-# not a PATH-resolved `ps` (Codex review of dfdd719). Linux: /proc; elsewhere: ps by absolute path.
+# The lease decision trusts the process tree, so the tree must not come from anything the caller controls: not a
+# PATH-resolved `ps`. Linux: /proc; elsewhere: ps by absolute path.
 _PS = next((p for p in ("/bin/ps", "/usr/bin/ps") if os.path.exists(p)), None)
 
 
@@ -133,13 +133,13 @@ def proc_start(pid: int) -> str | None:
 def _zombie(pid: int) -> bool:
     """An exited process not yet reaped by its parent: it runs nothing any more."""
     value, from_proc = _proc_field(pid, 0, "stat")                     # stat field 3: state
-    # /proc holds exactly one state letter; ps may add flags after it (Codex review of cleanup #1)
+    # /proc holds exactly one state letter; ps may add flags after it
     return value == "Z" if from_proc else (value or "").startswith("Z")
 
 
 def same_process(pid: int | None, start: str | None) -> bool:
     """The recorded process is still running (not a new process that got the same pid). Both are needed: with no
-    recorded start time nothing proves it is the same process (fail closed; Codex review of f8c105e)."""
+    recorded start time nothing proves it is the same process."""
     return (bool(pid) and start is not None and _pid_alive(pid) and proc_start(pid) == start
             and not _zombie(pid))
 
@@ -172,17 +172,15 @@ def lease_refusal(ledger, agent: str) -> str | None:
     """Why this process may not act as `agent` now, or None. A live session holds the agent: only that session
     (its MCP process, or anything the session itself started, e.g. agentctl from its shell) may use it.
     No environment variable exempts a process: MUTMUAS_TASK_ID is set by whoever starts the process, so it
-    proves nothing (Codex review of dfdd719). Daemon-run tasks act as worker agents, which hold no lease.
-    A post being retired is refused to everyone (Codex re-review of f5d9ad5: the fence only stopped the lease)."""
+    proves nothing. Daemon-run tasks act as worker agents, which hold no lease.
+    A post being retired is refused to everyone."""
     if ledger.retiring(agent):
         return (f"{agent} is being retired (agent-node retire-agent): no session or tool may act as it; "
                 "`retire-agent --undo` lifts this.")
     row = ledger.session_of(agent)
     if not row or row["pid"] in (0, os.getpid()) or not session_alive(row):
         return None
-    # session_pid is missing when the holder's MCP process runs older code (e2fb5d1) than this CLI, as during
-    # an upgrade: then the MCP process's own parent is the session.
-    session = row.get("session_pid") or next(iter(_ancestors(row["pid"])[:1]), None)
+    session = row.get("session_pid")
     chain = {os.getpid(), *_ancestors(os.getpid())}
     # auto_worker: a task the daemon started before the session came is finished, not interrupted (D-032a);
     # its processes descend from the pid the daemon recorded when it spawned them.
@@ -254,7 +252,7 @@ class NodeDaemon:
     # ---- lifecycle ----------------------------------------------------
 
     async def start(self) -> None:
-        # one daemon per data dir, and none while retire-agent changes the node (Codex review of c46cfb9)
+        # one daemon per data dir, and none while retire-agent changes the node
         lock = daemon_lock(self.cfg)
         lock.__enter__()
         self._daemon_lock = lock
@@ -302,8 +300,8 @@ class NodeDaemon:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
-        # background jobs (e.g. the unbounded observer-copy verifier) use the Hub too: end them before closing it
-        # (Codex review of d98413f); recover() schedules the verifiers again at the next start
+        # background jobs (e.g. the unbounded observer-copy verifier) use the Hub too: end them before closing it ;
+        # recover() schedules the verifiers again at the next start
         background = list(self._background)
         for task in background:
             task.cancel()
@@ -315,7 +313,7 @@ class NodeDaemon:
                     await self._publish_cards(state_override="offline")
                 await self.hub.close()
         finally:
-            # its loops have ended: the lock goes even if going offline is cancelled or fails (Codex third review)
+            # its loops have ended: the lock goes even if going offline is cancelled or fails
             if (lock := getattr(self, "_daemon_lock", None)) is not None:
                 self._daemon_lock = None
                 lock.__exit__(None, None, None)
@@ -323,7 +321,7 @@ class NodeDaemon:
 
     async def run_forever(self) -> None:
         try:
-            await self.start()          # a failed start is cleaned up too: its lock let go (Codex re-review)
+            await self.start()          # a failed start is cleaned up too: its lock let go
             await asyncio.Event().wait()
         finally:
             await self.stop()
@@ -353,11 +351,11 @@ class NodeDaemon:
 
     async def recover(self) -> None:
         hub = self.hub
-        # every open task, not just the newest page (A:codex: a backlog > 200 left old tasks stuck)
+        # every open task, not just the newest page
         for task in hub.ledger.tasks(role="owner", statuses=OPEN_STATES, limit=None):
             agent = self._agent_cfg(task["owner"])
             if agent is not None and task.get("paused"):
-                # paused until resumed (D-089); a worker that outlived the old node is stopped (Codex review of 9f39ff0)
+                # paused until resumed (D-089); a worker that outlived the old node is stopped
                 await self._stop_old_worker(task)
                 continue
             if agent is None:
@@ -448,8 +446,8 @@ class NodeDaemon:
 
     async def _handle(self, agent: AgentConfig, env: Envelope) -> str | None:
         state = await self._handle_message(agent, env)
-        # not a REQUEST (it starts its own work), not a RESULT (a child's end is the children job's to judge: the
-        # parent wakes once all are done), not pause/resume/interrupt (handled as control: B:ops review of d385143)
+        # not a REQUEST (it starts its own work), not a RESULT (a child's end is the children job's to judge: the parent
+        # wakes once all are done), not pause/resume/interrupt
         if env.type not in ("REQUEST", "RESULT") and env.body.get("next") == env.to and not env.body.get("fyi") \
                 and not any(env.body.get(k) for k in ("pause", "resume", "interrupt")) \
                 and state not in ("rejected", "dropped", "unverified"):
@@ -484,11 +482,11 @@ class NodeDaemon:
             elif asked and asked["local_agent"] == addr and asked.get("parent_task"):
                 parent = ledger.task(asked["parent_task"], "owner")
                 targets = [parent] if parent and parent["owner"] == addr else []
-        # a reminder with no task (a session set it) only lands in the inbox: it would wake every waiting task of
-        # the post, each time it repeats (B:ops review of d385143)
+        # a reminder with no task (a session set it) only lands in the inbox: it would wake every waiting task of the
+        # post, each time it repeats
         for task in targets:
-            # per task, as the worker's claim decides it: a session switched off, or one in another project,
-            # leaves the work to the worker (secretary's review of d385143)
+            # per task, as the worker's claim decides it: a session switched off, or one in another project, leaves the
+            # work to the worker
             if not self._session_takes(agent, addr, task["task_id"]):
                 await self._wake_task(task, why)
 
@@ -528,15 +526,15 @@ class NodeDaemon:
 
     def _on_observer_copy(self, env: Envelope) -> str | None:
         """A copy of a task's REQUEST or RESULT for an observer. Who takes part is never taken from the copy
-        itself (a sender could list itself: Codex review of dfdd719):
+        itself:
         - this node knows the task: the sender must be in the persisted ACL, else rejected;
         - this node has never heard of it (a cross-node observer): kept unverified, not shown, until the shared
           task record names the sender as its requester or owner (_verify_observer_copy)."""
         copy = env.body.get("copy_of") or {}
         if copy.get("type") not in ("REQUEST", "RESULT") or not copy.get("from") or not copy.get("to"):
             return "rejected"
-        # Structural check (as documented): the copy lists both its sender and its recipient. It proves nothing
-        # by itself, so the authoritative checks below still decide (Codex review of 8c018ee).
+        # Structural check (as documented): the copy lists both its sender and its recipient. It proves nothing by
+        # itself, so the authoritative checks below still decide.
         people = set(env.body.get("participants") or [])
         if env.sender not in people or env.to not in people:
             log.warning("dropped observer copy %s: sender or recipient not in its participant list", env.short())
@@ -545,8 +543,8 @@ class NodeDaemon:
         if known:
             row = self.hub.ledger.task(env.task_id)        # every row of a task has the same requester/owner
             if env.sender not in (row["requester"], row["owner"]):
-                # Content copies come from the requester or owner only; an observer's grant is relayed by the
-                # owner (Codex reviews of 8c018ee and d13ffc8), so an observer never authors one.
+                # Content copies come from the requester or owner only; an observer's grant is relayed by the owner, so
+                # an observer never authors one.
                 log.warning("dropped observer copy %s: %s is not the task's requester or owner", env.short(),
                             env.sender)
                 return "rejected"
@@ -558,8 +556,8 @@ class NodeDaemon:
     def _still_unverified(self, message_id: str) -> bool:
         return self.hub.ledger.inbound_state(message_id) in (None, "new", "unverified")
 
-    # The copy and the owner's task record travel separately, so the record may not be there yet: look again
-    # with growing gaps, then every last gap until it appears (Codex reviews of 8c018ee and d13ffc8).
+    # The copy and the owner's task record travel separately, so the record may not be there yet: look again with
+    # growing gaps, then every last gap until it appears.
     VERIFY_BACKOFF_S = (0.05, 0.2, 1, 3, 10, 30)
 
     async def _verify_observer_copy(self, env: Envelope) -> None:
@@ -613,9 +611,9 @@ class NodeDaemon:
         new = [o for o in added if o not in before]
         from_observer = owned is not None and env.sender not in (owned["requester"], owned["owner"])
         if owned and owned["local_agent"] == env.to and new and from_observer:
-            # (a requester that adds an observer sends the copies itself: relaying would duplicate them)
-            # An observer added them: as the owner, relay the copies, so that a node that never saw the task can
-            # check the sender against the task record (Codex review of 8c018ee).
+            # (a requester that adds an observer sends the copies itself: relaying would duplicate them) An observer
+            # added them: as the owner, relay the copies, so that a node that never saw the task can check the sender
+            # against the task record.
             from .tools import send_observer_copies
             self._background_job(send_observer_copies(self.hub, env.to, env.task_id, new))
         return None
@@ -696,7 +694,7 @@ class NodeDaemon:
             if env.sender != env.to:
                 return "refused: an internal subtask is sent by an agent to itself (D-073)"
             if not agent.auto_worker:
-                # a brain, its batch and its sub pool are a post's (Codex review of 09456a9)
+                # a brain, its batch and its sub pool are a post's
                 return f"refused: internal subtasks are for a post with auto_worker; {env.to} has none"
             parent = self.hub.ledger.task(env.body.get("parent_task") or "", "owner")
             if parent and agent.project_of(env.body) != agent.project_of(parent.get("request")):
@@ -768,8 +766,7 @@ class NodeDaemon:
             log.info("message about task %s (%s) kept in inbox only", env.task_id, env.type)
             return None
         if env.sender != task["owner"]:
-            # Only the persisted owner speaks for the task: anyone else's RESULT/UPDATE must not change it
-            # (Codex review of dfdd719: a RESULT from an unrelated sender completed the task).
+            # Only the persisted owner speaks for the task: anyone else's RESULT/UPDATE must not change it .
             log.warning("ignored %s about %s from %s: not its owner %s", env.type, env.task_id, env.sender,
                         task["owner"])
             return "rejected"
@@ -822,14 +819,13 @@ class NodeDaemon:
                         raise
                     if asyncio.current_task().cancelling():
                         # this runner itself is stopped, just as its run ended: stop, never back to the queue
-                        # (C's Linux runs: the cancel was swallowed and the runner waited on its queue for good)
                         raise
                     # else the run was stopped on purpose (interrupt, pause): settled below, laid out again
             finally:
                 self._running.pop(task_id, None)
                 if (why := self._interrupted.pop(task_id, None)) is not None:
-                    # stopped before its runtime ran (in Worktree.create, in the RUNNING transition): settled here,
-                    # or the stop was lost (Codex review of 9f39ff0)
+                    # stopped before its runtime ran (in Worktree.create, in the RUNNING transition): settled here, or
+                    # the stop was lost
                     await self._settle_stopped(task_id, why)
                 self._queued[addr].discard(task_id)
                 if task_id in self._retry:
@@ -857,9 +853,9 @@ class NodeDaemon:
                                             lambda: self._session_takes(agent, addr, task_id))
             if refused:
                 if "session" in refused and task["status"] == "ACCEPTED":
-                    # Release the claim first: a stop between the two steps leaves ACCEPTED + no runner, which
-                    # recover queues again (and the claim checks the session again). The other order left PENDING
-                    # + runner=worker, which nothing picked up (Codex review of e6a9df9).
+                    # Release the claim first: a stop between the two steps leaves ACCEPTED + no runner, which recover
+                    # queues again (and the claim checks the session again). The other order left PENDING +
+                    # runner=worker, which nothing picked up.
                     hub.ledger.release_task(task_id, "worker")
                     await hub.owner_transition(task_id, "PENDING", f"{addr}'s session is online: left for it")
                 log.info("task %s not run as a worker: %s", task_id, refused)
@@ -884,8 +880,8 @@ class NodeDaemon:
                           jobs=[j for j in hub.ledger.jobs(task_id, open_only=False) if j["ended_at"]],
                           resume=hub.ledger.brain_session(task["owner"], project) if brain else None)
         if brain and not ctx.resume:
-            # A new conversation gets its id from the node and is recorded before the run: a run stopped midway
-            # (D-089 interrupt) prints no JSON, and the next run must still resume it (sandbox finding).
+            # A new conversation gets its id from the node and is recorded before the run: a run stopped midway (D-089
+            # interrupt) prints no JSON, and the next run must still resume it.
             ctx.session_id = str(uuid.uuid4())
             hub.ledger.set_brain_session(task["owner"], project, ctx.session_id)
         spawned: list[int] = []                 # this run's process (every mode: a failed stop is watched)
@@ -925,7 +921,7 @@ class NodeDaemon:
                 return
             raise
         except Exception as e:
-            self._mark_unstopped(task_id, spawned)       # its cleanup may have failed too (Codex fourth review)
+            self._mark_unstopped(task_id, spawned)       # its cleanup may have failed too
             await self._run_failed(agent, task_id, attempt, result_body("failed", f"runtime error: {e!r}"))
             return
 
@@ -1040,7 +1036,7 @@ class NodeDaemon:
     async def _settle_stopped(self, task_id: str, why: str) -> None:
         """A run stopped on purpose (D-089): paused, or laid out again with the message for the next run. The run
         does not count as an attempt. A pause resumed while the run was still stopping goes on as an interrupt
-        (Codex review of 9f39ff0: the queue was lost)."""
+."""
         hub = self.hub
         task = hub.ledger.task(task_id, "owner")
         if task is None or task["status"] in TERMINAL_STATES:
@@ -1055,7 +1051,7 @@ class NodeDaemon:
 
     def _worker_alive(self, task: dict[str, Any]) -> bool:
         """An earlier run of this task still runs: its leader (pid and start time), or its process group when a
-        stop of it failed (the group may outlive its leader; Codex third review of the interrupt)."""
+        stop of it failed."""
         if same_process(task.get("runner_pid"), task.get("runner_start")):
             return True
         return bool(task.get("stuck_pgid")) and group_alive(task["stuck_pgid"])
@@ -1077,7 +1073,7 @@ class NodeDaemon:
     async def _stop_old_worker(self, task: dict[str, Any]) -> str | None:
         """Stop the process group of a worker from before a restart (not one of ours, so it cannot be cancelled):
         None if there is none, "stopped", or "failed": then it stays on the heartbeat's recheck and nothing runs
-        next to it (Codex reviews of 9f39ff0 and cb77a33)."""
+        next to it."""
         if not self._old_worker(task):
             return None
         task_id = task["task_id"]
@@ -1113,7 +1109,7 @@ class NodeDaemon:
             if task["status"] in TERMINAL_STATES or hub.ledger.jobs(job["task_id"]):
                 continue            # closed meanwhile, or still waiting on another job
             if task.get("paused"):
-                # paused: stays WAITING; resume runs it with this news (Codex review of 9f39ff0)
+                # paused: stays WAITING; resume runs it with this news
                 self._note_interrupt(job["task_id"], f"background job ended while paused: {ended}; "
                                                      f"log {job['log'] or '-'}; note {job['note'] or '-'}")
                 continue
@@ -1123,7 +1119,7 @@ class NodeDaemon:
         """D-066: a wait on the direct child tasks ends once each has a result, was refused or cancelled, or is past
         its deadline (then it is reported overdue and left running: the parent decides). None while one is open.
         A child is reported overdue once: a parent that waits again afterwards waits for its real end, or every
-        heartbeat would wake it again (secretary's recheck of ad60ea4). There is no way to extend a child's
+        heartbeat would wake it again. There is no way to extend a child's
         deadline, and a worker cannot be relied on to cancel, so the node keeps this rule itself."""
         now = datetime.now(timezone.utc)
         lines, overdue = [], []
@@ -1182,7 +1178,7 @@ class NodeDaemon:
         """D-089: a trusted controller (node.yaml trusted_controllers; the leader's word comes relayed by the
         secretary) interrupts a worker's run: a message about the task it runs, or any marked interrupt; it may pause
         and resume any task here. Anyone else may pause / resume only a task it requested from this address.
-        priority and body.leader are not permissions: they only order what is allowed (Codex review of 9f39ff0)."""
+        priority and body.leader are not permissions: they only order what is allowed."""
         trusted = env.sender in self.cfg.trusted_controllers
         task = self.hub.ledger.task(env.task_id, "owner")
         if env.body.get("pause") or env.body.get("resume"):
@@ -1265,7 +1261,7 @@ class NodeDaemon:
             if child["status"] in TERMINAL_STATES:
                 continue
             if child["task_id"] in held:
-                # not sent yet (depends_on): it waits here, paused, until resumed (Codex review of 9f39ff0)
+                # not sent yet (depends_on): it waits here, paused, until resumed
                 self.hub.ledger.update_task(child["task_id"], "requester", paused=int(kind == "pause"))
                 continue
             await self.hub.send(Envelope(
@@ -1348,8 +1344,8 @@ class NodeDaemon:
                 continue
             if not all(t and t["status"] == "COMPLETED" for t in deps.values()):
                 continue
-            # what travels with it is checked again for its sender now (Codex review of b442f2c): only tasks it
-            # takes part in, only artifacts it may see itself
+            # what travels with it is checked again for its sender now: only tasks it takes part in, only artifacts it
+            # may see itself
             sender = env.sender
             deps = {d: t for d, t in deps.items() if is_participant(hub.ledger, sender, d)}
             env.body["dependencies"] = [{"task_id": d, "owner": t["owner"], "status": t.get("result_status"),
@@ -1381,8 +1377,7 @@ class NodeDaemon:
             agent = self._agent_cfg(row["local_agent"])
             if agent is None or parse_iso(row["updated_at"]) > cutoff:
                 continue
-            # busy, per project (Codex review of 09456a9): a sub of it still open, a task waiting on a job, or a
-            # brain run under way or queued
+            # busy, per project: a sub of it still open, a task waiting on a job, or a brain run under way or queued
             busy = [t for t in ledger.tasks(role="owner", local_agent=row["local_agent"], statuses=OPEN_STATES,
                                             limit=None)
                     if (agent.project_of(t.get("request")) or "") == row["project"]
@@ -1420,7 +1415,7 @@ class NodeDaemon:
         Nothing is chased while the owner's node itself is offline (a closed laptop): the clock waits."""
         hub = self.hub
         now = datetime.now(timezone.utc)
-        held = hub.ledger.held_ids()            # not sent yet: nobody owes us a reply (Codex review of b442f2c)
+        held = hub.ledger.held_ids()            # not sent yet: nobody owes us a reply
         for t in hub.ledger.tasks(role="requester", statuses=OPEN_STATES, limit=None):
             if t["task_id"] in held:
                 continue
@@ -1432,8 +1427,8 @@ class NodeDaemon:
                 continue
             deadline = request.get("deadline")
             with contextlib.suppress(TypeError, ValueError):
-                # an owner that gave an eta is chased by its eta (_chase_etas) while that eta is ahead and the task
-                # is one _chase_etas chases (not WAITING / BLOCKED), not as overdue (D-098; B:ops review)
+                # an owner that gave an eta is chased by its eta (_chase_etas) while that eta is ahead and the task is
+                # one _chase_etas chases (not WAITING / BLOCKED), not as overdue
                 eta_chased = (t.get("eta") and parse_iso(t["eta"]) > now and t["status"] not in ("WAITING", "BLOCKED"))
                 if (deadline and not eta_chased and parse_iso(deadline) < now
                         and hub.ledger.notice_once(t["task_id"], "overdue")):
@@ -1499,7 +1494,7 @@ class NodeDaemon:
 
     async def _deliver_draft(self, task_id: str) -> bool:
         """A worker that submitted its result and ended while the daemon was down: deliver that result rather
-        than running the task again (Codex review of f8c105e)."""
+        than running the task again."""
         current = self.hub.ledger.task(task_id, "owner")
         draft = (current or {}).get("result_draft")
         if not draft or current["status"] in TERMINAL_STATES:
@@ -1595,8 +1590,8 @@ def _result_from(draft: dict[str, Any] | None, outcome) -> tuple[dict[str, Any],
             body.setdefault("limitations", []).append(f"agent process exited with code {outcome.exit_code}")
         return body, refs
     status = "failed" if outcome.exit_code != 0 else "partial"
-    # The raw output and run log are private (visibility design; Codex review of dfdd719): the requester gets
-    # the kind of error only (e.g. "quota"), the text stays in the log on the owner's node.
+    # The raw output and run log are private: the requester gets the kind of error only (e.g. "quota"), the text stays
+    # in the log on the owner's node.
     kinds = _error_kinds(outcome.log_path)
     outputs = {"error_kinds": kinds} if kinds else {}
     summary = f"agent finished without a structured result (exit code {outcome.exit_code})"

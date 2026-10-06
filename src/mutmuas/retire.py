@@ -158,7 +158,7 @@ async def _retire(path, cfg, agent, hand_over, dry_run, keep_mailbox) -> dict[st
         if live_worker_runs(ledger, addr):
             raise PermissionError(f"{addr}: its worker is running a task; wait for it or cancel it first")
         open_owned = ledger.tasks(role="owner", local_agent=addr, statuses=OPEN_STATES, limit=None)
-        # every task, closed ones too: a task's state says nothing about its processes (Codex fourth review)
+        # every task, closed ones too: a task's state says nothing about its processes
         if stuck := [t["task_id"] for t in ledger.tasks(role="owner", local_agent=addr, limit=None)
                      if t.get("stuck_pgid") and group_alive(t["stuck_pgid"])]:
             raise PermissionError(f"{addr}: a process group a stop could not end still runs for {', '.join(stuck)}; "
@@ -191,7 +191,7 @@ async def _retire(path, cfg, agent, hand_over, dry_run, keep_mailbox) -> dict[st
                                   "keep the mailbox for whoever takes over")
         if dry_run:
             return plan
-        # the manifest first: if it cannot be written, nothing has been done (Codex re-review of f5d9ad5)
+        # the manifest first: if it cannot be written, nothing has been done
         manifest = _Manifest(path.with_name(f"RETIRED-{agent_id}-{stamp}.json"),
                              {**plan, "at": stamp, "state": "planned", "steps": [], "archived_to": None})
         # 0 the fence, in one transaction with the session check: from here no session takes the post
@@ -286,8 +286,8 @@ def _undo(path: Path, done: dict[str, Any], dry_run: bool) -> dict[str, Any]:
     except KeyError:
         candidate = _insert(text, done)
         out["config"] = f"block goes back as item {done['index']} of agents"
-    # the directory, if retiring was to archive it: at its archive (moved, whether or not the manifest got to say
-    # so), or still in its place; neither changes nothing (Codex third review: it was restored as "done" without it)
+    # the directory, if retiring was to archive it: at its archive (moved, whether or not the manifest got to say so),
+    # or still in its place; neither changes nothing
     archive = done.get("archived_to") or done.get("archive_to")
     workdir = Path(done["workdir"])
     if archive and Path(archive).exists():

@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS messages (
     last_error      TEXT,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL,
+    shown           INTEGER NOT NULL DEFAULT 0,   -- an inbox listing showed it: clear_inbox may mark it read
+    pushed          INTEGER NOT NULL DEFAULT 0,   -- push state (spec v1.1 §5.1)
+    pushed_at       TEXT,
     PRIMARY KEY (message_id, direction)
 );
 CREATE INDEX IF NOT EXISTS messages_state ON messages(direction, state);
@@ -63,6 +66,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     attempts        INTEGER NOT NULL DEFAULT 0,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL,
+    runner          TEXT,                    -- auto_worker: 'worker' | 'session', claimed in one transaction
+    runner_pid      INTEGER,                 -- the worker's process ...
+    runner_start    TEXT,                    -- ... and its start time (pids get reused)
+    stuck_pgid      INTEGER,                 -- a process group a stop could not end: nothing runs beside it
+    eta             TEXT,                    -- the owner's estimate (D-076)
+    nudged_at       TEXT,                    -- requester side: the last nudge
+    interrupts      TEXT,                    -- messages that stopped a run, for the next run (D-089)
+    paused          INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, role)
 );
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(role, status);
@@ -75,7 +86,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     session_pid     INTEGER,                    -- its parent: the session itself (Claude Code, Codex, ...)
     cwd             TEXT,
     started_at      TEXT NOT NULL,
-    last_seen       TEXT NOT NULL
+    last_seen       TEXT NOT NULL,
+    accepting       INTEGER NOT NULL DEFAULT 1   -- 0: online but takes no work (`off`)
 );
 
 -- Artifacts an agent of this node published itself: with inbound mail, the only source of artifact access
@@ -95,7 +107,10 @@ CREATE TABLE IF NOT EXISTS reminders (
     due             TEXT NOT NULL,
     text            TEXT NOT NULL,
     created_at      TEXT NOT NULL,
-    fired_at        TEXT
+    fired_at        TEXT,
+    every_s         REAL,                    -- repeats after this many seconds
+    cancelled_at    TEXT,
+    task_id         TEXT                     -- set in a worker run: the task it wakes (D-098)
 );
 
 -- Follow-ups already sent (overdue reply, session gone), so each is sent once.
@@ -116,8 +131,8 @@ CREATE TABLE IF NOT EXISTS failures (
     error           TEXT NOT NULL            -- "<ExceptionType>: <message>"
 );
 
--- A post being retired (agent-node retire-agent): no session may take its lease from the check on (Codex review
--- of c46cfb9). Cleared by --undo.
+-- A post being retired (agent-node retire-agent): no session may take its lease from the check on. Cleared by
+-- --undo.
 CREATE TABLE IF NOT EXISTS retiring (
     local_agent     TEXT PRIMARY KEY,
     at              TEXT NOT NULL
@@ -152,7 +167,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     note            TEXT,
     created_at      TEXT NOT NULL,
     ended_at        TEXT,
-    ended           TEXT                     -- how it ended: process gone / done-file and its first lines
+    ended           TEXT,                    -- how it ended: process gone / done-file and its first lines
+    children        INTEGER NOT NULL DEFAULT 0   -- waits on the task's child tasks instead (D-066)
 );
 """
 
@@ -181,52 +197,7 @@ class Ledger:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=30000")
-        self._migrate_v1()
         self.db.executescript(SCHEMA)
-        self._add_column("sessions", "session_pid", "INTEGER")    # ledgers created by exp/wake e2fb5d1
-        # 1 once an inbox listing has shown the message to the session: clear_inbox may only mark those read
-        self._add_column("messages", "shown", "INTEGER NOT NULL DEFAULT 0")
-        # Who is doing an owner task of an auto_worker agent: 'worker' (runner_pid: its process) or 'session'.
-        # Claimed in one transaction, so a task is never done twice (D-032).
-        self._add_column("tasks", "runner", "TEXT")
-        self._add_column("tasks", "runner_pid", "INTEGER")
-        self._add_column("tasks", "runner_start", "TEXT")          # the process's start time: pids get reused
-        # D-089: the process group of a run whose stop failed; nothing runs for the task while it lives
-        self._add_column("tasks", "stuck_pgid", "INTEGER")
-        # D-066: a job that waits on the task's direct child tasks (parent_task) instead of a process or file
-        self._add_column("jobs", "children", "INTEGER NOT NULL DEFAULT 0")
-        self._add_column("reminders", "every_s", "REAL")             # repeat after this many seconds
-        self._add_column("reminders", "cancelled_at", "TEXT")
-        self._add_column("reminders", "task_id", "TEXT")             # set in a worker run: the task it wakes
-        # D-073 batch 2: push state per message (spec §5.1), the owner's eta (D-076), the last nudge (requester
-        # side), and a session that is online but takes no work (`off`)
-        self._add_column("messages", "pushed", "INTEGER NOT NULL DEFAULT 0")
-        self._add_column("messages", "pushed_at", "TEXT")
-        self._add_column("tasks", "eta", "TEXT")
-        self._add_column("tasks", "nudged_at", "TEXT")
-        self._add_column("sessions", "accepting", "INTEGER NOT NULL DEFAULT 1")
-        # D-089: messages that interrupted a worker's run, for its next run; a task paused until resumed
-        self._add_column("tasks", "interrupts", "TEXT")
-        self._add_column("tasks", "paused", "INTEGER NOT NULL DEFAULT 0")
-
-    def _add_column(self, table: str, column: str, decl: str) -> None:
-        if column not in [r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")]:
-            self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
-
-    def _migrate_v1(self) -> None:
-        """v1 keyed messages on message_id alone, which dropped same-node deliveries. Re-key in place."""
-        pk = [r["name"] for r in self.db.execute("PRAGMA table_info(messages)") if r["pk"]]
-        if pk != ["message_id"]:
-            return
-        with self.tx() as db:
-            db.execute("ALTER TABLE messages RENAME TO messages_v1")
-            db.execute("DROP INDEX IF EXISTS messages_state")
-            db.execute("DROP INDEX IF EXISTS messages_task")
-            for stmt in SCHEMA.split("CREATE TABLE IF NOT EXISTS tasks")[0].split(";"):
-                if stmt.strip():        # executescript would commit implicitly; stay inside this transaction
-                    db.execute(stmt)
-            db.execute("INSERT INTO messages SELECT * FROM messages_v1")
-            db.execute("DROP TABLE messages_v1")
 
     def close(self) -> None:
         self.db.close()
@@ -338,8 +309,8 @@ class Ledger:
                leader_before_seq: int | None = None) -> list[Envelope]:
         """Inbound messages an interactive agent has not looked at yet.
         Without `since` (a session looking at its mail) the page holds the newest (D-074): the leader's mail first
-        (body.leader, D-049, when leader_first), then newest to oldest. Paging back has two stages (Codex review of
-        374be94): leader_before_seq continues the leader's mail older than it (then fills up with the newest other
+        (body.leader, D-049, when leader_first), then newest to oldest. Paging back has two stages:
+        leader_before_seq continues the leader's mail older than it (then fills up with the newest other
         mail); before_seq pages through the other mail only.
         With `since` (a notifier's cursor, advanced to the last row) it stays in arrival order, oldest first, so
         nothing is skipped.
@@ -365,8 +336,8 @@ class Ledger:
                               f" AND state='handled' AND local_agent=?{type_sql}{since_sql}{before_sql}"
                               f" ORDER BY {order} LIMIT ?",
                               (local_agent, *type_args, *since_arg, *before_arg, limit)).fetchall()
-            # show: a foreground listing for the session (peek too) = shown, so clear_inbox may clear it later;
-            # a notifier's read (watch, push) is not (Codex review of 8c018ee). mark: read.
+            # show: a foreground listing for the session (peek too) = shown, so clear_inbox may clear it later; a
+            # notifier's read (watch, push) is not. mark: read.
             sets = [x for x, on in (("shown=1", show), ("seen=1", mark)) if on]
             if rows and sets:
                 db.executemany(f"UPDATE messages SET {', '.join(sets)} WHERE message_id=? AND direction='in'",
@@ -502,7 +473,7 @@ class Ledger:
 
     def mark_seen_before(self, local_agent: str, before_seq: int) -> list[Envelope]:
         """Mark everything up to a rowid as read (the session's explicit 'clear the backlog') that an inbox
-        listing has shown: never mail the session has not seen (STANDARD item 8; Codex review of dfdd719).
+        listing has shown: never mail the session has not seen.
         Informational messages (ACKs, progress) are cleared whether listed or not (D-098).
         Returns what was marked, so receipts can follow."""
         with self.tx() as db:
@@ -515,8 +486,8 @@ class Ledger:
 
     def list_recent_inbound(self, local_agent: str, limit: int = 50, show: bool = True) -> list[Envelope]:
         """The newest handled inbound messages, read or not (inbox --all): not ones still new, unverified or
-        rejected (Codex review of d98413f). With show (a foreground listing) the unread ones count as shown, so
-        clear_inbox may clear them later; they are not marked read (Codex review of d13ffc8)."""
+        rejected. With show (a foreground listing) the unread ones count as shown, so
+        clear_inbox may clear them later; they are not marked read."""
         with self.tx() as db:
             rows = db.execute("SELECT message_id, envelope FROM messages WHERE direction='in' AND local_agent=?"
                               " AND state='handled' ORDER BY rowid DESC LIMIT ?", (local_agent, limit)).fetchall()
@@ -796,7 +767,7 @@ class Ledger:
         """Apply a state transition. Terminal states are sticky unless ``force``. Returns False if refused.
 
         ``queue``: a message announcing this transition, put in the outbox in the *same* transaction, so a
-        crash can never leave a finished task whose RESULT was not queued (found by A:codex).
+        crash can never leave a finished task whose RESULT was not queued.
         """
         with self.tx() as db:
             row = db.execute("SELECT status FROM tasks WHERE task_id=? AND role=?", (task_id, role)).fetchone()

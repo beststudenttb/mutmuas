@@ -400,7 +400,7 @@ class Hub:
             raise KeyError(f"task {task_id} is not owned by this node")
         if task["status"] in TERMINAL_STATES:
             return False                                         # finished already: the board is not touched
-        # an invalid RESULT is refused before anything changes, the board included (Codex review of ea40b88)
+        # an invalid RESULT is refused before anything changes, the board included
         Envelope(type="RESULT", sender=task["owner"], to=task["requester"], body=result, task_id=task_id,
                  artifacts=artifacts or []).validate()
         agent = self.local_agent(task["owner"])[1]
@@ -409,8 +409,8 @@ class Hub:
         taken: list[str] = []
 
         def take(text: str) -> str:
-            # this task's section goes into the result and off the board in one locked rewrite, so a line the
-            # node adds meanwhile (收件) is not overwritten (Codex review of b442f2c)
+            # this task's section goes into the result and off the board in one locked rewrite, so a line the node adds
+            # meanwhile (收件) is not overwritten
             found = plan_section(text, task_id)
             if not found:
                 return text
@@ -450,7 +450,7 @@ INBOX_SECTION = "## 收件"
 
 def rewrite_plan(board: Path, change, create: bool = False) -> None:
     """Rewrite PLAN.md with change(text): one writer at a time over the whole read-modify-write (a cross-process
-    lock), through a temporary file of its own (Codex review of 09456a9)."""
+    lock), through a temporary file of its own."""
     with open(board.with_name(".PLAN.md.lock"), "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if not board.is_file() and not create:

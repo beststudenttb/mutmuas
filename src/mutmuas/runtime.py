@@ -120,7 +120,7 @@ class SubprocessRuntime:
         argv, stdin = self.command(ctx)
         runs = self.node.data_path / "runs"
         runs.mkdir(parents=True, exist_ok=True)
-        # a new name for every run: a task woken after a background job starts again at attempt 1 (r19 F1)
+        # a new name for every run: a task woken after a background job starts again at attempt 1
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         log_path = runs / f"{ctx.task_id}.{stamp}.attempt{ctx.attempt}.log"
         workdir = self.start_dir(ctx)
@@ -138,8 +138,8 @@ class SubprocessRuntime:
                 ctx.on_spawn(proc.pid)
             tail = bytearray()
             try:
-                # a command that does not read its input may close it first: not an error, its exit code says how
-                # it went (C's Linux runs: `true` made a run fail with ConnectionResetError now and then)
+                # a command that does not read its input may close it first: not an error, its exit code says how it
+                # went
                 with contextlib.suppress(BrokenPipeError, ConnectionResetError):
                     if stdin is not None:
                         proc.stdin.write(stdin)
@@ -316,10 +316,10 @@ class ClaudeCodeRuntime(SubprocessRuntime):
         if ctx.allows("RUN_EXPERIMENT"):
             tools += ["Bash"]
             available += [] if "Bash" in available else ["Bash"]
-        # Tools come from node.yaml alone (D-032; Codex review of 6c2a60a): --tools limits what exists, since
-        # --allowedTools only pre-approves. Setting source "project" only: not "user" (its allow rules and
-        # plugin hooks) nor "local" (a session's "don't ask again" approvals); "project" still loads the
-        # function CLAUDE.md above the project directory and the project's memory.
+        # Tools come from node.yaml alone: --tools limits what exists, since --allowedTools only pre-approves. Setting
+        # source "project" only: not "user" (its allow rules and plugin hooks) nor "local" (a session's "don't ask
+        # again" approvals); "project" still loads the function CLAUDE.md above the project directory and the project's
+        # memory.
         argv = ["claude", "-p", "--output-format", "json", "--mcp-config", str(cfg_path), "--strict-mcp-config",
                 "--setting-sources", "project",
                 "--tools", ",".join(available), "--allowedTools", ",".join(tools)]
@@ -400,7 +400,7 @@ def _last_json(text: str) -> dict[str, Any] | None:
 async def stop_group(pgid: int, grace_s: float = 5.0) -> bool:
     """Stop a run's whole process group: SIGTERM, then SIGKILL to whatever is left after grace_s. The group is
     waited on, not just its leader: a child that ignores SIGTERM would keep running and keep its locks (a GPU
-    flock) (Codex review of 9f39ff0). True once the group is gone."""
+    flock). True once the group is gone."""
     for sig in (signal.SIGTERM, signal.SIGKILL):
         if _group_gone(pgid, sig):
             return True
@@ -420,7 +420,7 @@ def group_alive(pgid: int) -> bool:
 def _group_gone(pgid: int, sig: int) -> bool:
     """Whether the group is gone after sending it sig. Members that are zombies (dead, not yet reaped by their
     parent) count as gone: Linux lets kill() reach a zombie, macOS answers EPERM for a group of zombies only
-    (secretary's run on B, Codex re-review of cb77a33). A live member we may not signal is not gone."""
+. A live member we may not signal is not gone."""
     try:
         os.killpg(pgid, sig)
     except ProcessLookupError:
@@ -431,7 +431,7 @@ def _group_gone(pgid: int, sig: int) -> bool:
 
 
 def _all_zombies(states: list[str]) -> bool:
-    # the group answered a signal, so ps must show members: none shown says nothing (Codex third review)
+    # the group answered a signal, so ps must show members: none shown says nothing
     return bool(states) and all(state.startswith("Z") for state in states)
 
 

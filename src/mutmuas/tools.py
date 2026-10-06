@@ -100,9 +100,9 @@ def _deadline(text: str | None) -> str | None:
 
 def default_reply_deadline(hub: Hub, timeout_s: float | None, kind: str | None = "query") -> str | None:
     if hub.cfg.default_reply_deadline_s > 0:
-        # Without a deadline nothing ever chases a missing reply (no-stall design, G3): take the node's default,
-        # but never before the task's own run limit plus a margin, or a long task would be chased while it
-        # still runs normally (C's review of 6a5e2f1). Experiments and code get the longer default (D-098).
+        # Without a deadline nothing ever chases a missing reply (no-stall design, G3): take the node's default, but
+        # never before the task's own run limit plus a margin, or a long task would be chased while it still runs
+        # normally. Experiments and code get the longer default (D-098).
         wait_s = hub.cfg.default_reply_deadline_s
         if kind in LONG_KINDS and hub.cfg.long_reply_deadline_s > 0:
             wait_s = hub.cfg.long_reply_deadline_s
@@ -125,7 +125,7 @@ async def _send_request(hub: Hub, me: str, to: str, body: dict[str, Any], *, art
         parent = parent_task or _current_task()
         owner = hub.ledger.task(parent, "owner") if parent else None
         if owner:
-            # a sub belongs to its parent's project (its brain's plan is there; Codex review of 09456a9)
+            # a sub belongs to its parent's project
             agent = hub.local_agent(me)[1]
             inherited = agent.project_of(owner.get("request"))
             if project and project != inherited:
@@ -140,7 +140,7 @@ async def _send_request(hub: Hub, me: str, to: str, body: dict[str, Any], *, art
             raise ValueError(f"depends_on names tasks this node does not know: {', '.join(unknown)}")
         sender = str(hub.local_agent(me)[0])
         foreign = [d for d in depends_on if not is_participant(hub.ledger, sender, d)]
-        if foreign:                                  # their results travel with it: only one's own tasks (Codex)
+        if foreign:                                  # their results travel with it: only one's own tasks
             raise PermissionError(f"depends_on may name only tasks {sender} takes part in, not {', '.join(foreign)}")
         body["depends_on"] = list(depends_on)       # held here until they are done (D-073 batch 2)
     sender = str(hub.local_agent(me)[0])
@@ -233,7 +233,7 @@ async def inbox_page(hub: Hub, me: str, peek: bool = False, types: tuple[str, ..
                      limit: int = 50) -> dict[str, Any]:
     """inbox() for a session looking at its mail, plus what the page left out (D-074): how many unread the cursor
     covers, how many it lists, how many older ones it did not, and `next`, the cursor for the following page.
-    Paging has two stages (Codex review of 374be94): the leader's mail first (leader_before_seq), then the other
+    Paging has two stages: the leader's mail first (leader_before_seq), then the other
     mail (before_seq), each newest to oldest, so every message is listed exactly once."""
     addr, _ = hub.local_agent(me)
     next_to, own_results = _wake_view(hub, me, types)
@@ -271,9 +271,8 @@ async def inbox(hub: Hub, me: str, include_seen: bool = False, limit: int = 50, 
     show=False: a notifier's read (watch, push), which does not count as showing the mail to the session."""
     addr, _ = hub.local_agent(me)
     project = _project_view(hub, me)
-    # A message that hands me the baton (body.next == me) needs me as much as a REQUEST does.
-    # (a notifier's ACTIONABLE view too: Codex's watch, which then sees a background job's wake-up)
-    # Results of my own requests too only with wake_on_own_results (no-stall G2, per agent, off by default).
+    # A message that hands me the baton (body.next == me) needs me as much as a REQUEST does. Results of my own requests
+    # too only with wake_on_own_results (no-stall G2, per agent, off by default).
     next_to, own_results = _wake_view(hub, me, types)
     if wait_s and not include_seen:
         # Messages reach this node's ledger through the daemon, so waiting on the ledger is enough
@@ -333,7 +332,7 @@ def _interval_s(text: str) -> float | None:
 async def remind_me(hub: Hub, me: str, at: str, text: str, every: str | None = None,
                     task_id: str | None = None) -> dict[str, Any]:
     """The node puts `text` into the agent's inbox at `at` (ISO time with timezone, or +30s/+10m/+2h) as a message
-    that hands the agent the baton, so it wakes a session (channel push, Codex watch) and waits in the inbox while
+    that hands the agent the baton, so it wakes a session and waits in the inbox while
     none runs (D-066). every='5h' repeats it at that interval until cancel_reminder. task_id: the task a worker run
     sets it for: a post with no session gets that task run again when it fires (D-098)."""
     addr, _ = hub.local_agent(me)
@@ -514,7 +513,7 @@ async def nudge(hub: Hub, me: str, task_id: str, note: str = "") -> dict[str, An
         raise ValueError(f"{task_id} is {task['status']}: nothing to nudge")
     now = datetime.now(timezone.utc)
     if not hub.ledger.claim_nudge(task_id, now.isoformat(), (now - timedelta(seconds=NUDGE_EVERY_S)).isoformat()):
-        # one compare-and-set in the ledger, so two nudges at once (or from two processes) send one (Codex)
+        # one compare-and-set in the ledger, so two nudges at once (or from two processes) send one
         raise PermissionError(f"{task_id} was nudged at {hub.ledger.task(task_id, 'requester')['nudged_at']}; "
                               f"at most once in {NUDGE_EVERY_S // 3600} h")
     text = (f"nudge from {me}: {note or 'how is it going?'} Reply with what you are doing, where you are stuck "
@@ -526,7 +525,7 @@ async def nudge(hub: Hub, me: str, task_id: str, note: str = "") -> dict[str, An
 
 async def set_session_taking_work(hub: Hub, me: str, on: bool) -> dict[str, Any]:
     """`mutmuas <post> off|on`: the session stays online but takes no new work; the worker does. Only a post with
-    a worker can hand its work over (Codex review of b442f2c)."""
+    a worker can hand its work over."""
     addr, agent = hub.local_agent(me)
     if not on and not agent.auto_worker:
         raise PermissionError(f"{addr} has no worker (auto_worker) to take the work: its session stays on")
@@ -541,8 +540,8 @@ async def push_due(hub: Hub, me: str, cursor: int | None) -> tuple[list[dict[str
     between: a busy session is not interrupted (§5.4); the Stop hook has it look before it ends a turn.
     Records each push (count, time). Returns (messages, next cursor)."""
     if cursor is None:
-        # every unread one up to now, oldest first, page by page (not just the newest page: Codex review of
-        # b442f2c); the live cursor starts at the boundary only once all before it are covered
+        # every unread one up to now, oldest first, page by page (not just the newest page); the live cursor starts
+        # at the boundary only once all before it are covered
         boundary, rows, since = hub.ledger.last_rowid(), [], 0
         while page := [r for r in await inbox(hub, me, peek=True, types=WAKE, since=str(since), limit=200,
                                               show=False) if (r["seq"] or 0) <= boundary]:
@@ -592,8 +591,8 @@ async def publish_artifact(hub: Hub, me: str, path: str, *, key: str | None = No
         src = (Path.cwd() / src)
     if not key:
         # The key is shared metadata (object-store listings), so by default it names no local file: a random id,
-        # keeping only a short extension so a fetched copy still opens with the right tool (Codex review of
-        # dfdd719). Pass key= to publish under a readable name on purpose.
+        # keeping only a short extension so a fetched copy still opens with the right tool. Pass key= to publish
+        # under a readable name on purpose.
         import secrets
         suffix = src.suffix if src.is_file() and len(src.suffix) <= 8 and src.suffix[1:].isalnum() else ""
         key = f"{addr.node}/{addr.agent}/{task_id or _current_task() or 'adhoc'}/{secrets.token_hex(8)}{suffix}"
@@ -618,9 +617,8 @@ async def add_observer(hub: Hub, me: str, task_id: str, observer: str) -> dict[s
     copies = []
     if me_s in (base["requester"], base["owner"]):
         copies = await send_observer_copies(hub, me_s, task_id, [observer])
-    # An observer does not send copies itself: a node that never saw the task could only check the sender
-    # against the task record, which names requester and owner. The owner relays them when it hears of the
-    # new observer below (Codex review of 8c018ee).
+    # An observer does not send copies itself: a node that never saw the task could only check the sender against the
+    # task record, which names requester and owner. The owner relays them when it hears of the new observer below.
     for other in sorted({base["requester"], base["owner"]} - {me_s}):
         try:          # so the requester's side forwards a later RESULT, and every side knows the ACL
             await hub.send(Envelope(type="UPDATE", sender=me_s, to=other, task_id=task_id,
@@ -731,7 +729,7 @@ async def fetch_artifact(hub: Hub, uri: str, dest_dir: str | None = None, sha256
 
 def _check_actor(hub: Hub, task: dict[str, Any]) -> str | None:
     """Every owner-side change (accept, reject, progress, result) is made by whoever holds the task, so a task is
-    never done twice and a running worker is not interrupted (D-032, D-032a; Codex reviews of 6116466, ba28e70).
+    never done twice and a running worker is not interrupted.
     Who the caller is comes from the process tree: a process descending from a worker the daemon started (pid
     and start time recorded) is that worker, whatever its environment says. MUTMUAS_TASK_ID can only add a
     restriction (a process that claims to be a worker is treated as one), never prove anything.
@@ -765,7 +763,7 @@ def _owned(hub: Hub, me: str, task_id: str) -> dict[str, Any]:
 def internal_caller(hub: Hub) -> str | None:
     """The internal subtask (D-073) whose worker the calling process descends from, if any. Decided from the
     process tree (the worker's pid and start time are recorded when the daemon starts it), as for the lease and
-    _check_actor; MUTMUAS_TASK_ID can only add the restriction, never lift it (Codex review of 09456a9)."""
+    _check_actor; MUTMUAS_TASK_ID can only add the restriction, never lift it."""
     from .node import _ancestors, worker_tasks_of
     chain = {os.getpid(), *_ancestors(os.getpid())}
     ids = {t for a in hub.cfg.agents for t in worker_tasks_of(hub.ledger, str(Address(hub.cfg.node, a.id)), chain)}

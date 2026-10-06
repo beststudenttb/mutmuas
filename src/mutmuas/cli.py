@@ -85,12 +85,12 @@ async def _with_hub(args, fn, *, require_bus: bool = True, watch: bool = False):
         await hub.close()
 
 
-# Commands that only read public state: allowed while another session holds the agent. Not `watch`: it shows mail content (objective, summary, ...), so a second session could read the
-# holder's mail through it (Codex review of dfdd719). `watch --headers-only` shows no content (count, type,
-# sender) and stays lease-free, for notifier services that run outside the session.
+# Commands that only read public state: allowed while another session holds the agent. Not `watch`: it shows mail
+# content (objective, summary, ...), so a second session could read the holder's mail through it. `watch --headers-only`
+# shows no content (count, type, sender) and stays lease-free, for notifier services that run outside the session.
 SUB_COMMANDS = {"cmd_update", "cmd_job", "cmd_submit", "cmd_status"}      # all an internal subtask may run
 LEASE_FREE = {"cmd_status", "cmd_agents", "cmd_find", "cmd_session"}   # session: run from a shell beside it      # not whoami: MCP whoami is exempt in the MCP layer
-                                                          # only (Codex review of 8c018ee)
+                                                          # only
 
 
 def _parse_kv(pairs: list[str] | None) -> dict[str, Any]:
@@ -217,8 +217,7 @@ async def cmd_send(args, hub: Hub):
     else:
         if not args.task:
             raise SystemExit(f"{msg_type} needs --task")
-        # Through Hub.reply: only the task's requester or owner may send on it, and only to the other one
-        # (Codex review of dfdd719: a direct send skipped the participant check).
+        # Through Hub.reply: only the task's requester or owner may send on it, and only to the other one .
         try:
             delivery = await hub.reply(_me(args), args.task, msg_type, body,
                                        [ArtifactRef.from_dict(a) for a in artifacts], to=await hub.resolve(args.to))
@@ -323,8 +322,7 @@ async def cmd_watch(args, hub: Hub):
     me = _me(args)
     addr, _ = hub.local_agent(me)
     cursor_file = hub.cfg.data_path / f"{addr.node}_{addr.agent}.notify-cursor"
-    # Cursor = ledger rowid (monotonic). An old timestamp cursor (A:codex: ms collisions lost mail) is reset
-    # to the current end of the ledger.
+    # Cursor = ledger rowid (monotonic). An old timestamp cursor is reset to the current end of the ledger.
     if not cursor_file.exists() or not cursor_file.read_text().strip().isdigit():
         cursor_file.write_text(str(hub.ledger.db.execute("SELECT COALESCE(MAX(rowid), 0) FROM messages").fetchone()[0]))
     while True:
