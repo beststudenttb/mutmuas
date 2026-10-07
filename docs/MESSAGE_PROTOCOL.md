@@ -222,7 +222,8 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   reported overdue once, so a wait registered again afterwards lasts until that child really ends). A delivered
   child (D-109) counts as ended until the parent has been told of it (a run of the parent lists it, or a wait ended
   on it): this catches a delivery whose wake found the parent's run still going; after that it is open until the
-  parent accepts it. The task is then
+  parent accepts it, but it holds a wait only while nothing is new: another child that ended since the parent was
+  last told, or a child past its deadline (a delivered one too, once), still ends it. The task is then
   woken once, as for a background job, and the wake-up lists how each child ended. Cancelling a task sends CANCEL
   to its open children (their nodes cascade further down).
 - `next: <address>` on RESULT, UPDATE, QUESTION or ANSWER names whose move it is. That agent is woken exactly

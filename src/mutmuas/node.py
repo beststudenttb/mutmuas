@@ -1138,40 +1138,57 @@ class NodeDaemon:
         deadline, and a worker cannot be relied on to cancel, so the node keeps this rule itself.
         A delivered child (D-109) has a result that waits for the parent to accept it: until a run of the parent has
         been told about it (or a wait ended on it) it counts as an end, as a result did before; after that it is
-        open until accepted, or a parent that waits again unaccepted would be woken for it over and over. Its wake
-        when it came may have found the parent's run going and been dropped: this is what still tells the parent."""
+        "held": open until accepted, or a parent that waits again unaccepted would be woken for it over and over (its
+        deadline still reports it overdue once). Its wake when it came may have found the parent's run going and been
+        dropped: this is what still tells the parent. A held delivery keeps the wait only while there is no news:
+        a child that ended since the parent was last told (a refusal, say, wakes nobody by itself), a fresh delivery,
+        or an overdue child (B:ops p6, p8)."""
         now = datetime.now(timezone.utc)
-        lines, overdue, fresh, held = [], [], [], False
+        lines, overdue, fresh, ended, held = [], [], [], [], False
         ledger = self.hub.ledger
+
+        def past_deadline(child: dict[str, Any]) -> str | None:
+            deadline = (child.get("request") or {}).get("deadline")
+            with contextlib.suppress(TypeError, ValueError):
+                if (deadline and parse_iso(deadline) < now
+                        and not ledger.noticed(child["task_id"], "overdue_wake")):
+                    return deadline
+            return None
+
         for child in ledger.children(task_id):
             head = f"{child['task_id']} ({child['owner']})"
             result = child.get("result") or {}
             if child["status"] in TERMINAL_STATES:
                 lines.append(f"{head}: {child['status']} {result.get('status') or ''} - "
                              f"{short(result.get('summary') or '', 200)}")
+                if not ledger.noticed(child["task_id"], "end_seen"):
+                    ended.append(child["task_id"])
                 continue
             if child["status"] == DELIVERED:
-                lines.append(f"{head}: delivered {result.get('status') or ''}, waits for your acceptance "
-                             f"(accept_delivery) - {short(result.get('summary') or '', 200)}")
-                if ledger.noticed(child["task_id"], _seen(child)):
-                    held = True
-                else:
+                line = (f"{head}: delivered {result.get('status') or ''}, waits for your acceptance (accept_delivery) - "
+                        f"{short(result.get('summary') or '', 200)}")
+                if not ledger.noticed(child["task_id"], _seen(child)):
                     fresh.append(child)
+                else:
+                    held = True
+                    if deadline := past_deadline(child):
+                        line += f" [overdue: deadline {deadline}]"
+                        overdue.append(child["task_id"])
+                lines.append(line)
                 continue
-            deadline = (child.get("request") or {}).get("deadline")
-            with contextlib.suppress(TypeError, ValueError):
-                if (deadline and parse_iso(deadline) < now
-                        and not ledger.noticed(child["task_id"], "overdue_wake")):
-                    lines.append(f"{head}: overdue (deadline {deadline}, still {child['status']}; not cancelled)")
-                    overdue.append(child["task_id"])
-                    continue
+            if deadline := past_deadline(child):
+                lines.append(f"{head}: overdue (deadline {deadline}, still {child['status']}; not cancelled)")
+                overdue.append(child["task_id"])
+                continue
             return None
-        if held and not fresh and not overdue:
-            return None                  # what is left is a delivery the parent was told about: its to accept
+        if held and not fresh and not overdue and not ended:
+            return None                  # nothing new: what is left is a delivery the parent was told of, to accept
         for child_id in overdue:
             ledger.notice_once(child_id, "overdue_wake")
         for child in fresh:
             ledger.notice_once(child["task_id"], _seen(child))
+        for child_id in ended:
+            ledger.notice_once(child_id, "end_seen")
         return "child tasks done: " + "; ".join(lines)
 
     def _stop_jobs(self, task_id: str) -> None:

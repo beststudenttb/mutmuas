@@ -378,3 +378,58 @@ async def test_agentctl_ask_needs_a_reason_but_not_outputs_or_criteria(monkeypat
     assert sent == [("B:llm", "read notes", "smoke")]
     with pytest.raises(SystemExit, match="reason"):
         await cli.cmd_ask(parse(["ask", "B:x", "o", "--as", "A:a1"]), None)
+
+
+# ---- B:ops re-review of 5ee4e04 (p6, p8) -----------------------------------------------------------------------------
+
+async def test_a_sibling_that_ends_ends_a_wait_held_by_a_delivery_the_parent_was_told_of(tmp_path):
+    """p6: told of X (delivered, not accepted), the parent waits to judge X and Y together; Y is then refused. Y's
+    end is news the parent has not had: the wait ends (a refusal does not wake the parent by itself). Once told,
+    a wait again is held by X again."""
+    x, (a_agent, a_ledger, a_daemon), (b_agent, b_ledger, b_daemon) = await _manual_task(tmp_path, parent="T-p")
+    try:
+        y = (await tools.send_request(a_daemon.hub, "A:lead", "B:desk", "second", "y", acceptance="manual",
+                                      parent_task="T-p"))["task_id"]
+        await _carry(a_ledger, b_daemon, b_agent, "REQUEST")
+        await tools.submit_result(b_daemon.hub, "B:desk", "complete", "trained", task_id=x)
+        await _carry(b_ledger, a_daemon, a_agent, "RESULT")
+        a_daemon._queued["A:lead"].discard("T-p")
+        assert [d["task_id"] for d in a_daemon._deliveries_for_run("T-p")] == [x]
+        await tools.add_job(a_daemon.hub, "A:lead", "T-p", children=True, note="judge both together")
+        await tools.reject_task(b_daemon.hub, "B:desk", y, "not mine")
+        await _carry(b_ledger, a_daemon, a_agent, "REJECT")
+        await a_daemon._check_jobs()
+        assert a_ledger.jobs("T-p") == [] and "T-p" in a_daemon._queued["A:lead"]
+        ended = a_ledger.jobs("T-p", open_only=False)[-1]["ended"]
+        assert y in ended and x in ended
+        a_daemon._queued["A:lead"].discard("T-p")
+        await tools.add_job(a_daemon.hub, "A:lead", "T-p", children=True, note="again")
+        await a_daemon._check_jobs()
+        assert a_ledger.jobs("T-p")                              # nothing new: X is the parent's to accept
+    finally:
+        a_ledger.close(); b_ledger.close()
+
+
+async def test_a_delivery_the_parent_was_told_of_is_still_reported_overdue(tmp_path):
+    """p8: a parent that waits on a delivery it does not accept is woken once at the child's deadline, as for any
+    child (before the P1 fix a delivered child fell through to this check)."""
+    x, (a_agent, a_ledger, a_daemon), (b_agent, b_ledger, b_daemon) = await _manual_task(tmp_path, parent="T-p")
+    try:
+        await tools.submit_result(b_daemon.hub, "B:desk", "complete", "trained", task_id=x)
+        await _carry(b_ledger, a_daemon, a_agent, "RESULT")
+        a_daemon._queued["A:lead"].discard("T-p")
+        a_daemon._deliveries_for_run("T-p")
+        await tools.add_job(a_daemon.hub, "A:lead", "T-p", children=True, note="wait")
+        await a_daemon._check_jobs()
+        assert a_ledger.jobs("T-p")                              # held
+        row = a_ledger.task(x, "requester")
+        a_ledger.update_task(x, "requester", request={**row["request"], "deadline": "2000-01-01T00:00:00+00:00"})
+        await a_daemon._check_jobs()
+        assert a_ledger.jobs("T-p") == [] and "T-p" in a_daemon._queued["A:lead"]
+        assert "overdue" in a_ledger.jobs("T-p", open_only=False)[-1]["ended"]
+        a_daemon._queued["A:lead"].discard("T-p")
+        await tools.add_job(a_daemon.hub, "A:lead", "T-p", children=True, note="again")
+        await a_daemon._check_jobs()
+        assert a_ledger.jobs("T-p")                              # reported overdue once
+    finally:
+        a_ledger.close(); b_ledger.close()
