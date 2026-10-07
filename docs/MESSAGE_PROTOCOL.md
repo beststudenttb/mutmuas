@@ -117,9 +117,9 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   "project": "visualrl", ...}`. `agentctl status` shows both.
 - **Held up** (D-108): the card carries `stuck: true` (a boolean) and `stuck_reason` (a string: the kinds, comma
   separated, in this order: `blocked` a task the post owns is BLOCKED; `quota` one waits for the usage limit;
-  `delivery` a message it sent keeps failing to go out; `worker` its last two runs failed with nothing finished
-  since). Never a task id or content. Both keys are absent when nothing holds it up. Example: `{"stuck": true,
-  "stuck_reason": "blocked,delivery"}`.
+  `delivery` a message it sent has failed to go out for 5 minutes; `worker` runs of two or more different tasks
+  failed within the hour with nothing finished since). Never a task id or content. Both keys are absent when
+  nothing holds it up. Example: `{"stuck": true, "stuck_reason": "blocked,delivery"}`.
 - **Letters follow templates** (D-109): every letter an agent writes has a fixed template,
   `src/mutmuas/letters.yaml` (the wording lives there alone): sent directly — 需求 request (send_request), 告知
   notice (send_notice), 交付回执 delivery (submit_result, naming its task), 数据 data (send_data); receipts — 收到
