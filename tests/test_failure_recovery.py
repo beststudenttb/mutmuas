@@ -19,7 +19,9 @@ async def _request(hub, to, inputs, **kw):
     return (await tools.send_request(hub, "A:main", to, "do it", "failure test", inputs=inputs, **kw))["task_id"]
 
 
-async def test_node_restart_resumes_running_task(make_config, cluster, tmp_path):
+async def test_a_run_in_progress_outlives_a_node_restart_and_finishes_once(make_config, cluster, tmp_path):
+    """D-104: a deploy restarts the daemon; the run goes on on its own and is not run again; the new daemon delivers
+    its result when it ends."""
     a = make_config("A", [interactive("main")])
     b = make_config("B", [worker("lab", "lab.py")])
     await cluster.start(a)
@@ -30,17 +32,15 @@ async def test_node_restart_resumes_running_task(make_config, cluster, tmp_path)
                                             "marker": str(marker)}, kind="experiment")
     await eventually(lambda: marker.exists(), what="task started")
     await asyncio.sleep(0.5)
-    await cluster.stop("B")                               # daemon dies mid-run; process group is killed
+    await cluster.stop("B")                               # the daemon stops mid-run (a deploy); the run goes on
     view = await hub.task_view(task_id)
     assert view["status"] not in ("COMPLETED", "FAILED")
 
     await cluster.start(b)
     result = await tools.wait_for_result(hub, task_id, 40)
-    assert result["result_status"] == "complete"
-    # the attempt count is the owner's business (not in the shared task KV); the requester sees it in the thread
-    assert any("attempt 2" in tools._note(m) for m in hub.ledger.thread(task_id))
-    assert marker.read_text().count("attempt=2") == 1
-    assert any("restarted" in tools._note(m) for m in hub.ledger.thread(task_id))
+    assert result["result_status"] == "complete" and result["result"]["outputs"]["final_loss"] == round(1 / 6, 4)
+    assert marker.read_text().count(task_id) == 1                    # one run only, across the restart
+    assert not any("attempt 2" in tools._note(m) for m in hub.ledger.thread(task_id))
 
 
 async def test_agent_process_crash_is_reported_failed(make_config, cluster):

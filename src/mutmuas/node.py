@@ -40,7 +40,7 @@ from .ids import Address, InvalidAddress, check_token, now_iso, parse_iso
 from .ledger import is_info
 from .protocol import (OPEN_STATES, REQUEST_KINDS, TERMINAL_STATES, ArtifactRef, Envelope, ProtocolError,
                        reply_required, result_body, task_state_for_result)
-from .runtime import TaskContext, group_alive, make_runtime, stop_group
+from .runtime import RunOutcome, TaskContext, group_alive, log_tail, make_runtime, stop_group
 from .visibility import CARD_KEYS, accepts_kinds, acl, short
 from .worktree import GitError, Worktree
 
@@ -268,7 +268,8 @@ class NodeDaemon:
                 delay = min(delay * 2, 30)
 
     async def stop(self) -> None:
-        """Graceful stop: running tasks are interrupted and resumed by recover() next start."""
+        """Graceful stop, e.g. for a deploy (D-104): the runs in progress are left running (their output goes to their
+        own logs); the next daemon adopts them in recover() and delivers each result when it ends."""
         self._stopping = True
         for task in self._tasks:
             task.cancel()
@@ -345,17 +346,13 @@ class NodeDaemon:
                 continue
             if agent.mode != "worker" and not agent.auto_worker:
                 continue
-            if agent.auto_worker:
+            if agent.auto_worker or task["status"] in ("ACCEPTED", "RUNNING"):
+                # its run may have outlived the old daemon (a deploy, D-104): adopted, never run twice
                 await self._recover_auto(task)
                 continue
-            if task["status"] not in ("PENDING", "ACCEPTED", "RUNNING"):
-                continue
-            if task["status"] == "RUNNING":
-                await hub.owner_transition(task["task_id"], "ACCEPTED",
-                                           f"node {self.cfg.node} restarted; task will be resumed")
-            elif task["status"] == "PENDING":
+            if task["status"] == "PENDING":
                 await self._accept(task["task_id"])
-            self._enqueue(task["owner"], task["task_id"])
+                self._enqueue(task["owner"], task["task_id"])
         for task in hub.ledger.tasks(role="owner", limit=500):
             await hub.publish_task_record(task["task_id"])
         await hub.flush_outbox()
@@ -838,6 +835,8 @@ class NodeDaemon:
         def on_spawn(pid: int) -> None:
             spawned.append(pid)
             self._record_worker(task_id, pid)
+            hub.ledger.update_task(task_id, "owner", run_log=ctx.run_log)
+        ctx.handing_over = lambda: self._stopping
         ctx.on_spawn = on_spawn
         wt = None
         if request.body.get("kind") == "code" and agent.copies_code:
@@ -861,6 +860,8 @@ class NodeDaemon:
                 "failed", f"timed out after {timeout:.0f}s", limitations=["process was killed at the deadline"]))
             return
         except asyncio.CancelledError:
+            if self._stopping:
+                raise                                    # a deploy: the run goes on; the next daemon adopts it
             self._mark_unstopped(task_id, spawned)
             if task_id in self._stopped_runs:
                 return                                   # a control stopped it: the runner settles it
@@ -1335,10 +1336,10 @@ class NodeDaemon:
         self.hub.ledger.set_runner_pid(task_id, pid, proc_start(pid))
 
     async def _recover_auto(self, task: dict[str, Any]) -> None:
-        """auto_worker after a restart: deliver the draft its worker submitted, or run the task again. A worker
-        from before the restart that still runs is not stopped: skip it this round, record it once, look again at
-        the next heartbeat (D-040). A PENDING task still claimed by the worker is released for _auto_dispatch; a
-        session's task stays the session's."""
+        """A worker's task after a restart: deliver the draft its run submitted or the result it printed, or run the
+        task again. A run from before the restart that still runs (it outlived a deploy, D-104) is not stopped:
+        skip it this round, record it once, look again at the next heartbeat (D-040). An auto_worker's PENDING task
+        still claimed by the worker is released for _auto_dispatch; a session's task stays the session's."""
         hub, task_id = self.hub, task["task_id"]
         if task.get("runner") == "session":
             return
@@ -1351,15 +1352,14 @@ class NodeDaemon:
                 await self._settle(task_id, "paused")      # waits for resume like any paused task
             return
         if self._worker_alive(task):
-            if hub.ledger.notice_once(task_id, "old-worker-running"):
-                self._failed("recover", "a worker from before the restart still runs; checked again each heartbeat",
-                             address=task["owner"], task_id=task_id)
+            if hub.ledger.notice_once(task_id, "old-worker-running"):     # normal after a deploy: not a failure
+                log.info("task %s: adopted its run from before the restart; looked at again each heartbeat", task_id)
             self._recheck.add(task_id)
             return
         self._recheck.discard(task_id)
         if task.get("stuck_pgid"):
             hub.ledger.update_task(task_id, "owner", stuck_pgid=None)          # its group has gone
-        if await self._deliver_draft(task_id):
+        if await self._deliver_draft(task_id) or await self._deliver_logged(task):
             return
         hub.ledger.set_runner_pid(task_id, None)
         await self._settle(task_id, f"node {self.cfg.node} restarted; the task is run again")   # paused: waits
@@ -1374,6 +1374,26 @@ class NodeDaemon:
         draft = dict(draft)
         refs = [ArtifactRef.from_dict(a) for a in draft.pop("artifacts", None) or []]
         await self.hub.finish(task_id, draft, refs)
+        return True
+
+    async def _deliver_logged(self, task: dict[str, Any]) -> bool:
+        """A run that ended while no daemon watched it (it outlived a deploy, D-104): what it printed into its log
+        decides, as at the end of any run: the account's usage limit, or the result it printed. Its exit code is
+        not known (it was not this daemon's child)."""
+        agent, path = self._agent_cfg(task["owner"]), task.get("run_log")
+        if agent is None or not path or task["status"] in TERMINAL_STATES:
+            return False
+        runtime = make_runtime(agent, self.cfg)
+        tail = log_tail(path)
+        if why := runtime.quota(RunOutcome(-1, tail, log_path=path)):
+            await self._hold_for_quota(task["task_id"], why)
+            return True
+        outcome = runtime.parse(None, 0, tail)
+        if not _structured(outcome.result):
+            return False
+        body, refs = _result_from(None, outcome)
+        body.setdefault("limitations", []).append("its run outlived a restart of the node: exit code not known")
+        await self.hub.finish(task["task_id"], body, refs)
         return True
 
     async def _auto_dispatch(self) -> None:

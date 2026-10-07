@@ -49,6 +49,8 @@ class TaskContext:
     resume: str | None = None            # a brain batch's conversation to continue (D-073)
     interrupts: list[str] = field(default_factory=list)   # what interrupted the previous run (D-089)
     session_id: str | None = None        # a new brain conversation's id, chosen by the node before the run
+    run_log: str | None = None           # this run's log (its output too), set as it starts
+    handing_over: Any = None             # () -> True while the daemon stops for a deploy: the run is left running
 
     @property
     def home(self) -> Path:
@@ -110,12 +112,7 @@ class SubprocessRuntime:
         """What says this run stopped at the account's usage limit, or None (D-104 item 1)."""
         if outcome.exit_code == 0 and not (outcome.result or {}).get("is_error"):
             return None
-        text = outcome.output_tail or ""
-        if outcome.log_path:
-            with contextlib.suppress(OSError), open(outcome.log_path, "rb") as f:
-                f.seek(0, os.SEEK_END)
-                f.seek(max(0, f.tell() - TAIL_BYTES))
-                text += "\n" + f.read().decode(errors="replace")
+        text = (outcome.output_tail or "") + "\n" + (log_tail(outcome.log_path) if outcome.log_path else "")
         for line in text.splitlines():
             line = line.strip()
             if line.startswith(QUOTA_SIGNAL):
@@ -150,12 +147,13 @@ class SubprocessRuntime:
         with open(log_path, "wb") as logf:
             logf.write(f"$ {' '.join(argv)}\n".encode())
             logf.flush()
+            ctx.run_log = str(log_path)
+            # output straight into the run's log, not through a pipe to this daemon: the run outlives a deploy (D-104)
             proc = await asyncio.create_subprocess_exec(
                 *argv, cwd=str(workdir), env=ctx.env(), stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE, stderr=logf, start_new_session=True)
+                stdout=logf, stderr=logf, start_new_session=True)
             if ctx.on_spawn:
                 ctx.on_spawn(proc.pid)
-            tail = bytearray()
             try:
                 # a command that does not read its input may close it first: not an error, its exit code says how it
                 # went
@@ -164,16 +162,13 @@ class SubprocessRuntime:
                         proc.stdin.write(stdin)
                         await proc.stdin.drain()
                     proc.stdin.close()
-                while chunk := await proc.stdout.read(65536):
-                    logf.write(chunk)
-                    logf.flush()
-                    tail.extend(chunk)
-                    del tail[:-TAIL_BYTES]
                 code = await proc.wait()
-            except BaseException:          # timeout, cancel, shutdown: never leave orphans behind
-                await _kill_group(proc)
+            except BaseException:
+                if ctx.handing_over and ctx.handing_over():
+                    raise                  # the daemon is being replaced: the run goes on; the next one adopts it
+                await _kill_group(proc)    # timeout, a control's stop: never leave orphans behind
                 raise
-        outcome = self.parse(ctx, code, tail.decode(errors="replace"))
+        outcome = self.parse(ctx, code, log_tail(log_path))
         outcome.log_path = str(log_path)
         return outcome
 
@@ -369,6 +364,15 @@ class CodexRuntime(SubprocessRuntime):
 
 
 RUNTIMES = {"script": ScriptRuntime, "claude-code": ClaudeCodeRuntime, "codex": CodexRuntime}
+
+
+def log_tail(path: str | Path) -> str:
+    """The end of a run's log (its output and errors), or "" if it cannot be read."""
+    with contextlib.suppress(OSError), open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        f.seek(max(0, f.tell() - TAIL_BYTES))
+        return f.read().decode(errors="replace")
+    return ""
 
 
 def make_runtime(agent: AgentConfig, node: NodeConfig) -> SubprocessRuntime:

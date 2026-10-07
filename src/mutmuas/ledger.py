@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     paused          INTEGER NOT NULL DEFAULT 0,
     priority        TEXT NOT NULL DEFAULT 'normal',   -- the REQUEST's: high runs first and stops normal (D-104)
     wait_reason     TEXT,                    -- why a paused task waits: "quota" = the account's usage limit (D-104)
+    run_log         TEXT,                    -- the latest run's log: its result is read from it after a deploy
     PRIMARY KEY (task_id, role)
 );
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(role, status);
@@ -164,6 +165,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 ADDED_COLUMNS = (
     ("tasks", "priority", "TEXT NOT NULL DEFAULT 'normal'"),
     ("tasks", "wait_reason", "TEXT"),
+    ("tasks", "run_log", "TEXT"),
 )
 
 TASK_JSON_FIELDS = ("request", "result", "result_draft", "input_refs", "output_refs", "interrupts")

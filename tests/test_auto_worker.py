@@ -216,9 +216,9 @@ async def test_recovery_delivers_a_draft_from_a_worker_that_already_exited(tmp_p
         ledger.close()
 
 
-async def test_an_old_worker_that_still_runs_is_skipped_recorded_and_looked_at_again(tmp_path):
-    """D-040: not stopped, not quarantined. This round it is skipped and recorded (once); after it ends, the
-    next look queues the task again."""
+async def test_an_old_worker_that_still_runs_is_skipped_and_looked_at_again(tmp_path):
+    """D-040: not stopped, not quarantined. This round it is skipped (a run that outlived a deploy is normal, D-104:
+    not a failure); after it ends, the next look queues the task again."""
     _, ledger, daemon = _setup(tmp_path, "RUNNING")
     worker = Orphan("import time; time.sleep(30)")
     ledger.set_runner_pid("T-b", worker.pid, proc_start(worker.pid))
@@ -226,9 +226,8 @@ async def test_an_old_worker_that_still_runs_is_skipped_recorded_and_looked_at_a
         await daemon.recover()
         assert worker.poll() is None and "T-b" not in daemon._queued["B:desk"]
         assert "T-b" in daemon._recheck
-        await daemon._recover_auto(ledger.task("T-b", "owner"))       # still running: recorded only once
-        records = [r for r in ledger.failures() if r["task_id"] == "T-b"]
-        assert [r["stage"] for r in records] == ["recover"]
+        await daemon._recover_auto(ledger.task("T-b", "owner"))       # still running: skipped again
+        assert "T-b" in daemon._recheck and not [r for r in ledger.failures() if r["task_id"] == "T-b"]
         worker.terminate()
         worker.wait(5)
         await daemon._recover_auto(ledger.task("T-b", "owner"))       # what the heartbeat does
