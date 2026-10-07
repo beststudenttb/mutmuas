@@ -17,6 +17,7 @@ import json
 import sqlite3
 import threading
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -387,6 +388,9 @@ class Ledger:
     _BEAT_SQL = ("INSERT INTO sessions (local_agent, pid, session_pid, cwd, started_at, last_seen)"
                  " VALUES (?,?,?,?,?,?) ON CONFLICT(local_agent) DO UPDATE SET pid=excluded.pid,"
                  " session_pid=excluded.session_pid, cwd=excluded.cwd, last_seen=excluded.last_seen,"
+                 # a new session (another MCP process) starts idle: the old one's busy is not its own (D-108)
+                 " activity=CASE WHEN sessions.pid=excluded.pid THEN sessions.activity END,"
+                 " activity_at=CASE WHEN sessions.pid=excluded.pid THEN sessions.activity_at END,"
                  " started_at=CASE WHEN sessions.pid=excluded.pid THEN sessions.started_at"
                  " ELSE excluded.started_at END")
 
@@ -625,9 +629,10 @@ class Ledger:
         self.db.execute("UPDATE jobs SET ended_at=?, ended=? WHERE job_id=?", (now_iso(), ended, job_id))
 
     def stuck_reasons(self, local_agent: str) -> list[str]:
-        """Why this post is held up (D-108), as kinds only: "blocked" (a task it owns is BLOCKED), "quota" (one
-        waits for the account's usage limit), "delivery" (a message it sent keeps failing to go out), "worker"
-        (its last two runs failed, with nothing finished since)."""
+        """Why this post is really held up (D-108), as kinds only: "blocked" (a task it owns is BLOCKED), "quota"
+        (one waits for the account's usage limit), "delivery" (a message it sent has failed to go out for 5
+        minutes), "worker" (its last two runs failed on two different tasks within the hour, nothing finished
+        since: the worker itself, not one task's trouble)."""
         reasons = []
         if self.db.execute("SELECT 1 FROM tasks WHERE role='owner' AND local_agent=? AND status='BLOCKED'",
                            (local_agent,)).fetchone():
@@ -637,14 +642,17 @@ class Ledger:
                            f" AND status NOT IN ({','.join('?' * len(TERMINAL_STATES))})",
                            (local_agent, *TERMINAL_STATES)).fetchone():
             reasons.append("quota")
+        now = datetime.now(timezone.utc)
         if self.db.execute("SELECT 1 FROM messages WHERE direction='out' AND local_agent=? AND state='queued'"
-                           " AND last_error IS NOT NULL", (local_agent,)).fetchone():
+                           " AND last_error IS NOT NULL AND created_at < ?",
+                           (local_agent, (now - timedelta(minutes=5)).isoformat())).fetchone():
             reasons.append("delivery")
         done = self.db.execute("SELECT MAX(updated_at) FROM tasks WHERE role='owner' AND local_agent=?"
                                " AND status='COMPLETED'", (local_agent,)).fetchone()[0] or ""
-        failed = [r[0] for r in self.db.execute("SELECT at FROM failures WHERE stage='run' AND address=?"
-                                               " ORDER BY rowid DESC LIMIT 2", (local_agent,))]
-        if len(failed) == 2 and all(at > done for at in failed):
+        failed = [tuple(r) for r in self.db.execute("SELECT at, task_id FROM failures WHERE stage='run' AND address=?"
+                                                     " ORDER BY rowid DESC LIMIT 2", (local_agent,))]
+        since = max(done, (now - timedelta(hours=1)).isoformat())
+        if len(failed) == 2 and failed[0][1] != failed[1][1] and all(at > since for at, _ in failed):
             reasons.append("worker")
         return reasons
 

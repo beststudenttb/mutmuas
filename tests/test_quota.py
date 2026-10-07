@@ -134,3 +134,18 @@ async def test_a_quota_task_resumed_then_a_deploy_before_its_next_run_is_not_hel
         assert "T-q" in new._queued["B:desk"]
     finally:
         ledger.close()
+
+
+def test_a_run_the_cli_says_succeeded_is_not_held_for_quota_whatever_it_mentions(tmp_path):
+    """B:ops S2 (probe p2): claude -p's JSON says is_error false: the run worked, even if its answer quotes a limit
+    notice (and an adopted run's exit code is not known)."""
+    import json
+    claude = ClaudeCodeRuntime(AgentConfig(id="c", runtime="claude-code"),
+                               NodeConfig(project="p", node="B", data_dir=str(tmp_path)))
+    out = {"type": "result", "subtype": "success", "is_error": False,
+           "result": 'Done. Added "You\'ve hit your limit" to quota_patterns.\n'
+                     '{"status": "complete", "summary": "patterns updated"}'}
+    log = tmp_path / "run.log"
+    log.write_text("$ claude -p ...\n" + json.dumps(out) + "\n")
+    assert claude.quota(RunOutcome(-1, log.read_text(), log_path=str(log))) is None
+

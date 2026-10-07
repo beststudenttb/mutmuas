@@ -123,9 +123,10 @@ async def test_a_post_that_is_really_held_up_shows_stuck_with_the_kind_only(tmp_
         out = Envelope(type="UPDATE", sender="B:desk", to="A:sender", task_id="T-b", body={"message": "x"})
         ledger.queue_outgoing(out)
         ledger.mark_send_error(out.message_id, "BusUnavailable: no servers")
+        _failing_since(ledger, out.message_id, minutes=6)
         assert (await _card(daemon))["stuck_reason"] == "blocked,quota,delivery"
-        for _ in range(2):
-            ledger.record_failure("run", "runtime error: claude not found", address="B:desk", task_id="T-q")
+        for task_id in ("T-q", "T-b"):                                         # two tasks: the worker itself
+            ledger.record_failure("run", "runtime error: claude not found", address="B:desk", task_id=task_id)
         card = await _card(daemon)
         assert card["stuck_reason"] == "blocked,quota,delivery,worker" and "T-" not in card["stuck_reason"]
     finally:
@@ -138,14 +139,74 @@ async def test_stuck_clears_once_the_trouble_is_over(tmp_path):
         out = Envelope(type="UPDATE", sender="B:desk", to="A:sender", task_id="T-1", body={"message": "x"})
         ledger.queue_outgoing(out)
         ledger.mark_send_error(out.message_id, "BusUnavailable")
-        ledger.record_failure("run", "runtime error", address="B:desk")
-        ledger.record_failure("run", "runtime error", address="B:desk")
+        _failing_since(ledger, out.message_id, minutes=6)
+        ledger.record_failure("run", "runtime error", address="B:desk", task_id="T-1")
+        ledger.record_failure("run", "runtime error", address="B:desk", task_id="T-2")
         assert (await _card(daemon))["stuck"] is True
         ledger.mark_sent(out.message_id)                                       # the send went through after all
         owned_task(ledger, "T-ok", "ACCEPTED", ingest=True)
         ledger.update_task("T-ok", "owner", status="COMPLETED")                # a run worked since the failures
         assert "stuck" not in await _card(daemon)
-        ledger.record_failure("run", "runtime error", address="B:desk")       # one failure is not "keeps failing"
+        ledger.record_failure("run", "runtime error", address="B:desk", task_id="T-3")   # one is not "keeps failing"
         assert "stuck" not in await _card(daemon)
     finally:
         ledger.close()
+
+
+def _failing_since(ledger, message_id, minutes):
+    then = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat(timespec="milliseconds")
+    ledger.db.execute("UPDATE messages SET created_at=? WHERE message_id=?", (then, message_id))
+
+
+async def test_one_task_failing_both_attempts_does_not_leave_its_idle_post_stuck(tmp_path):
+    """B:ops S1 (probe p1): a task that failed twice is FAILED; the post has nothing open and is not held up."""
+    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    try:
+        owned_task(ledger, "T-x", "ACCEPTED", ingest=True)
+        ledger.record_failure("run", "timed out after 3600s", address="B:desk", task_id="T-x", attempt=1)
+        ledger.record_failure("run", "timed out after 3600s", address="B:desk", task_id="T-x", attempt=2)
+        ledger.update_task("T-x", "owner", status="FAILED")
+        card = await _card(daemon)
+        assert card["availability"] == "available" and "stuck" not in card
+    finally:
+        ledger.close()
+
+
+async def test_a_worker_failing_on_two_tasks_is_stuck_for_an_hour_at_most(tmp_path):
+    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    try:
+        for task_id in ("T-1", "T-2"):
+            ledger.record_failure("run", "runtime error: claude not found", address="B:desk", task_id=task_id)
+        assert (await _card(daemon))["stuck_reason"] == "worker"
+        ledger.db.execute("UPDATE failures SET at=?",
+                          ((datetime.now(timezone.utc) - timedelta(minutes=61)).isoformat(),))
+        assert "stuck" not in await _card(daemon)
+    finally:
+        ledger.close()
+
+
+async def test_a_send_that_failed_once_is_not_stuck_yet(tmp_path):
+    """B:ops S3: a blip of the bus is not being held up; failing for 5 minutes is."""
+    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    try:
+        out = Envelope(type="UPDATE", sender="B:desk", to="A:sender", task_id="T-1", body={"message": "x"})
+        ledger.queue_outgoing(out)
+        ledger.mark_send_error(out.message_id, "BusUnavailable")
+        assert "stuck" not in await _card(daemon)
+        _failing_since(ledger, out.message_id, minutes=6)
+        assert (await _card(daemon))["stuck_reason"] == "delivery"
+    finally:
+        ledger.close()
+
+
+async def test_a_new_session_does_not_inherit_the_old_ones_busy(tmp_path):
+    """B:ops S5: a session that starts anew (another MCP process) starts idle."""
+    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    _session(ledger, agent)
+    try:
+        await tools.report_activity(hub, "B:desk", "busy")
+        ledger.session_beat("B:desk", os.getppid(), str(agent.workdir_path), session_pid=os.getppid())   # a new one
+        assert ledger.session_of("B:desk")["activity"] is None
+    finally:
+        ledger.close()
+

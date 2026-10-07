@@ -119,8 +119,10 @@ class SubprocessRuntime:
         for line in lines:
             if line.startswith(QUOTA_SIGNAL):
                 return line[len(QUOTA_SIGNAL):].strip() or "usage limit reached"
-        failed = (outcome.exit_code != 0 or (outcome.result or {}).get("is_error")
-                  or (_last_json(outcome.output_tail or "") or {}).get("type") == "error")
+        cli = _last_json(outcome.output_tail or "") or {}
+        if cli.get("type") == "result" and cli.get("is_error") is False:
+            return None                     # the CLI itself says the run worked, whatever its answer quotes
+        failed = (outcome.exit_code != 0 or (outcome.result or {}).get("is_error") or cli.get("type") == "error")
         if failed:
             for line in lines:
                 if any(p in _plain(line) for p in self.quota_patterns):
@@ -129,14 +131,6 @@ class SubprocessRuntime:
             head = _plain(outcome.output_tail or "").lstrip("{\"' ")
             if any(head.startswith(n) for n in self.quota_notices):
                 return (outcome.output_tail or "").strip()[:300]
-        return None
-        text = (outcome.output_tail or "") + "\n" + (log_tail(outcome.log_path) if outcome.log_path else "")
-        for line in text.splitlines():
-            line = line.strip()
-            if line.startswith(QUOTA_SIGNAL):
-                return line[len(QUOTA_SIGNAL):].strip() or "usage limit reached"
-            if any(p in line.lower() for p in self.quota_patterns):
-                return line[:300]
         return None
 
     def __init__(self, agent: AgentConfig, node: NodeConfig):
@@ -177,10 +171,12 @@ class SubprocessRuntime:
                 ctx.on_spawn(proc.pid)
             try:
                 code = await proc.wait()
+                input_path.unlink(missing_ok=True)      # it holds the task's content: gone with the run
             except BaseException:
                 if ctx.handing_over and ctx.handing_over():
                     raise                  # the daemon is being replaced: the run goes on; the next one adopts it
                 await _kill_group(proc)    # timeout, a control's stop: never leave orphans behind
+                input_path.unlink(missing_ok=True)
                 raise
         outcome = self.parse(ctx, code, log_tail(log_path))
         outcome.log_path = str(log_path)

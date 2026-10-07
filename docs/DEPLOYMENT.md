@@ -379,6 +379,10 @@ show a pattern.
 
 Known risks (protections removed on purpose; one line each):
 
+- Any process of the same user on a node can report another post's activity there (`agentctl activity busy --as
+  <post>`), as with `session off|on`: the same trust model (one user per node). It changes only what the card
+  shows (state, activity, find_agent's order), nothing about work, leases or tasks.
+
 - A run adopted after a deploy is no longer bound by its task_timeout_s: the new daemon waits for it to end
   (a control or a cancel still stops it).
 - A deploy that lands while the daemon is creating a run's process can leave a process whose pid was not yet
