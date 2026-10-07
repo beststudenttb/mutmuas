@@ -190,6 +190,19 @@ def session_fields(session: dict[str, Any] | None) -> dict[str, Any]:
     return out
 
 
+ACTIVITY_STALE_S = 3600          # a busy report not renewed this long counts as idle: a Stop hook was lost (D-108)
+
+
+def _activity(session: dict[str, Any] | None) -> str | None:
+    """What the session's hooks last reported (busy | idle), a stale busy as idle; None if they never did."""
+    if not session or not session.get("activity"):
+        return None
+    if session["activity"] == "busy" and (
+            datetime.now(timezone.utc) - parse_iso(session["activity_at"])).total_seconds() < ACTIVITY_STALE_S:
+        return "busy"
+    return "idle"
+
+
 def _code_version() -> str:
     """The git commit this daemon runs from (what 'same version on every node' is checked against)."""
     import subprocess
@@ -1442,7 +1455,15 @@ class NodeDaemon:
                                           statuses=OPEN_STATES)
             if agent.mode == "interactive":      # an accepted task is RUNNING until its result is submitted
                 running = [t["task_id"] for t in owned_open if t["status"] == "RUNNING"]
-            state = state_override or ("working" if running else "idle")
+            session = hub.ledger.session_of(addr) if agent.mode == "interactive" else None
+            seen = session_fields(session) if agent.mode == "interactive" else {}
+            activity = _activity(session) if seen.get("session") == "online" else None
+            state = state_override or ("working" if running or activity == "busy" else "idle")
+            # D-108: the project of the task in hand, else the session's project directory, else the post's default
+            if running:
+                project = agent.project_of(hub.ledger.task(running[0], "owner")["request"])
+            else:
+                project = agent.session_project(seen.get("session_cwd")) or agent.default_project or None
             card = {
                 "address": addr, "node": self.cfg.node, "agent_id": agent.id, "display": agent.display,
                 "role": agent.role, "provider": agent.provider, "mode": agent.mode,
@@ -1451,8 +1472,9 @@ class NodeDaemon:
                 # Public layer only (visibility.py): coarse availability, no current task, queue or inbox
                 # counts, no session directory. The agent reads its own details locally (whoami).
                 "state": state, "availability": "busy" if running or owned_open else "available",
-                **(public_session(session_fields(hub.ledger.session_of(addr)))
-                   if agent.mode == "interactive" else {}),
+                **(public_session(seen) if agent.mode == "interactive" else {}),
+                **({"activity": activity, "activity_at": session["activity_at"]} if activity else {}),
+                **({"project": project} if project else {}),
                 "heartbeat_s": self.cfg.heartbeat_s, "last_heartbeat": now}
             await bus.kv_put(bus.names.agents_kv, f"{self.cfg.node}.{agent.id}",
                              {k: v for k, v in card.items() if k in CARD_KEYS})

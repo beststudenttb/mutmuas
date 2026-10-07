@@ -26,7 +26,8 @@ OBJECTIVE_CHARS = 80
 STATUS_KEYS = ("task_id", "requester", "owner", "status", "updated_at", "wait_reason")
 # The public registry card: who someone is and whether they can take work now, nothing about the work.
 CARD_KEYS = ("address", "node", "agent_id", "display", "role", "capabilities", "provider", "mode", "auto_worker",
-             "accepts_kinds", "state", "availability", "session", "session_seen", "heartbeat_s", "last_heartbeat")
+             "accepts_kinds", "state", "availability", "session", "session_seen", "heartbeat_s", "last_heartbeat",
+             "activity", "activity_at", "project")
 
 
 def short(text: str | None, n: int = OBJECTIVE_CHARS) -> str:

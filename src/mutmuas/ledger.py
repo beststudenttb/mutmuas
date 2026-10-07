@@ -89,7 +89,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     cwd             TEXT,
     started_at      TEXT NOT NULL,
     last_seen       TEXT NOT NULL,
-    accepting       INTEGER NOT NULL DEFAULT 1   -- 0: online but takes no work (`off`)
+    accepting       INTEGER NOT NULL DEFAULT 1,  -- 0: online but takes no work (`off`)
+    activity        TEXT,                       -- busy | idle, as the session's hooks report it (D-108)
+    activity_at     TEXT                        -- when it last did
 );
 
 -- Artifacts an agent of this node published itself: with inbound mail, the only source of artifact access
@@ -166,6 +168,8 @@ ADDED_COLUMNS = (
     ("tasks", "priority", "TEXT NOT NULL DEFAULT 'normal'"),
     ("tasks", "wait_reason", "TEXT"),
     ("tasks", "run_log", "TEXT"),
+    ("sessions", "activity", "TEXT"),
+    ("sessions", "activity_at", "TEXT"),
 )
 
 TASK_JSON_FIELDS = ("request", "result", "result_draft", "input_refs", "output_refs", "interrupts")
@@ -574,6 +578,10 @@ class Ledger:
         last = self.db.execute("SELECT MAX(pushed_at) FROM messages WHERE direction='in' AND local_agent=?",
                                (local_agent,)).fetchone()[0]
         return {"oldest_unread_at": row["oldest"], "last_push_at": last}
+
+    def set_activity(self, local_agent: str, activity: str) -> bool:
+        return self.db.execute("UPDATE sessions SET activity=?, activity_at=? WHERE local_agent=?",
+                               (activity, now_iso(), local_agent)).rowcount == 1
 
     def set_session_accepting(self, local_agent: str, accepting: bool) -> bool:
         cur = self.db.execute("UPDATE sessions SET accepting=? WHERE local_agent=?", (int(accepting), local_agent))

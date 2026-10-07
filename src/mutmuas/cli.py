@@ -88,10 +88,10 @@ async def _with_hub(args, fn, *, require_bus: bool = True, watch: bool = False):
         await hub.close()
 
 
-# Commands that may run beside the session that holds the agent (from a shell or a hook): they only read, or switch
-# the session's own work off and on. `inbox --peek` and `watch --headers-only` read without marking anything.
+# Commands that may run beside the session that holds the agent (from a shell or a hook): they only read, switch
+# the session's own work off and on, or report its activity (its hooks, D-108). `inbox --peek` and `watch --headers-only` read without marking anything.
 LEASE_FREE = {"cmd_status", "cmd_agents", "cmd_find", "cmd_session", "cmd_whoami", "cmd_tasks", "cmd_task",
-              "cmd_failures"}
+              "cmd_failures", "cmd_activity"}
 
 
 def _parse_kv(pairs: list[str] | None) -> dict[str, Any]:
@@ -140,7 +140,10 @@ async def cmd_status(args, hub: Hub):
             alias = f" ({c['display']})" if c.get("display") else ""
             session = f"  session {c['session']}" if c.get("session") else ""
             busy = f"  {c['availability']}" if c.get("availability") and c["online"] else ""
-            print(f"  {c['address']}{alias}  {state}{busy}  [{c.get('mode')}/{c.get('runtime') or '-'}]{session}")
+            activity = f"  activity {c['activity']}" if c.get("activity") and c["online"] else ""
+            project = f"  project {c['project']}" if c.get("project") else ""
+            print(f"  {c['address']}{alias}  {state}{busy}  [{c.get('mode')}/{c.get('runtime') or '-'}]{session}"
+                  f"{activity}{project}")
     if not known and not by_node:
         print("no nodes registered yet (is any agent-node running?)")
 
@@ -301,6 +304,10 @@ def _desktop_notify(title: str, text: str, dry_run: bool = False) -> None:
 async def cmd_update(args, hub: Hub):
     _print(await tools.report_progress(hub, _me(args), args.message, args.task, args.state, next=args.next,
                                        eta=args.eta), args.json)
+
+
+async def cmd_activity(args, hub: Hub):
+    _print(await tools.report_activity(hub, _me(args), args.activity), args.json)
 
 
 async def cmd_session(args, hub: Hub):
@@ -739,6 +746,8 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--state", choices=["RUNNING", "WAITING", "BLOCKED"])
     p.add_argument("--next", metavar="ADDR", help="whose move it is now (wakes them)")
     p.add_argument("--eta", help="a new estimate from now: +2h, +1d")
+    p = add("activity", cmd_activity, "my session is at work (busy) or done (idle): for its hooks (D-108)", bus=False)
+    p.add_argument("activity", choices=["busy", "idle"])
     p = add("session", cmd_session, "my session: off = online but takes no work (the worker does); on = back",
             bus=False)
     p.add_argument("action", choices=["off", "on"])

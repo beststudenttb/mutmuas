@@ -107,6 +107,14 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   takes all of them, as before. Which project a session is in is found by file identity, so a case variant of
   the directory or a link into it counts as that project. An agent without `auto_worker` has nobody to hand
   the rest to, so its session takes and sees all work wherever it was started.
+- **At work, and where** (D-108): an interactive post's card carries `activity` (`"busy"` | `"idle"`, a string)
+  and `activity_at` (ISO time of the last report), set by the session's own hooks with `agentctl activity
+  busy|idle` (UserPromptSubmit: busy; Stop: idle; allowed beside the session, no lease). Only while the session is
+  online; a busy report older than an hour shows as idle (a lost Stop hook). `state` is `"working"` while busy,
+  with or without a mutmuas task. `project` (a string, only the name; absent when there is none): the project of
+  the task in hand, else the project directory the session is in, else the post's `default_project`.
+  Example: `{"state": "working", "activity": "busy", "activity_at": "2026-10-07T05:51:02.120+00:00",
+  "project": "visualrl", ...}`. `agentctl status` shows both.
 - **Waiting for quota** (D-104): a worker run that ends at the vendor account's usage limit (the vendor CLI's own
   words, e.g. Claude's "usage limit reached", Codex's `usage_limit_reached`, or a line `MUTMUAS_QUOTA: <what>`
   from any runtime or script) does not fail its task: the task waits, paused with `wait_reason: quota` (in the
@@ -273,7 +281,7 @@ There are four layers (`src/mutmuas/visibility.py`):
 
 | layer | who | what |
 |---|---|---|
-| public | everyone | address, role, capabilities, provider, mode, `accepts_kinds`, online/offline, `session` on duty, `availability` available/busy |
+| public | everyone | address, role, capabilities, provider, mode, `accepts_kinds`, online/offline, `session` on duty, `availability` available/busy, `activity` busy/idle and `activity_at`, `project` (D-108) |
 | task status | coordinators + participants | task id, first 80 characters of the objective, status, requester → owner, last update |
 | task content | participants only: requester, owner, `observers` | reason, inputs, the thread, the RESULT, artifacts |
 | private | nobody | session reasoning, memory, work logs, transcripts, raw run logs. Never sent over mutmuas; ask the person, who answers with a condensed summary |

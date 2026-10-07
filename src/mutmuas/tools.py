@@ -533,6 +533,17 @@ async def answer(hub: Hub, me: str, task_id: str, text: str, next: str | None = 
     return {"task_id": task_id, "delivery": delivery}
 
 
+async def report_activity(hub: Hub, me: str, activity: str) -> dict[str, Any]:
+    """D-108: the session says it is at work (busy: it started on a prompt) or done (idle: it stopped). Its hooks
+    call it; the card shows the post working while busy, with or without a mutmuas task."""
+    if activity not in ("busy", "idle"):
+        raise ValueError(f"activity={activity!r}: busy or idle")
+    addr, _ = hub.local_agent(me)
+    if not hub.ledger.set_activity(str(addr), activity):
+        raise KeyError(f"{addr} has no session on this node: nothing to mark {activity}")
+    return {"address": str(addr), "activity": activity}
+
+
 async def set_session_taking_work(hub: Hub, me: str, on: bool) -> dict[str, Any]:
     """`mutmuas <post> off|on`: the session stays online but takes no new work; the worker does. Only a post with
     a worker can hand its work over."""
