@@ -84,5 +84,6 @@ async def test_a_runs_input_is_a_file_written_before_it_starts(tmp_path):
     try:
         await daemon._execute(agent, "T-in")
         assert ledger.task("T-in", "owner")["result"]["summary"] == "True T-in"
+        assert not list((daemon.cfg.data_path / "runs").glob("T-in.*.input"))      # gone with its run's end
     finally:
         ledger.close()
