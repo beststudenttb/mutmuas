@@ -56,19 +56,7 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                        deadline: str | None = None, artifacts: list[dict] | None = None,
                        parent_task: str | None = None, priority: str = "normal",
                        reply: str | None = None, observers: list[str] | None = None,
-                       leader: bool = False, project: str | None = None,
-                       reply_to: str | None = None) -> dict[str, Any]:
-    """reply_to (D-104): the open task of the recipient's this letter delivers; "new" for a new request whatever
-    the sender holds. Without it, a letter to someone with exactly one open task of theirs in the sender's hands
-    delivers that task; with several it is refused until reply_to says which."""
-    if reply_to != "new" and not parent_task:
-        if (delivering := await _delivers(hub, me, to, reply_to)):
-            task_id, recipient = delivering
-            out = await submit_result(hub, me, "complete", objective, task_id=task_id, outputs=inputs or None,
-                                      artifacts=artifacts, next=recipient, notes=reason)
-            return {**out, "delivered_as_result_of": task_id,
-                    "note": f"sent as the result of {task_id}, the open task {recipient} asked of you "
-                            "(reply_to='new' sends a new request instead)"}
+                       leader: bool = False, project: str | None = None) -> dict[str, Any]:
     default_deadline = None
     for observer in observers or []:
         Address.parse(observer)        # before anything goes out: a bad one is refused, not half sent
@@ -82,25 +70,6 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                         leader=leader)
     return await _send_request(hub, me, to, body, artifacts=artifacts, parent_task=parent_task, priority=priority,
                                project=project)
-
-
-async def _delivers(hub: Hub, me: str, to: str, reply_to: str | None) -> tuple[str, str] | None:
-    """(task, its requester): the open task of `to`'s that a letter from `me` delivers, if any (D-104 item 3).
-    Only tasks the caller may act on count: a worker's own task, or for a session the tasks no worker is doing."""
-    addr, recipient = str(hub.local_agent(me)[0]), await hub.resolve(to)
-    worker_of = node.worker_task(hub.ledger, addr)
-    held = [t["task_id"] for t in hub.ledger.tasks(role="owner", local_agent=addr, statuses=OPEN_STATES, limit=None)
-            if t["requester"] == recipient
-            and (t["task_id"] == worker_of if worker_of else t.get("runner") != "worker")]
-    if reply_to:
-        if reply_to not in held:
-            raise ValueError(f"reply_to={reply_to}: not an open task {recipient} asked of you"
-                             f"{' (yours: ' + ', '.join(held) + ')' if held else ''}; reply_to='new' for a new request")
-        return reply_to, recipient
-    if len(held) > 1:
-        raise ValueError(f"you hold {len(held)} open tasks {recipient} asked of you ({', '.join(held)}): say which "
-                         "this letter delivers with reply_to=<task id>, or reply_to='new' for a new request")
-    return (held[0], recipient) if held else None
 
 
 LONG_KINDS = ("experiment", "code")       # their default deadline is long_reply_deadline_s (D-098)

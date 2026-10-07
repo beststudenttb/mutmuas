@@ -122,11 +122,6 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   jobs run on. Nothing restarts it by itself: the account is shared, so when the secretary is back, everyone is.
   The secretary lists all such tasks with the MCP `quota_waits` and resumes them with `resume_quota_waits`
   (`control_task resume` to each; a resume clears the reason).
-- **A letter that delivers** (D-104): `send_request` first looks at the open tasks the recipient asked of the
-  sender (those the caller may act on: a worker's own task; for a session, those no worker is doing). Exactly
-  one: the letter is that task's delivery: its RESULT (`complete`, summary = the objective, artifacts and inputs
-  carried over, the requester named `next`), and the task is closed. Several: refused until `reply_to=<task id>`
-  says which. None, `reply_to: "new"`, or an explicit `parent_task` (a child task): a new request.
 - **Urgent work** (D-104): a REQUEST's `priority` has two levels, `normal` and `high`; the sender marks it as it
   needs, and the leader's work (`leader: true`) counts as high. The owner's node decides once more with what the
   post is doing: urgent work that arrives while the post's worker runs something not urgent stops that run; the
