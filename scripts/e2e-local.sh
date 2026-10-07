@@ -11,6 +11,8 @@
 #   TEST 4  A pauses and resumes B's experiment; interrupts its own task without touching another one running
 #           on the same post, and the next run gets the message (control_task)
 #   TEST 6  B:secretary, trusted on B, pauses and resumes a task it did not request (run before TEST 5)
+#   TEST 7  a hot deploy: B's daemon restarts while a run and a job go on; both finish, the run once (D-104)
+#   TEST 8  a run stops at the usage limit: it waits; B:secretary lists and resumes it (D-104)
 #   TEST 5  B retires its post B:data (daemon stopped) and undoes it
 #
 # Usage: scripts/e2e-local.sh [--keep]     (work dir: .local/e2e/, kept with --keep)
@@ -80,6 +82,7 @@ data_dir: ./data
 heartbeat_s: 1
 resources: {gpu: {type: RTX4090, count: 2}}
 trusted_controllers: ["A:main", "B:secretary"]
+coordinators: ["B:secretary"]
 nats: {servers: ["nats://127.0.0.1:$PORT"], credentials_file: ../server/B.env, tls_ca: ../server/tls/ca.crt}
 agents:
   - id: data
@@ -137,6 +140,10 @@ async def main(cmd, task_id, *rest):
             out = await tools.control_task(hub, ME, task_id, rest[0], rest[1])
         elif cmd == "answer":
             out = await tools.answer(hub, ME, task_id, rest[0], next=rest[1])
+        elif cmd == "quota_waits":
+            out = await tools.quota_waits(hub, ME)
+        elif cmd == "resume_quota":
+            out = await tools.resume_quota_waits(hub, ME)
         print(json.dumps(out, default=str))
     finally:
         await hub.close()
@@ -266,6 +273,37 @@ CTL_AS=B:secretary ctl_b control "$TASK6" resume "go on" >/dev/null
 CTL_AS=A:aux ctl wait "$TASK6" \
   | check "d['result_status']=='complete' and any('the leader needs the GPU' in t for t in d['result']['outputs']['told'])" \
           "resumed and finished; the run after resume was told why it was paused"
+
+step "TEST 7: a hot deploy: B's daemon restarts while a run and a job are in progress"
+OUT=$("${AGENTCTL[@]}" ask B:b1 "Job across the deploy" --reason "hot deploy" --kind experiment \
+  --input action=job_then_result --input "flag=$W/job7.done" --input job_s=12 --json --config "$W/A/node.yaml")
+JOB7=$(echo "$OUT" | json "d['task_id']")
+wait_status "$JOB7" "d['status']=='WAITING'" "a job is started and its task waits on it"
+OUT=$("${AGENTCTL[@]}" ask B:b1 "Run across the deploy" --reason "hot deploy" --kind experiment \
+  --input action=experiment --input steps=40 --input step_s=0.25 --json --config "$W/A/node.yaml")
+RUN7=$(echo "$OUT" | json "d['task_id']")
+wait_status "$RUN7" "d['status']=='RUNNING'" "a run is under way"
+[ -f "$W/job7.done" ] && { echo "FAIL: the job ended before the deploy"; exit 1; }
+kill "$PID_B"; wait "$PID_B" 2>/dev/null || true             # the old daemon stops (SIGTERM, as a deploy does)
+start_node B                                                  # the new one starts
+ctl wait "$RUN7" | check "d['result_status']=='complete' and d['result']['outputs']['final_loss']==0.025" \
+  "the run went on across the restart and its result was delivered"
+grep -q "task $RUN7: adopted its run" "$W/B.log" && echo "PASS: the new daemon adopted the run still going" \
+  || { echo "FAIL: the run was not adopted while it ran"; exit 1; }
+RUNS=$(ls "$W/B/data/runs/" | grep -c "^$RUN7\..*\.log$")
+[ "$RUNS" = "1" ] && echo "PASS: it ran once (not again after the restart)" || { echo "FAIL: $RUNS runs"; exit 1; }
+ctl wait "$JOB7" | check "d['result_status']=='complete' and d['result']['summary']=='job finished'" \
+  "the job started before the deploy ran to its end and woke its task"
+
+step "TEST 8: a run stops at the usage limit; B:secretary lists and resumes what waits for quota"
+OUT=$("${AGENTCTL[@]}" ask B:b1 "Out of quota" --reason "quota" --kind experiment \
+  --input action=quota_once --input "flag=$W/quota8" --json --config "$W/A/node.yaml")
+TASK8=$(echo "$OUT" | json "d['task_id']")
+wait_status "$TASK8" "d['status']=='WAITING'" "it waits instead of failing"
+CTL_AS=B:secretary ctl_b quota_waits - | check "[t['task_id'] for t in d]==['$TASK8']" "quota_waits lists it"
+CTL_AS=B:secretary ctl_b resume_quota - | check "d['resumed']==['$TASK8']" "resume_quota_waits resumes it"
+ctl wait "$TASK8" | check "d['result_status']=='complete' and d['result']['summary']=='done after the limit came back'" \
+  "it ran again and finished"
 
 step "TEST 5: retire B:data (B's daemon stopped), then undo"
 kill "$PID_B"; wait "$PID_B" 2>/dev/null || true
