@@ -28,7 +28,10 @@ import yaml
 from .config import load_config
 from .hub import Hub
 from .ids import Address
+from .node import daemon_lock, live_worker_runs, session_present
 from .protocol import OPEN_STATES
+from .runtime import group_alive
+from .tools import cancel_task
 
 
 def _agents_node(text: str) -> yaml.SequenceNode:
@@ -84,7 +87,6 @@ def _write_atomic(path: Path, text: str) -> None:
 @contextlib.contextmanager
 def _node_stopped(cfg, dry_run: bool):
     """Hold the daemon's lock (the daemon cannot start meanwhile); a dry run only says when it is running."""
-    from .node import daemon_lock
     with contextlib.ExitStack() as lock:
         try:
             lock.enter_context(daemon_lock(cfg))
@@ -112,9 +114,6 @@ async def retire(config: Path | str, agent_id: str, hand_over: str | None = None
 
 
 async def _retire(path, cfg, agent, hand_over, dry_run, keep_mailbox) -> dict[str, Any]:
-    from .node import live_worker_runs, session_present
-    from .runtime import group_alive
-    from .tools import cancel_task
     addr = str(Address(cfg.node, agent.id))
     # one try at the bus: with it the card goes offline now, without it at the node's next start
     hub = await Hub.open(cfg, "cli", require_bus=False, reconnect=False, initial_connect_attempts=1)

@@ -12,7 +12,7 @@ import pytest
 import yaml
 from conftest import Orphan
 
-from mutmuas import runtime as runtime_module
+from mutmuas import retire as retire_module
 from mutmuas.config import load_config
 from mutmuas.ledger import Ledger
 from mutmuas.node import proc_start
@@ -334,7 +334,7 @@ async def test_a_stop_cancelled_while_going_offline_still_lets_go_of_the_lock(tm
 async def test_retire_waits_for_a_stuck_process_group_of_a_finished_task(node, monkeypatch):  # noqa: F811
     path, cfg, ledger, post = node
     ledger.update_task("T-open", "owner", status="CANCELLED", stuck_pgid=12345)
-    monkeypatch.setattr(runtime_module, "group_alive", lambda pgid: pgid == 12345)
+    monkeypatch.setattr(retire_module, "group_alive", lambda pgid: pgid == 12345)
     with pytest.raises(PermissionError, match="T-open"):
         await retire(path, "vision")
     assert "id: vision" in path.read_text() and post.is_dir()

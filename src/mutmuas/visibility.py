@@ -20,6 +20,7 @@ from typing import Any
 
 from .config import NodeConfig
 from .ledger import Ledger
+from .protocol import REQUEST_KINDS
 
 OBJECTIVE_CHARS = 80
 STATUS_KEYS = ("task_id", "requester", "owner", "status", "updated_at", "wait_reason")
@@ -68,7 +69,6 @@ def is_participant(ledger: Ledger, viewer: str, task_id: str, record: dict[str, 
 
 def accepts_kinds(permissions: list[str]) -> list[str]:
     """Request kinds an agent may take, from its permissions: public, so senders pick a kind it accepts."""
-    from .protocol import REQUEST_KINDS
     return sorted(kind for kind, needed in REQUEST_KINDS.items() if needed in permissions)
 
 

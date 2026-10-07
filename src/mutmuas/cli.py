@@ -22,12 +22,15 @@ from typing import Any
 
 import yaml
 
-from . import __version__, tools
+from . import __version__, mcp_server, tools
 from .bus import Bus, BusUnavailable
 from .config import ConfigError, NodeConfig, dump_config, find_config, load_config
 from .hub import Hub, is_online
 from .ids import Address, parse_iso
+from .node import NodeDaemon, lease_refusal
 from .protocol import ProtocolError
+from .retire import retire, undo
+from .server_config import generate
 
 # --------------------------------------------------------------------------- helpers
 
@@ -77,7 +80,6 @@ async def _with_hub(args, fn, *, require_bus: bool = True, watch: bool = False):
                       and getattr(args, "clear_before", None) is None) or (
             command == "cmd_watch" and getattr(args, "headers_only", False))
         if command not in LEASE_FREE and not reads_only:
-            from .node import lease_refusal
             refusal = lease_refusal(hub.ledger, str(hub.local_agent(_me(args))[0]))
             if refusal:
                 raise SystemExit(f"error: {refusal}")
@@ -352,8 +354,7 @@ async def cmd_failures(args, hub: Hub):
 
 
 def cmd_mcp(args):
-    from .mcp_server import run
-    run(_cfg(args), _me(args), channel=args.channel, worker_task=args.worker_task)
+    mcp_server.run(_cfg(args), _me(args), channel=args.channel, worker_task=args.worker_task)
 
 
 # --------------------------------------------------------------------------- agent-node commands
@@ -392,7 +393,6 @@ def node_init(args):
 def node_retire_agent(args):
     """agent-node retire-agent <id> [--hand-over ADDR] [--keep-mailbox] [--dry-run] [-y];
     agent-node retire-agent --undo <manifest> [--dry-run]."""
-    from .retire import retire, undo
     try:
         if args.undo:
             print(json.dumps(asyncio.run(undo(args.undo, dry_run=args.dry_run)), indent=2, ensure_ascii=False))
@@ -478,7 +478,6 @@ def node_start(args):
     logging.basicConfig(level=getattr(logging, args.log_level.upper()), handlers=handlers,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("nats").setLevel(logging.WARNING)
-    from .node import NodeDaemon
 
     async def main():
         daemon = NodeDaemon(cfg)
@@ -496,7 +495,6 @@ def node_start(args):
 
 
 def node_server_config(args):
-    from .server_config import generate
     nodes = [n.strip() for n in args.nodes.split(",") if n.strip()]
     tls_hosts = [h.strip() for h in args.tls.split(",") if h.strip()] if args.tls else None
     written = generate(args.project, nodes, Path(args.out), tls_hosts=tls_hosts, port=args.port,

@@ -32,7 +32,7 @@ from typing import Any
 
 from nats.errors import TimeoutError as NatsTimeoutError
 
-from . import __version__
+from . import __version__, tools   # tools imports node as well: looked up when called
 from .bus import Names
 from .config import AgentConfig, NodeConfig
 from .hub import Hub
@@ -557,8 +557,7 @@ class NodeDaemon:
             # (a requester that adds an observer sends the copies itself: relaying would duplicate them) An observer
             # added them: as the owner, relay the copies, so that a node that never saw the task can check the sender
             # against the task record.
-            from .tools import send_observer_copies
-            self._background_job(send_observer_copies(self.hub, env.to, env.task_id, new))
+            self._background_job(tools.send_observer_copies(self.hub, env.to, env.task_id, new))
         return None
 
     def _failed(self, stage: str, error: BaseException | str, address: str | None = None, task_id: str | None = None,
@@ -671,8 +670,7 @@ class NodeDaemon:
             log.warning("ignored CANCEL of %s from %s: not its requester %s", env.task_id, env.sender,
                         task["requester"])
             return "rejected"
-        from .tools import cancel_children
-        await cancel_children(self.hub, env.task_id, env.body.get("reason") or "cancelled by its requester")
+        await tools.cancel_children(self.hub, env.task_id, env.body.get("reason") or "cancelled by its requester")
         if task["status"] == "PENDING":
             # Withdrawn before anyone picked it up: close it and keep it out of the interactive inbox
             # (both the REQUEST and this CANCEL are noise to someone who never saw the request).

@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from . import node   # node imports tools as well: its names are looked up when called
 from .hub import Hub
 from .ids import Address, parse_iso
 from .visibility import acl, artifact_visible, is_participant, short
@@ -86,9 +87,8 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
 async def _delivers(hub: Hub, me: str, to: str, reply_to: str | None) -> tuple[str, str] | None:
     """(task, its requester): the open task of `to`'s that a letter from `me` delivers, if any (D-104 item 3).
     Only tasks the caller may act on count: a worker's own task, or for a session the tasks no worker is doing."""
-    from .node import worker_task
     addr, recipient = str(hub.local_agent(me)[0]), await hub.resolve(to)
-    worker_of = worker_task(hub.ledger, addr)
+    worker_of = node.worker_task(hub.ledger, addr)
     held = [t["task_id"] for t in hub.ledger.tasks(role="owner", local_agent=addr, statuses=OPEN_STATES, limit=None)
             if t["requester"] == recipient
             and (t["task_id"] == worker_of if worker_of else t.get("runner") != "worker")]
@@ -211,10 +211,9 @@ WAKE = ("REQUEST", "QUESTION", "ANSWER", "BLOCKED", "REJECT", "CANCEL", "ERROR")
 def _project_view(hub: Hub, me: str) -> tuple[str, str] | None:
     """A project's session sees only its project's requests (D-072): (its project, the post's default project);
     the rest go to the worker, so only when there is one. None: the session sees all."""
-    from .node import session_alive
     addr, agent = hub.local_agent(me)
     session = hub.ledger.session_of(str(addr))
-    alive = session and session_alive(session)
+    alive = session and node.session_alive(session)
     if alive and agent.auto_worker and not session.get("accepting", 1):
         return ("\x00off", agent.default_project)    # switched off: no request is the session's (none matches)
     mine = agent.session_project(session["cwd"]) if alive else None
@@ -409,7 +408,6 @@ async def add_job(hub: Hub, me: str, task_id: str | None = None, pid: int | None
     (process pid gone, or done_file appears) and wakes the post: a worker's task is queued again, a session gets
     a wake-up. No time limit. children=True (D-066): wait on the task's direct child tasks instead (sent with
     parent_task); it ends when each has a result, was refused or cancelled, or is past its deadline."""
-    from .node import proc_start
     task_id = task_id or _current_task()
     if not task_id:
         raise ValueError("task_id is required outside of a delegated task")
@@ -419,7 +417,7 @@ async def add_job(hub: Hub, me: str, task_id: str | None = None, pid: int | None
     _check_actor(hub, task)
     if children and not hub.ledger.children(task_id):
         raise ValueError(f"{task_id} has no child task to wait on: send them with parent_task={task_id} first")
-    job_id = hub.ledger.add_job(task_id, task["owner"], pid, proc_start(pid) if pid else None, done_file, log,
+    job_id = hub.ledger.add_job(task_id, task["owner"], pid, node.proc_start(pid) if pid else None, done_file, log,
                                 note, children=children)
     what = note or ("its child tasks" if children else f"pid {pid}" if pid else f"until {done_file}")
     await hub.owner_transition(task_id, "WAITING", f"waiting on a background job ({what}); resumes when it ends",
@@ -663,7 +661,6 @@ async def list_tasks(hub: Hub, me: str | None = None, limit: int = 50) -> list[d
 
 async def whoami(hub: Hub, me: str | None = None) -> dict[str, Any]:
     """My own details, read from this node's ledger: private, never on the shared card."""
-    from .node import session_fields
     addr, agent = hub.local_agent(me)
     open_tasks = hub.ledger.tasks(role="owner", local_agent=str(addr),
                                   statuses=OPEN_STATES)
@@ -674,7 +671,7 @@ async def whoami(hub: Hub, me: str | None = None) -> dict[str, Any]:
            **_push_fields(hub.ledger.push_state(str(addr))),
            "coordinator": str(addr) in (hub.cfg.coordinators or [])}
     if agent.mode == "interactive":
-        out.update(session_fields(hub.ledger.session_of(str(addr))))
+        out.update(node.session_fields(hub.ledger.session_of(str(addr))))
     out["jobs_waiting"] = [{k: j[k] for k in ("job_id", "task_id", "pid", "done_file", "log", "note", "created_at")}
                            for j in hub.ledger.jobs(owner=str(addr))]
     if agent.auto_worker:
@@ -726,8 +723,7 @@ def _check_actor(hub: Hub, task: dict[str, Any]) -> str | None:
     - A task held by the worker is changed only by its worker.
     - A task held by the session is not changed by a worker.
     Returns the task the caller is the worker of (None: not a worker)."""
-    from .node import worker_task
-    worker_of = worker_task(hub.ledger, task["owner"])
+    worker_of = node.worker_task(hub.ledger, task["owner"])
     if worker_of and task["task_id"] != worker_of:
         raise PermissionError(f"a worker process (task {worker_of}) acts only on its own task, not on "
                               f"{task['task_id']}, which belongs to the session or to another run")
