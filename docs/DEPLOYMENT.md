@@ -379,6 +379,11 @@ show a pattern.
 
 Known risks (protections removed on purpose; one line each):
 
+- A run adopted after a deploy is no longer bound by its task_timeout_s: the new daemon waits for it to end
+  (a control or a cancel still stops it).
+- A deploy that lands while the daemon is creating a run's process can leave a process whose pid was not yet
+  recorded: the new daemon does not see it and runs the task again beside it.
+
 - The usage limit is recognised by the vendor CLI's own wording (runtime.py quota_patterns): if a vendor changes
   it, such a run counts as an ordinary failed run (laid out once more, then failed) until the pattern is added.
 

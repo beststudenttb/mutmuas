@@ -69,3 +69,20 @@ async def test_a_run_outlives_a_deploy_and_the_new_daemon_delivers_its_printed_r
         ledger.close()
         if same_process(pid, start):
             os.kill(pid, 9)
+
+
+async def test_a_runs_input_is_a_file_written_before_it_starts(tmp_path):
+    """B:ops (F6): the prompt went through a pipe the daemon wrote while the run started; a deploy in the middle
+    left the run with half of it. The run now reads a file the daemon wrote in full before starting it."""
+    agent, ledger, daemon = _node(tmp_path)
+    agent.command = [sys.executable, "-c",
+                     "import json, os, stat, sys\n"
+                     "regular = stat.S_ISREG(os.fstat(0).st_mode)\n"
+                     "task = json.load(sys.stdin)\n"
+                     "print(json.dumps({'status': 'complete', 'summary': f\"{regular} {task['task_id']}\"}))"]
+    owned_task(ledger, "T-in", "ACCEPTED", ingest=True)
+    try:
+        await daemon._execute(agent, "T-in")
+        assert ledger.task("T-in", "owner")["result"]["summary"] == "True T-in"
+    finally:
+        ledger.close()

@@ -162,24 +162,20 @@ class SubprocessRuntime:
         workdir = self.start_dir(ctx)
         workdir.mkdir(parents=True, exist_ok=True)
         log.info("task %s: starting %s in %s", ctx.task_id, argv[0], workdir)
-        with open(log_path, "wb") as logf:
+        # Its input is a file written in full before it starts and its output goes straight into its log: nothing
+        # passes through a pipe to this daemon, so the run neither starts with half its prompt nor stops when the
+        # daemon is replaced (D-104).
+        input_path = runs / f"{ctx.task_id}.{stamp}.attempt{ctx.attempt}.input"
+        input_path.write_bytes(stdin or b"")
+        with open(log_path, "wb") as logf, open(input_path, "rb") as inp:
             logf.write(f"$ {' '.join(argv)}\n".encode())
             logf.flush()
             ctx.run_log = str(log_path)
-            # output straight into the run's log, not through a pipe to this daemon: the run outlives a deploy (D-104)
             proc = await asyncio.create_subprocess_exec(
-                *argv, cwd=str(workdir), env=ctx.env(), stdin=asyncio.subprocess.PIPE,
-                stdout=logf, stderr=logf, start_new_session=True)
+                *argv, cwd=str(workdir), env=ctx.env(), stdin=inp, stdout=logf, stderr=logf, start_new_session=True)
             if ctx.on_spawn:
                 ctx.on_spawn(proc.pid)
             try:
-                # a command that does not read its input may close it first: not an error, its exit code says how it
-                # went
-                with contextlib.suppress(BrokenPipeError, ConnectionResetError):
-                    if stdin is not None:
-                        proc.stdin.write(stdin)
-                        await proc.stdin.drain()
-                    proc.stdin.close()
                 code = await proc.wait()
             except BaseException:
                 if ctx.handing_over and ctx.handing_over():
