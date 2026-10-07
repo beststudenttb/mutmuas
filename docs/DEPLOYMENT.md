@@ -195,6 +195,10 @@ none). They map to `claude -p --max-turns` / `--max-budget-usd`; Codex has no eq
 bounded by `task_timeout_s` only. A run stopped at a limit without a result counts as a failed run (recorded,
 laid out once more, then failed).
 
+Long commands (D-104): a worker's prompt tells it to run any command it expects to take longer than
+`background_after_min` minutes (top level of node.yaml, default 10) as a background job (detached, registered with
+add_job), never in the foreground of its run. Claude Code's own settings are not changed for this.
+
 Runtime notes:
 - `claude-code` runs `claude -p` with only the mutmuas MCP server (`--strict-mcp-config`) and the tools
   allowed by the agent's permissions (ARCHITECTURE_V1 §5). `extra_args` are appended to the command line.

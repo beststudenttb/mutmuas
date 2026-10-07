@@ -287,3 +287,13 @@ async def test_a_run_stopped_at_a_limit_is_a_failed_run_laid_out_once_more(tmp_p
         assert task["status"] == "FAILED" and "error_max_turns" in task["result"]["summary"]
     finally:
         ledger.close()
+
+
+def test_the_worker_prompt_sends_long_commands_to_the_background(tmp_path):
+    """D-104 item 6: a command expected to run longer than N minutes (node.yaml background_after_min, default 10)
+    is never run in the foreground of a worker run; Claude Code's own settings are left alone."""
+    _, ctx, _ = _claude_ctx(tmp_path)
+    prompt = worker_prompt(ctx)
+    assert "longer than 10 minutes" in prompt and "add_job" in prompt and "foreground" in prompt
+    ctx.node.background_after_min = 30
+    assert "longer than 30 minutes" in worker_prompt(ctx)

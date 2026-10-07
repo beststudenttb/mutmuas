@@ -215,6 +215,8 @@ class NodeConfig:
     # A post's brain batch (D-073) ends after this long without a brain run (and with no sub running or job waited
     # on); the next run starts a new conversation. Provisional default: to be set from measured costs.
     brain_batch_idle_s: float = 1800
+    # A worker runs a command expected to take longer than this many minutes in the background, as a job (D-104).
+    background_after_min: int = 10
     agents: list[AgentConfig] = field(default_factory=list)
     path: Path | None = None              # where this config was loaded from
 

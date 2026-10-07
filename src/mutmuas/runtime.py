@@ -247,9 +247,12 @@ Rules:
    failed = nothing usable. Never report partial work as complete. List limitations.
 5. If you need something only the requester can provide, say so in follow_up and use status partial or failed.
 6. This task was accepted for you when this run started: do not call accept_task.
-7. Work that runs long (e.g. training): start it detached, `nohup <command> > <log> 2>&1 < /dev/null &`
-   (then `echo $!` is its pid), register it with add_job (pid and/or done_file, log, a one-line note), note in
-   PLAN.md what you wait for, and end this run without submit_result. You are started again when the job ends.
+7. A command you expect to run longer than {ctx.node.background_after_min} minutes (training, a long test suite or
+   build, a big download) never runs in the foreground of this run: start it detached,
+   `nohup <command> > <log> 2>&1 < /dev/null &` (then `echo $!` is its pid), register it with add_job (pid
+   and/or done_file, log, a one-line note), note in PLAN.md what you wait for, and end this run without
+   submit_result. You are started again when the job ends; a run that ends or is stopped meanwhile does not
+   stop the job.
 8. Parts you delegate with send_request are this task's child tasks (parent_task is set for you). To wait for
    them, call add_job(children=True) and end this run without submit_result: you are started again once
    each has a result, was refused or cancelled, or is past its deadline, and told how each ended. Wait on
