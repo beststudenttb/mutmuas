@@ -38,8 +38,8 @@ from .config import AgentConfig, NodeConfig
 from .hub import Hub
 from .ids import Address, InvalidAddress, check_token, now_iso, parse_iso
 from .ledger import is_info
-from .protocol import (OPEN_STATES, REQUEST_KINDS, TERMINAL_STATES, ArtifactRef, Envelope, ProtocolError,
-                       reply_required, result_body, task_state_for_result)
+from .protocol import (ACCEPTANCE_VERDICTS, DELIVERED, OPEN_STATES, REQUEST_KINDS, TERMINAL_STATES, ArtifactRef,
+                       Envelope, ProtocolError, reply_required, result_body, task_state_for_result)
 from .runtime import RunOutcome, TaskContext, group_alive, log_tail, make_runtime, stop_group
 from .visibility import CARD_KEYS, accepts_kinds, acl, short
 from .worktree import GitError, Worktree
@@ -143,6 +143,12 @@ def live_worker_runs(ledger, agent: str) -> dict[int, str]:
 def _urgent(task: dict[str, Any]) -> bool:
     """High priority, or the leader's (D-049): such work goes first (D-104)."""
     return task.get("priority") == "high" or bool(task["request"].get("leader"))
+
+
+def _seen(child: dict[str, Any]) -> str:
+    """The notice that the parent was told of this delivery of a child task (D-109): one per RESULT, so a delivery
+    after a rejection is news again."""
+    return f"delivery_seen:{child.get('last_message') or ''}"
 
 
 def worker_task(ledger, agent: str | None = None) -> str | None:
@@ -433,7 +439,8 @@ class NodeDaemon:
         state = await self._handle_message(agent, env)
         # not a REQUEST (it starts its own work), not a RESULT (a child's end is the children job's to judge: the parent
         # wakes once all are done), not pause/resume/interrupt
-        if env.type not in ("REQUEST", "RESULT") and env.body.get("next") == env.to and not env.body.get("fyi") \
+        if (env.type != "REQUEST" and (env.type != "RESULT" or env.body.get("acceptance") == "pending")
+                and env.body.get("next") == env.to and not env.body.get("fyi")) \
                 and not any(env.body.get(k) for k in ("pause", "resume", "interrupt")) \
                 and state not in ("rejected", "dropped"):
             what = env.body.get("question") or env.body.get("reason") or env.body.get("answer") \
@@ -499,6 +506,8 @@ class NodeDaemon:
             return self._on_observers_added(env)
         if env.type == "UPDATE" and env.body.get("nudge"):
             await self._on_nudge(env)                    # then kept in the inbox below: it wakes the session
+        if env.type == "UPDATE" and env.body.get("acceptance"):
+            await self._on_acceptance(env)               # then kept in the inbox below: the owner reads why
         if env.type in ("UPDATE", "ANSWER") and (kind := self._interrupt_kind(env)):
             await self._control(agent, env, kind)        # then kept in the inbox below like any message
         elif env.type == "UPDATE" and any(env.body.get(k) for k in ("pause", "resume", "interrupt")):
@@ -727,7 +736,8 @@ class NodeDaemon:
         if env.type == "UPDATE":
             status = env.body.get("state")
         elif env.type == "RESULT":
-            status = task_state_for_result(env.body["status"])
+            # D-109: a delivery that waits for this requester to accept it (accept_delivery)
+            status = DELIVERED if env.body.get("acceptance") == "pending" else task_state_for_result(env.body["status"])
             observers = (task.get("request") or {}).get("observers") or []
             await self.hub.copy_to_observers(task["local_agent"], env, observers)
             fields.update(result=env.body, result_status=env.body["status"],
@@ -736,6 +746,10 @@ class NodeDaemon:
             summary = env.body.get("reason") or env.body.get("message")
             fields.update(result=result_body("failed", f"{env.type.lower()}: {summary}"), result_status="failed")
         ledger.update_task(env.task_id, "requester", status=status, **fields)
+        if status == DELIVERED and not self._can_wake(task):
+            await self.hub.escalate(task["local_agent"], env.task_id, "acceptance",
+                                    f"{env.task_id} was delivered to {task['local_agent']}, which has no session online "
+                                    "and no worker task to wake: nobody can accept it now")
 
     # ---- execution ----------------------------------------------------
 
@@ -835,6 +849,7 @@ class NodeDaemon:
         if notes:
             hub.ledger.update_task(task_id, "owner", interrupts=[])      # handed to this run (D-089)
         ctx = TaskContext(task_id, request, agent, self.cfg, attempt, interrupts=notes,
+                          deliveries=self._deliveries_for_run(task_id),
                           jobs=[j for j in hub.ledger.jobs(task_id, open_only=False) if j["ended_at"]],
                           resume=hub.ledger.brain_session(task["owner"], project) if brain else None)
         if brain and not ctx.resume:
@@ -890,6 +905,8 @@ class NodeDaemon:
             # this daemon has the run's end and reads it now; only a deploy leaves the log to the next daemon
             if not self._stopping:
                 hub.ledger.update_task(task_id, "owner", run_log=None)
+                if agent.mode == "worker":
+                    hub.ledger.mark_seen(task_id, task["owner"])  # D-111: a post with workers only has nobody to read it
 
         if brain:
             if outcome.exit_code != 0 and ctx.resume:
@@ -1106,32 +1123,72 @@ class NodeDaemon:
                 continue
             await self._wake_for_job(task, job, ended)
 
+    def _deliveries_for_run(self, task_id: str) -> list[dict[str, Any]]:
+        """The child tasks delivered to a task, which its run is told about (D-109): each counts as seen by it."""
+        delivered = [c for c in self.hub.ledger.children(task_id) if c["status"] == DELIVERED]
+        for child in delivered:
+            self.hub.ledger.notice_once(child["task_id"], _seen(child))
+        return delivered
+
     def _children_ended(self, task_id: str) -> str | None:
         """D-066: a wait on the direct child tasks ends once each has a result, was refused or cancelled, or is past
         its deadline (then it is reported overdue and left running: the parent decides). None while one is open.
         A child is reported overdue once: a parent that waits again afterwards waits for its real end, or every
         heartbeat would wake it again. There is no way to extend a child's
-        deadline, and a worker cannot be relied on to cancel, so the node keeps this rule itself."""
+        deadline, and a worker cannot be relied on to cancel, so the node keeps this rule itself.
+        A delivered child (D-109) has a result that waits for the parent to accept it: until a run of the parent has
+        been told about it (or a wait ended on it) it counts as an end, as a result did before; after that it is
+        "held": open until accepted, or a parent that waits again unaccepted would be woken for it over and over (its
+        deadline still reports it overdue once). Its wake when it came may have found the parent's run going and been
+        dropped: this is what still tells the parent. A held delivery keeps the wait only while there is no news:
+        a child that ended since the parent was last told (a refusal, say, wakes nobody by itself), a fresh delivery,
+        or an overdue child (B:ops p6, p8)."""
         now = datetime.now(timezone.utc)
-        lines, overdue = [], []
+        lines, overdue, fresh, ended, held = [], [], [], [], False
         ledger = self.hub.ledger
-        for child in ledger.children(task_id):
-            head = f"{child['task_id']} ({child['owner']})"
-            if child["status"] in TERMINAL_STATES:
-                result = child.get("result") or {}
-                lines.append(f"{head}: {child['status']} {result.get('status') or ''} - "
-                             f"{short(result.get('summary') or '', 200)}")
-                continue
+
+        def past_deadline(child: dict[str, Any]) -> str | None:
             deadline = (child.get("request") or {}).get("deadline")
             with contextlib.suppress(TypeError, ValueError):
                 if (deadline and parse_iso(deadline) < now
                         and not ledger.noticed(child["task_id"], "overdue_wake")):
-                    lines.append(f"{head}: overdue (deadline {deadline}, still {child['status']}; not cancelled)")
-                    overdue.append(child["task_id"])
-                    continue
+                    return deadline
             return None
+
+        for child in ledger.children(task_id):
+            head = f"{child['task_id']} ({child['owner']})"
+            result = child.get("result") or {}
+            if child["status"] in TERMINAL_STATES:
+                lines.append(f"{head}: {child['status']} {result.get('status') or ''} - "
+                             f"{short(result.get('summary') or '', 200)}")
+                if not ledger.noticed(child["task_id"], "end_seen"):
+                    ended.append(child["task_id"])
+                continue
+            if child["status"] == DELIVERED:
+                line = (f"{head}: delivered {result.get('status') or ''}, waits for your acceptance (accept_delivery) - "
+                        f"{short(result.get('summary') or '', 200)}")
+                if not ledger.noticed(child["task_id"], _seen(child)):
+                    fresh.append(child)
+                else:
+                    held = True
+                    if deadline := past_deadline(child):
+                        line += f" [overdue: deadline {deadline}]"
+                        overdue.append(child["task_id"])
+                lines.append(line)
+                continue
+            if deadline := past_deadline(child):
+                lines.append(f"{head}: overdue (deadline {deadline}, still {child['status']}; not cancelled)")
+                overdue.append(child["task_id"])
+                continue
+            return None
+        if held and not fresh and not overdue and not ended:
+            return None                  # nothing new: what is left is a delivery the parent was told of, to accept
         for child_id in overdue:
             ledger.notice_once(child_id, "overdue_wake")
+        for child in fresh:
+            ledger.notice_once(child["task_id"], _seen(child))
+        for child_id in ended:
+            ledger.notice_once(child_id, "end_seen")
         return "child tasks done: " + "; ".join(lines)
 
     def _stop_jobs(self, task_id: str) -> None:
@@ -1170,6 +1227,48 @@ class NodeDaemon:
         hub.ledger.ingest(wake)
         hub.ledger.mark_handled(wake.message_id)
 
+    def _can_wake(self, asked: dict[str, Any]) -> bool:
+        """Whether a delivery to this requester wakes someone to accept it (D-109): its session (online: the delivery
+        is pushed), or its worker through the task the request is part of (an auto_worker post)."""
+        addr = asked["local_agent"]
+        agent = self._agent_cfg(addr)
+        if agent is None:
+            return False
+        if session_fields(self.hub.ledger.session_of(addr)).get("session") == "online":
+            return True
+        parent = self.hub.ledger.task(asked["parent_task"], "owner") if asked.get("parent_task") else None
+        return bool(agent.auto_worker and parent and parent["owner"] == addr
+                    and parent["status"] in OPEN_STATES)           # a delivered parent runs no more (B:ops P2)
+
+    async def _on_acceptance(self, env: Envelope) -> None:
+        """D-109: the requester's verdict on a delivered task. pass: done; close: ended as failed (a partial or failed
+        result never counts as done); reject: back to the owner, the reason handed to its next run (not counted as
+        a failed attempt). Only the task's requester decides, only while it is delivered."""
+        hub, verdict = self.hub, env.body["acceptance"]
+        task = hub.ledger.task(env.task_id, "owner")
+        if (not task or task["owner"] != env.to or env.sender != task["requester"] or task["status"] != DELIVERED
+                or verdict not in ACCEPTANCE_VERDICTS):
+            log.warning("ignored a verdict on %s from %s: not its requester, or nothing delivered", env.task_id,
+                        env.sender)
+            return
+        if verdict == "pass" and task.get("result_status") == "complete":
+            hub.ledger.update_task(env.task_id, "owner", status="COMPLETED")
+        elif verdict == "close" and task.get("result_status") != "complete":
+            hub.ledger.update_task(env.task_id, "owner", status="FAILED")
+        elif verdict == "reject":
+            reason = env.body.get("reason") or "(no reason given)"
+            hub.ledger.update_task(env.task_id, "owner", attempts=0, result_draft=None)
+            self._note_interrupt(env.task_id, f"your delivery was sent back by {env.sender}: {reason}")
+            await hub.owner_transition(env.task_id, "ACCEPTED", f"sent back by {env.sender}: {short(reason, 200)}",
+                                       notify=False)
+            await self._settle(env.task_id, f"sent back by {env.sender}: {short(reason, 200)}")
+            return
+        else:
+            log.warning("ignored verdict %s on %s: it does not fit its %s result", verdict, env.task_id,
+                        task.get("result_status"))
+            return
+        await hub.publish_task_record(env.task_id)
+
     def _interrupt_kind(self, env: Envelope) -> str | None:
         """D-089: a trusted controller (node.yaml trusted_controllers; the leader's word comes relayed by the
         secretary) interrupts a worker's run: a message about the task it runs, or any marked interrupt; it may pause
@@ -1194,7 +1293,10 @@ class NodeDaemon:
         hub, addr, task_id = self.hub, env.to, env.task_id
         text = f"{env.type} from {env.sender} on {task_id}: {short(env.body.get('message') or env.body.get('answer') or '', 400)}"
         task = hub.ledger.task(task_id, "owner")
-        if task and task["owner"] == addr and task["status"] not in TERMINAL_STATES:
+        if task and task["owner"] == addr and task["status"] == DELIVERED:
+            # its work is done and waits for acceptance: stopping or resuming it would lay it out to be done again
+            log.info("task %s is delivered: %s from %s not acted on", task_id, kind, env.sender)
+        elif task and task["owner"] == addr and task["status"] not in TERMINAL_STATES:
             if kind == "interrupt":
                 hub.ledger.update_task(task_id, "owner", attempts=0)       # the next run starts afresh
             else:
@@ -1225,8 +1327,8 @@ class NodeDaemon:
     async def _cascade(self, env: Envelope, kind: str) -> None:
         """Pause and resume travel down parent_task to the open child tasks, on whatever node they run (D-089)."""
         for child in self.hub.ledger.children(env.task_id):
-            if child["status"] in TERMINAL_STATES:
-                continue
+            if child["status"] in TERMINAL_STATES or child["status"] == DELIVERED:
+                continue                                 # done, or done and waiting for acceptance (B:ops P3)
             await self.hub.send(Envelope(
                 type="UPDATE", sender=child["local_agent"], to=child["owner"], task_id=child["task_id"],
                 priority=env.priority, body={"message": f"{kind} (from parent {env.task_id}): "

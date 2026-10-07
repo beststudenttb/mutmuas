@@ -397,6 +397,12 @@ Known risks (protections removed on purpose; one line each):
   only when that node is up. During a rolling upgrade a new requester with an old owner sends none (the old code
   left them to the requester): they come once the owner's node runs the new code. A copy that reaches an
   observer without any record of the task (no bus at the observer) is dropped and logged.
+- Acceptance (D-109) during a rolling upgrade: a new requester with an old owner gets no acceptance. The old
+  owner does not know `acceptance: manual` and sends a final RESULT, so the task is COMPLETED or FAILED without
+  being accepted, silently (the secretary is not told). Acceptance works once both nodes run the new code.
+- A parent that waits on a delivered child it has been told of is woken again by any later message from that
+  child's owner on it (send_data, a QUESTION): the delivery counts as news again (its notice is keyed on the
+  task's last message). Once per such message, not a loop (B:ops p7).
 - A worker's send_request takes its own task as parent_task by default (MUTMUAS_TASK_ID), unchecked; the
   daemon sets that variable, so it is the worker's task unless a person sets it by hand.
 - A session started from the wrong directory (empty memory, other rules) is not told so.

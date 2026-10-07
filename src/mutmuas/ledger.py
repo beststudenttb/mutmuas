@@ -346,8 +346,14 @@ class Ledger:
                                [(r["message_id"],) for r in rows])
         return [Envelope.from_json(r["envelope"]) for r in rows]
 
-    def mark_seen(self, task_id: str) -> None:
-        self.db.execute("UPDATE messages SET seen=1 WHERE direction='in' AND task_id=?", (task_id,))
+    def mark_seen(self, task_id: str, local_agent: str | None = None) -> None:
+        """Mark a task's incoming mail read: all of it, or only what came to local_agent (other posts on this node
+        may hold FYIs on the same task)."""
+        if local_agent is None:
+            self.db.execute("UPDATE messages SET seen=1 WHERE direction='in' AND task_id=?", (task_id,))
+        else:
+            self.db.execute("UPDATE messages SET seen=1 WHERE direction='in' AND task_id=? AND local_agent=?",
+                            (task_id, local_agent))
 
     _LEADER = "json_extract(envelope, '$.body.leader') IS 1"
 

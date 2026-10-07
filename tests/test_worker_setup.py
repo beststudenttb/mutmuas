@@ -297,3 +297,11 @@ def test_the_worker_prompt_sends_long_commands_to_the_background(tmp_path):
     assert "longer than 10 minutes" in prompt and "start_job" in prompt and "foreground" in prompt
     ctx.node.background_after_min = 30
     assert "longer than 30 minutes" in worker_prompt(ctx)
+
+
+def test_the_worker_prompt_says_to_set_a_timeout_past_two_minutes(tmp_path):
+    """D-111 (B:rl): Claude Code's Bash tool stops a foreground command after 2 minutes unless given a timeout
+    (at most 10): past 2 minutes set one; past 10 use start_job."""
+    _, ctx, _ = _claude_ctx(tmp_path)
+    prompt = worker_prompt(ctx)
+    assert "2 minutes" in prompt and "timeout" in prompt and "start_job" in prompt

@@ -23,7 +23,7 @@ from mutmuas.ledger import Ledger
 from mutmuas.node import NodeDaemon
 from mutmuas.protocol import Envelope, request_body
 
-PREVIOUS = "8bc01bb"                                   # the version exp/flow builds on (deployed as claude)
+PREVIOUS = "db50415"                                   # the version deployed now (exp/flow merged into claude)
 FIXTURES = Path(__file__).parent / "compat" / PREVIOUS
 REPO = Path(__file__).parents[1]
 
@@ -43,7 +43,7 @@ async def test_this_code_works_on_the_previous_versions_ledger(tmp_path):
     try:
         task = ledger.task("T-compat-1", "owner")
         assert task["status"] == "WAITING" and task["paused"] and task["interrupts"] == ["hold on"]
-        assert task["priority"] == "normal" and task["wait_reason"] is None and task["run_log"] is None
+        assert task["priority"] == "high" and task["wait_reason"] is None and task["run_log"] is None
         assert task["request"]["leader"] is True       # still urgent: the leader's work counts as high
         assert [j["note"] for j in ledger.jobs("T-compat-1")] == ["training"]
         assert [e.task_id for e in ledger.outbox()] == ["T-compat-3"]
@@ -78,12 +78,15 @@ ledger = Ledger(cfg.db_path)
 task = ledger.task("T-new", "owner")
 assert task["status"] == "WAITING" and task["paused"] == 1, task
 assert ledger.tasks(role="owner", limit=None) and ledger.jobs("T-new") and ledger.outbox()
+assert ledger.task("T-delivered", "owner")["status"] == "DELIVERED"
 for raw in json.load(open(sys.argv[2])):
     Envelope.from_json(json.dumps(raw)).validate()
 daemon = NodeDaemon(cfg)                               # a rollback: the previous daemon on this ledger
 daemon.hub = Hub(cfg, None, ledger)
 daemon._queues["B:desk"], daemon._queued["B:desk"] = asyncio.PriorityQueue(), set()
 asyncio.run(daemon.recover())
+assert ledger.task("T-delivered", "owner")["status"] == "DELIVERED"     # not run again, not closed
+assert "T-delivered" not in daemon._queued["B:desk"]
 print("OK")
 """
 
@@ -105,6 +108,12 @@ def test_the_previous_version_works_on_this_codes_ledger_and_messages(tmp_path):
     ledger.update_task("T-new", "owner", status="WAITING", paused=1, wait_reason="quota", run_log="/tmp/run.log",
                        interrupts=["your previous run stopped at the account's usage limit"])
     ledger.add_job("T-new", "B:desk", 99999, "start", "/tmp/done", "/tmp/log", "training")
+    done = Envelope(type="REQUEST", sender="A:main", to="B:desk", task_id="T-delivered",
+                    body={**request_body("check it", "compat"), "acceptance": "manual", "title": "【需求】check it"})
+    ledger.ingest(done)
+    ledger.create_owned_task(done)
+    ledger.update_task("T-delivered", "owner", status="DELIVERED", result_status="complete",
+                       result={"status": "complete", "summary": "checked", "acceptance": "pending"})   # D-109
     ledger.queue_outgoing(Envelope(type="RESULT", sender="B:desk", to="A:main", task_id="T-new",
                                    body={"status": "complete", "summary": "delivered", "next": "A:main"}))
     ledger.close()

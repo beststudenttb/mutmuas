@@ -22,7 +22,7 @@ from typing import Any
 
 import yaml
 
-from . import __version__, mcp_server, tools
+from . import __version__, letters, mcp_server, tools
 from .bus import Bus, BusUnavailable
 from .config import ConfigError, NodeConfig, dump_config, find_config, load_config
 from .hub import Hub, is_online
@@ -168,15 +168,29 @@ async def cmd_find(args, hub: Hub):
     _print(await tools.find_agent(hub, args.capability), args.json)
 
 
+def _letter(kind: str, values: dict, optional: tuple[str, ...] = ()) -> None:
+    """A letter's template (D-109): refused here, before anything is sent, when a required blank is empty."""
+    try:
+        letters.check(kind, values, optional)
+    except ValueError as e:
+        raise SystemExit(f"error: {e}") from None
+
+
 async def cmd_ask(args, hub: Hub):
+    if args.reply == "none":
+        _letter("notice", {"text": args.objective})
+    else:
+        # a script's request is accepted on delivery (D-109), so it is not asked what to deliver or how it is judged
+        _letter("request", {"objective": args.objective, "reason": args.reason, "expected_outputs": args.expect,
+                            "acceptance_criteria": args.accept, "deadline": args.due},
+                optional=("expected_outputs", "acceptance_criteria"))
     out = await tools.send_request(
-        hub, _me(args), args.to, args.objective, args.reason or "requested via agentctl", kind=args.kind,
+        hub, _me(args), args.to, args.objective, args.reason or "a notice", kind=args.kind,
         inputs=_parse_kv(args.input) or None, expected_outputs=args.expect, acceptance_criteria=args.accept,
         constraints=args.constraint, timeout_s=args.timeout, priority=args.priority,
         reply=args.reply, deadline=args.due, observers=args.observer,
-        artifacts=[{"uri": uri} for uri in args.artifact or []], leader=args.leader, project=args.project,
-        reply_to=args.reply_to)
-    if args.wait is not None and not out.get("delivered_as_result_of"):      # a delivery waits for nothing
+        artifacts=[{"uri": uri} for uri in args.artifact or []], leader=args.leader, project=args.project)
+    if args.wait is not None:
         out = await tools.wait_for_result(hub, out["task_id"], args.wait, me=_me(args))
     _print(out, args.json)
 
@@ -302,7 +316,14 @@ def _desktop_notify(title: str, text: str, dry_run: bool = False) -> None:
         subprocess.run(["notify-send", title, text], capture_output=True)
 
 
+async def cmd_notice(args, hub: Hub):
+    _letter(args.kind, {"text": args.text})
+    _print(await tools.send_notice(hub, _me(args), args.to, args.text, priority=args.priority, kind=args.kind),
+           args.json)
+
+
 async def cmd_update(args, hub: Hub):
+    _letter("progress", {"task_id": args.task or tools._current_task(), "message": args.message})
     _print(await tools.report_progress(hub, _me(args), args.message, args.task, args.state, next=args.next,
                                        eta=args.eta), args.json)
 
@@ -331,8 +352,7 @@ async def cmd_submit(args, hub: Hub):
     artifacts = data.pop("artifacts", []) + [{"uri": u} for u in args.artifact or []]
     status = args.status or data.pop("status", None)
     summary = args.summary or data.pop("summary", None)
-    if not status or not summary:
-        raise SystemExit("--status and --summary (or a --file with them) are required")
+    _letter("delivery", {"task_id": args.task or tools._current_task(), "status": status, "summary": summary})
     _print(await tools.submit_result(hub, _me(args), status, summary, task_id=args.task, artifacts=artifacts,
                                      next=args.next or data.get("next"),
                                      how=args.how or data.get("how"), notes=args.notes or data.get("notes"),
@@ -700,8 +720,6 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--expect", action="append", help="expected output (repeatable)")
     p.add_argument("--accept", action="append", help="acceptance criterion (repeatable)")
     p.add_argument("--constraint", action="append", help="constraint on how to do it (repeatable)")
-    p.add_argument("--reply-to", metavar="TASK|new",
-                   help="the open task of theirs this delivers (needed when you hold several); new: a new request")
     p.add_argument("--priority", default="normal", choices=["normal", "high"],
                    help="high: urgent, runs first and stops work that is not urgent (D-104)")
     p.add_argument("--timeout", type=float, help="task timeout on the owner side (s)")
@@ -741,6 +759,11 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--headers-only", action="store_true",
                    help="announce count, type and sender only, no content; works without holding the session "
                         "(for notifier services)")
+    p = add("notice", cmd_notice, "tell someone something that needs no reply (告知; it closes once read)")
+    p.add_argument("to")
+    p.add_argument("text")
+    p.add_argument("--priority", default="normal", choices=["normal", "high"])
+    p.add_argument("--kind", default="notice", choices=["notice", "patrol"], help="patrol: a patrol summary (巡查汇总)")
     p = add("update", cmd_update, "progress update on a task I own", bus=False)
     p.add_argument("message")
     p.add_argument("--task")

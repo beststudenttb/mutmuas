@@ -13,6 +13,7 @@
 #   TEST 6  B:secretary, trusted on B, pauses and resumes a task it did not request (run before TEST 5)
 #   TEST 7  a hot deploy: B's daemon restarts while a run and a job go on; both finish, the run once (D-104)
 #   TEST 8  a run stops at the usage limit: it waits; B:secretary lists and resumes it (D-104)
+#   TEST 9  a delivery waits for its requester: sent back once with a reason, then passed (D-109)
 #   TEST 5  B retires its post B:data (daemon stopped) and undoes it
 #
 # Usage: scripts/e2e-local.sh [--keep]     (work dir: .local/e2e/, kept with --keep)
@@ -140,6 +141,11 @@ async def main(cmd, task_id, *rest):
             out = await tools.control_task(hub, ME, task_id, rest[0], rest[1])
         elif cmd == "answer":
             out = await tools.answer(hub, ME, task_id, rest[0], next=rest[1])
+        elif cmd == "request":       # task_id here is the recipient; what agents send through MCP (D-109)
+            out = await tools.send_request(hub, ME, task_id, rest[0], "end-to-end check", kind="experiment",
+                                           inputs=json.loads(rest[1]), acceptance="manual")
+        elif cmd == "accept":
+            out = await tools.accept_delivery(hub, ME, task_id, rest[0], rest[1] if len(rest) > 1 else None)
         elif cmd == "quota_waits":
             out = await tools.quota_waits(hub, ME)
         elif cmd == "resume_quota":
@@ -185,7 +191,7 @@ json.dump({'exp': 82, 'latents': [[random.random() for _ in range(16)] for _ in 
           open('$W/B-disk/representation_exp082/latents.json', 'w'))"
 WHO=$("${AGENTCTL[@]}" find representation_data --json --config "$W/A/node.yaml" | json "d['best']['address']")
 echo "registry says: $WHO"
-OUT=$("${AGENTCTL[@]}" ask "$WHO" "Return the latent data of representation experiment 82" \
+OUT=$("${AGENTCTL[@]}" ask --reason "end-to-end check" --expect "the result" --accept "as asked" "$WHO" "Return the latent data of representation experiment 82" \
   --reason "A:a1 continues the probing analysis" --kind artifact \
   --input action=fetch_file --input "path=$W/B-disk/representation_exp082/latents.json" \
   --wait 60 --json --config "$W/A/node.yaml")
@@ -201,7 +207,7 @@ step "TEST 1b: B goes offline, A sends anyway, B comes back"
 kill "$PID_B"; wait "$PID_B" 2>/dev/null || true
 sleep 3.5
 "${AGENTCTL[@]}" status --config "$W/A/node.yaml" | sed -n '/NODE B/,$p'
-OUT=$("${AGENTCTL[@]}" ask B:data "echo while offline" --input action=echo --input text=durable --json \
+OUT=$("${AGENTCTL[@]}" ask --reason "end-to-end check" --expect "the result" --accept "as asked" B:data "echo while offline" --input action=echo --input text=durable --json \
   --config "$W/A/node.yaml")
 echo "$OUT" | json "d['delivery'], d.get('note')"
 TASK1B=$(echo "$OUT" | json "d['task_id']")
@@ -210,7 +216,7 @@ ctl wait "$TASK1B" \
   | check "d['status']=='COMPLETED' and d['result']['summary']=='echo: durable'" "message sent while B was offline was processed after restart"
 
 step "TEST 2: A:a1 delegates an experiment to B:b1 (alias)"
-OUT=$("${AGENTCTL[@]}" ask B:b1 "Run the module-B ablation, seed 7" --reason "module A result depends on it" \
+OUT=$("${AGENTCTL[@]}" ask --reason "end-to-end check" --expect "the result" --accept "as asked" B:b1 "Run the module-B ablation, seed 7" --reason "module A result depends on it" \
   --kind experiment --input action=experiment --input steps=5 --input step_s=0.3 --input seed=7 \
   --accept "5 loss values" --json --config "$W/A/node.yaml")
 TASK2=$(echo "$OUT" | json "d['task_id']")
@@ -224,7 +230,7 @@ step "audit: why did B run that experiment? (asked from node B's side)"
 "${AGENTCTL[@]}" task "$TASK2" --as B:experimenter --config "$W/B/node.yaml" | sed -n '1,5p'
 
 step "TEST 3: B:c1 (a brain without a session) reports BLOCKED; A:aux (not trusted) answers and names it next"
-OUT=$("${AGENTCTL[@]}" ask B:c1 "Plan the next dataset" --reason "wake test" --as A:aux \
+OUT=$("${AGENTCTL[@]}" ask --reason "end-to-end check" --expect "the result" --accept "as asked" B:c1 "Plan the next dataset" --reason "wake test" --as A:aux \
   --input action=block_once --input "flag=$W/answered" --json --config "$W/A/node.yaml")
 TASK3=$(echo "$OUT" | json "d['task_id']")
 CTL_AS=A:aux wait_status "$TASK3" "d['status']=='BLOCKED'" "the worker is blocked and its run has ended"
@@ -234,7 +240,7 @@ CTL_AS=A:aux ctl wait "$TASK3" \
   | check "d['status']=='COMPLETED' and d['result']['summary']=='unblocked'" "named next, the blocked task ran again and finished"
 
 step "TEST 4a: A pauses and resumes B:b1's experiment"
-OUT=$("${AGENTCTL[@]}" ask B:b1 "Long ablation" --reason "control test" --kind experiment \
+OUT=$("${AGENTCTL[@]}" ask --reason "end-to-end check" --expect "the result" --accept "as asked" B:b1 "Long ablation" --reason "control test" --kind experiment \
   --input action=experiment --input steps=15 --input step_s=0.2 --json --config "$W/A/node.yaml")
 TASK4=$(echo "$OUT" | json "d['task_id']")
 wait_status "$TASK4" "d['status']=='RUNNING'" "the experiment runs"
@@ -247,11 +253,11 @@ RUNS=$(ls "$W/B/data/runs/" | grep -c "^$TASK4\..*\.log$")
 [ "$RUNS" = "2" ] && echo "PASS: two runs: before the pause and after resume" || { echo "FAIL: $RUNS runs"; exit 1; }
 
 step "TEST 4b: A interrupts its own queued task; A:aux's task running on the same post is left alone"
-OUT=$("${AGENTCTL[@]}" ask B:b1 "Someone else's run" --reason "bystander" --kind experiment --as A:aux \
+OUT=$("${AGENTCTL[@]}" ask --reason "end-to-end check" --expect "the result" --accept "as asked" B:b1 "Someone else's run" --reason "bystander" --kind experiment --as A:aux \
   --input action=experiment --input steps=15 --input step_s=0.2 --json --config "$W/A/node.yaml")
 OTHER=$(echo "$OUT" | json "d['task_id']")
 CTL_AS=A:aux wait_status "$OTHER" "d['status']=='RUNNING'" "A:aux's experiment runs"
-OUT=$("${AGENTCTL[@]}" ask B:b1 "Short check" --reason "interrupt test" --kind experiment \
+OUT=$("${AGENTCTL[@]}" ask --reason "end-to-end check" --expect "the result" --accept "as asked" B:b1 "Short check" --reason "interrupt test" --kind experiment \
   --input action=experiment --input steps=2 --input step_s=0.1 --json --config "$W/A/node.yaml")
 MINE=$(echo "$OUT" | json "d['task_id']")
 ctl control "$MINE" interrupt "use seed 9 from now on" >/dev/null
@@ -263,7 +269,7 @@ ctl wait "$MINE" \
   | check "d['result_status']=='complete' and any('use seed 9' in t for t in d['result']['outputs']['told'])" "the next run of the interrupted task got the message"
 
 step "TEST 6: B:secretary (trusted on B) pauses and resumes a task A:aux asked B for"
-OUT=$("${AGENTCTL[@]}" ask B:b1 "Another long run" --reason "secretary control" --kind experiment --as A:aux \
+OUT=$("${AGENTCTL[@]}" ask --reason "end-to-end check" --expect "the result" --accept "as asked" B:b1 "Another long run" --reason "secretary control" --kind experiment --as A:aux \
   --input action=experiment --input steps=15 --input step_s=0.2 --json --config "$W/A/node.yaml")
 TASK6=$(echo "$OUT" | json "d['task_id']")
 CTL_AS=A:aux wait_status "$TASK6" "d['status']=='RUNNING'" "A:aux's experiment runs"
@@ -275,11 +281,11 @@ CTL_AS=A:aux ctl wait "$TASK6" \
           "resumed and finished; the run after resume was told why it was paused"
 
 step "TEST 7: a hot deploy: B's daemon restarts while a run and a job are in progress"
-OUT=$("${AGENTCTL[@]}" ask B:b1 "Job across the deploy" --reason "hot deploy" --kind experiment \
+OUT=$("${AGENTCTL[@]}" ask --reason "end-to-end check" --expect "the result" --accept "as asked" B:b1 "Job across the deploy" --reason "hot deploy" --kind experiment \
   --input action=job_then_result --input "flag=$W/job7.done" --input job_s=12 --json --config "$W/A/node.yaml")
 JOB7=$(echo "$OUT" | json "d['task_id']")
 wait_status "$JOB7" "d['status']=='WAITING'" "a job is started and its task waits on it"
-OUT=$("${AGENTCTL[@]}" ask B:b1 "Run across the deploy" --reason "hot deploy" --kind experiment \
+OUT=$("${AGENTCTL[@]}" ask --reason "end-to-end check" --expect "the result" --accept "as asked" B:b1 "Run across the deploy" --reason "hot deploy" --kind experiment \
   --input action=experiment --input steps=40 --input step_s=0.25 --json --config "$W/A/node.yaml")
 RUN7=$(echo "$OUT" | json "d['task_id']")
 wait_status "$RUN7" "d['status']=='RUNNING'" "a run is under way"
@@ -296,7 +302,7 @@ ctl wait "$JOB7" | check "d['result_status']=='complete' and d['result']['summar
   "the job started before the deploy ran to its end and woke its task"
 
 step "TEST 8: a run stops at the usage limit; B:secretary lists and resumes what waits for quota"
-OUT=$("${AGENTCTL[@]}" ask B:b1 "Out of quota" --reason "quota" --kind experiment \
+OUT=$("${AGENTCTL[@]}" ask --reason "end-to-end check" --expect "the result" --accept "as asked" B:b1 "Out of quota" --reason "quota" --kind experiment \
   --input action=quota_once --input "flag=$W/quota8" --json --config "$W/A/node.yaml")
 TASK8=$(echo "$OUT" | json "d['task_id']")
 wait_status "$TASK8" "d['status']=='WAITING'" "it waits instead of failing"
@@ -304,6 +310,17 @@ CTL_AS=B:secretary ctl_b quota_waits - | check "[t['task_id'] for t in d]==['$TA
 CTL_AS=B:secretary ctl_b resume_quota - | check "d['resumed']==['$TASK8']" "resume_quota_waits resumes it"
 ctl wait "$TASK8" | check "d['result_status']=='complete' and d['result']['summary']=='done after the limit came back'" \
   "it ran again and finished"
+
+step "TEST 9: a delivery waits for the requester: sent back once with a reason, then passed (D-109)"
+TASK9=$(ctl request B:b1 "Train with acceptance" '{"action": "experiment", "steps": 3, "step_s": 0.1}' | json "d['task_id']")
+wait_status "$TASK9" "d['status']=='DELIVERED' and d['local_status']=='DELIVERED'" "delivered: it waits for A to accept it"
+ctl accept "$TASK9" reject "the seed is not recorded" >/dev/null
+wait_status "$TASK9" "d['status']=='DELIVERED' and d['local_status']=='DELIVERED' and len([m for m in d['thread'] if m['type']=='RESULT'])==2" \
+  "sent back with the reason, B ran it again and delivered anew"
+RUNS=$(ls "$W/B/data/runs/" | grep -c "^$TASK9\..*\.log$")
+[ "$RUNS" = "2" ] && echo "PASS: two runs: the first delivery and the one after the reason" || { echo "FAIL: $RUNS runs"; exit 1; }
+ctl accept "$TASK9" pass >/dev/null
+wait_status "$TASK9" "d['status']=='COMPLETED' and d['local_status']=='COMPLETED'" "passed: done on both sides"
 
 step "TEST 5: retire B:data (B's daemon stopped), then undo"
 kill "$PID_B"; wait "$PID_B" 2>/dev/null || true

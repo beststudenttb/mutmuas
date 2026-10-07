@@ -5,6 +5,7 @@ step 1 only an ArtifactRef attached to a message grants its recipient access, no
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -30,9 +31,10 @@ async def test_ask_with_artifact_lets_the_recipient_fetch_it(make_config, cluste
     src = tmp_path / "review.md"
     src.write_text("findings")
     ref = await tools.publish_artifact(hub_a, "A:main", str(src), key="A/main/adhoc/review.md")
-    out = subprocess.run([str(Path(sys.executable).parent / "agentctl"), "ask", "B:desk", "please read",
-                          "--artifact", ref["uri"], "--json", "--config", str(a.path), "--as", "A:main"],
-                         capture_output=True, text=True, timeout=60)
+    out = subprocess.run([sys.executable, "-m", "mutmuas.cli", "ask", "B:desk", "please read", "--reason", "review",
+                          "--expect", "notes", "--accept", "read it", "--artifact", ref["uri"], "--json",
+                          "--config", str(a.path), "--as", "A:main"], capture_output=True, text=True, timeout=60,
+                         env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)})   # the code under test
     assert out.returncode == 0, out.stderr
     task_id = json.loads(out.stdout)["task_id"]
     await eventually(lambda: hub_b.ledger.task(task_id, "owner"), what="request arrived")

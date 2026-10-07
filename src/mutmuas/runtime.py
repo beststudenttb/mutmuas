@@ -29,6 +29,7 @@ from typing import Any
 
 from .config import AgentConfig, NodeConfig
 from .protocol import Envelope
+from .visibility import short
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ class TaskContext:
     jobs: list[dict[str, Any]] = field(default_factory=list)   # background jobs of this task that have ended
     resume: str | None = None            # a brain batch's conversation to continue (D-073)
     interrupts: list[str] = field(default_factory=list)   # what interrupted the previous run (D-089)
+    deliveries: list[dict[str, Any]] = field(default_factory=list)   # its child tasks delivered, to accept (D-109)
     session_id: str | None = None        # a new brain conversation's id, chosen by the node before the run
     run_log: str | None = None           # this run's log (its output too), set as it starts
     handing_over: Any = None             # () -> True while the daemon stops for a deploy: the run is left running
@@ -248,6 +250,14 @@ def _worker_prompt(ctx: TaskContext) -> str:
     if jobs:
         jobs = ("\nThis task is being resumed: background jobs you registered have ended. Read your PLAN.md and "
                 f"the logs, judge whether each job succeeded, and carry on.{jobs}\n")
+    waiting = "".join(f"\n- {d['task_id']} from {d['owner']} ({d.get('result_status')}): "
+                      f"{short((d.get('result') or {}).get('summary'), 300)}" for d in ctx.deliveries)
+    if waiting:
+        jobs += ("\nThese parts you delegated were delivered and wait for your acceptance: check each against what "
+                 "you asked for, then accept_delivery(task_id, pass | reject | close, reason). pass only what you "
+                 "asked for (a complete result); reject sends it back with the reason; a partial or failed result "
+                 f"can only be rejected or closed as failed. Then wait again (add_job children=True) for the rest."
+                 f"{waiting}\n")
     return f"""You are {ctx.address} (role: {ctx.agent.role or ctx.agent.id}) in the mutmuas multi-agent system,
 project "{ctx.node.project}", running on node {ctx.node.node}. Another agent delegated a task to you.
 
@@ -282,7 +292,8 @@ Rules:
    one-line note; it runs on its own, its output goes to a log and its exit code to a done-file), note in
    PLAN.md what you wait for, and end this run without submit_result. You are started again when the job ends,
    told how it ended; a run that ends or is stopped meanwhile does not stop the job. (A process you started
-   yourself, detached, can be registered with add_job instead.)
+   yourself, detached, can be registered with add_job instead.) Your Bash tool stops a foreground command after 2
+   minutes unless you give it a timeout (at most 10 minutes): past 2 minutes set one; past 10 use start_job.
 8. Parts you delegate with send_request are this task's child tasks (parent_task is set for you). To wait for
    them, call add_job(children=True) and end this run without submit_result: you are started again once
    each has a result, was refused or cancelled, or is past its deadline, and told how each ended. Wait on

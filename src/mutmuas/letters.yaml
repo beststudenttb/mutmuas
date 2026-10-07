@@ -1,0 +1,165 @@
+# Letter templates (D-109). The leader: "以后写信用模版,agent只填入自定义的地方". The framework renders each letter's
+# title; the agent fills in the blanks below. A blank with required: true must be filled, or the MCP tool / agentctl
+# command refuses the letter before anything is sent. Change the wording here; the keys are the tools' parameters.
+#
+# title: how the letter is headed ({blank} = what was filled in; {original} = the task's own title, for letters
+# about a task). tool: the MCP tool that writes it (agentctl has the same under the name in `cli`).
+
+# ---- 直发 (sent directly) ----------------------------------------------------------------------------------------
+request:
+  name: 需求
+  tool: send_request
+  cli: ask
+  title: "【需求】{objective}"
+  fields:
+    objective: {required: true, label: 要做什么}
+    reason: {required: true, label: 为什么}
+    expected_outputs: {required: true, label: 交什么}
+    acceptance_criteria: {required: true, label: 验收标准}
+    deadline: {label: "截止(从现在算, 如 +2h; 不填则用节点默认值)"}
+    priority: {label: 急(high) / 不急(normal)}
+
+notice:
+  name: 告知
+  tool: send_notice
+  cli: notice
+  title: "【告知】{text}"
+  fields:
+    text: {required: true, label: 内容}
+    priority: {label: 急(high) / 不急(normal)}
+
+delivery:
+  name: 交付回执
+  tool: submit_result
+  cli: submit-result
+  title: "Re:{original}"
+  fields:
+    task_id: {required: true, label: 原单号}
+    status: {required: true, label: 结论 complete / partial / failed}
+    summary: {required: true, label: 摘要}
+    evidence: {label: 证据}
+    limitations: {label: 没做完的}
+    next: {label: 下一步谁}
+
+data:
+  name: 数据
+  tool: send_data
+  cli: data
+  title: "【数据】{note}"
+  fields:
+    task_id: {label: 对应单号}
+    artifacts: {required: true, label: 附件}
+    note: {required: true, label: "说明(是什么, 放到对方哪个位置)"}
+
+relay:
+  name: 转达
+  tool: send_relay
+  cli: null
+  title: "【转达】{words}"
+  fields:
+    words: {required: true, label: leader 原话(一字不改)}
+    understanding: {required: true, label: 我的理解(请纠正)}
+    ask: {required: true, label: 要谁回什么}
+
+# ---- 回执 (receipts) ---------------------------------------------------------------------------------------------
+receipt:
+  name: 收到
+  tool: accept_task
+  cli: null
+  title: "收到:{original}"
+  fields:
+    task_id: {required: true, label: 原单号}
+    eta: {label: 预计何时交}
+
+refusal:
+  name: 退回
+  tool: reject_task
+  cli: null
+  title: "退回:{original}"
+  fields:
+    task_id: {required: true, label: 原单号}
+    reason: {required: true, label: 原因}
+    suggest: {required: true, label: 建议找谁}
+
+acceptance:
+  name: 验收
+  tool: accept_delivery
+  cli: null
+  title: "【验收:{verdict}】{original}"
+  fields:
+    task_id: {required: true, label: 原单号}
+    verdict: {required: true, label: "pass(通过) / reject(打回) / close(按失败结案)"}
+    reason: {label: 原因(打回和结案必填)}
+
+withdrawal:
+  name: 撤回
+  tool: withdraw_delivery
+  cli: null
+  title: "【撤回交付】{original}"
+  fields:
+    task_id: {required: true, label: 原单号}
+    reason: {required: true, label: 为什么撤回}
+
+# ---- 其他固定类型 (other fixed kinds) ------------------------------------------------------------------------------
+question:
+  name: 提问
+  tool: ask_question
+  cli: null
+  title: "【提问】{original}"
+  fields:
+    task_id: {required: true, label: 原单号}
+    question: {required: true, label: 问什么}
+
+answer:
+  name: 回答
+  tool: answer_question
+  cli: null
+  title: "【回答】{original}"
+  fields:
+    task_id: {required: true, label: 原单号}
+    answer: {required: true, label: 回答}
+
+chase:
+  name: 催交
+  tool: chase_task
+  cli: null
+  title: "【催交】{original}"
+  fields:
+    task_id: {required: true, label: 原单号}
+    message: {label: 要说的话}
+
+progress:
+  name: 进度
+  tool: report_progress
+  cli: update
+  title: "【进度】{original}"
+  fields:
+    task_id: {label: 原单号}
+    message: {required: true, label: 进度}
+
+control:
+  name: 暂停 / 继续 / 打断
+  tool: control_task
+  cli: null
+  title: "【{action}】{original}"
+  fields:
+    task_id: {required: true, label: 原单号}
+    action: {required: true, label: pause / resume / interrupt}
+    message: {required: true, label: 为什么}
+
+reminder:
+  name: 提醒
+  tool: remind_me
+  cli: null
+  title: "【提醒】{text}"
+  fields:
+    at: {required: true, label: "什么时候(从现在算, 如 +2h)"}
+    text: {required: true, label: 提醒什么}
+
+patrol:
+  name: 巡查汇总
+  tool: send_notice
+  cli: notice
+  title: "【巡查】{text}"
+  fields:
+    text: {required: true, label: 汇总}

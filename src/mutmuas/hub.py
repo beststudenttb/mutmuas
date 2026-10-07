@@ -23,7 +23,7 @@ from .config import AgentConfig, NodeConfig
 from .ids import Address, new_task_id, parse_iso
 from .ledger import Ledger
 from .visibility import acl, is_coordinator, is_participant, status_layer
-from .protocol import TERMINAL_STATES, ArtifactRef, Envelope, task_state_for_result
+from .protocol import DELIVERED, TERMINAL_STATES, ArtifactRef, Envelope, task_state_for_result
 
 log = logging.getLogger(__name__)
 
@@ -108,6 +108,15 @@ class Hub:
 
     def _bus_up(self) -> bool:
         return self.bus is not None and self.bus.connected
+
+    async def escalate(self, sender: str, task_id: str, reason: str, text: str) -> None:
+        """Tell the node's escalation addresses (node.yaml escalate_to: the secretary) about something only they can
+        sort out: an FYI on the task (D-109: a delivery nobody can be woken to accept)."""
+        if not self.cfg.escalate_to:
+            log.warning("nobody to tell (escalate_to is empty): %s", text)
+        for target in self.cfg.escalate_to:
+            await self.send(Envelope(type="UPDATE", sender=sender, to=target, task_id=task_id,
+                                     body={"message": text, "fyi": True, "follow_up": reason}))
 
     async def card_or_none(self, target: str) -> dict[str, Any] | None:
         """Registry lookup that never blocks sending: None if unknown *or* the registry is unreachable."""
@@ -292,7 +301,7 @@ class Hub:
             view = await self.task_view(task_id, viewer)
             if view is None:
                 raise KeyError(f"unknown task {task_id}")
-            if view.get("status") in TERMINAL_STATES and self._closed_here(task_id, view):
+            if view.get("status") in (*TERMINAL_STATES, DELIVERED) and self._closed_here(task_id, view):
                 return view
             if asyncio.get_running_loop().time() >= deadline:
                 view["timed_out_waiting"] = True
@@ -307,7 +316,7 @@ class Hub:
         between and the stale view returned (717d7e0 on B)."""
         if view.get("local_role") != "requester":
             return True
-        return view.get("local_status") in TERMINAL_STATES
+        return view.get("local_status") in (*TERMINAL_STATES, DELIVERED)       # delivered: there to accept
 
     # ---- owner side ---------------------------------------------------
 
@@ -375,7 +384,7 @@ class Hub:
         task = self.ledger.task(task_id, "owner")
         if task is None:
             raise KeyError(f"task {task_id} is not owned by this node")
-        if task["status"] in TERMINAL_STATES:
+        if task["status"] in TERMINAL_STATES or task["status"] == DELIVERED:
             return False                                         # finished already: the board is not touched
         # an invalid RESULT is refused before anything changes, the board included
         Envelope(type="RESULT", sender=task["owner"], to=task["requester"], body=result, task_id=task_id,
@@ -400,17 +409,28 @@ class Hub:
             outputs = result.get("outputs")
             outputs = outputs if isinstance(outputs, dict) else {"value": outputs} if outputs else {}
             result = {**result, "outputs": {**outputs, "plan": section}}
+        manual = (task.get("request") or {}).get("acceptance") == "manual"
+        if manual:      # D-109: it waits for the requester to accept it, which this RESULT wakes to do
+            result = {**result, "acceptance": "pending", "next": task["requester"]}
         env = Envelope(type="RESULT", sender=task["owner"], to=task["requester"], body=result, task_id=task_id,
                        conversation_id=task["conversation_id"], artifacts=artifacts or [],
                        reply_to=task.get("last_message"))
         env.validate()
         refs = [a.to_dict() for a in env.artifacts]
-        if not self.ledger.update_task(task_id, "owner", status=task_state_for_result(result["status"]),
+        state = DELIVERED if manual else task_state_for_result(result["status"])
+        if not self.ledger.update_task(task_id, "owner", status=state,
                                        result=result, result_status=result["status"], output_refs=refs, queue=env):
             return False
         await self.try_publish(env)
         await self.publish_task_record(task_id)
         log.info("task %s finished: %s", task_id, result["status"])
+        if manual and self._bus_up():   # D-109: a requester that cannot be woken never accepts: tell the secretary
+            # Only one that is gone: an offline node gets the delivery when it is back, and judges then whether
+            # someone there can accept it (B:ops E1: reporting it here too would report it twice, or for nothing)
+            if await self.card_or_none(task["requester"]) is None:
+                await self.escalate(task["owner"], task_id, "acceptance",
+                                    f"{task_id} was delivered to {task['requester']}, who is retired or unknown: "
+                                    "nobody can accept it")
         self.drop_inbox_line(task_id)
         if workdir:
             workdir.mkdir(parents=True, exist_ok=True)          # as a run does; a post may not have run yet

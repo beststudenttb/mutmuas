@@ -24,6 +24,9 @@ agent-node = "mutmuas.cli:agent_node"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+mutmuas = ["letters.yaml"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"

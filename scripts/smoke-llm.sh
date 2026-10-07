@@ -55,7 +55,7 @@ sleep 3
 
 echo "asking B:llm ($RUNTIME${MODEL:+, $MODEL}) ..."
 OUT=$("$BIN/agentctl" ask B:llm "Read notes.txt in your working directory. Publish it as an artifact and report its first line in outputs.first_line." \
-  --reason "smoke test of the $RUNTIME runtime" --kind artifact \
+  --reason "smoke test of the $RUNTIME runtime" --kind artifact --expect "notes.txt as an artifact, outputs.first_line" \
   --accept "notes.txt published as artifact" --accept "outputs.first_line equals the file's first line" \
   --wait 300 --json --config "$W/A/node.yaml")
 echo "$OUT" | "$BIN/python" -c "

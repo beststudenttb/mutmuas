@@ -60,8 +60,9 @@ async def test_ask_carries_the_leader_mark(monkeypatch, tmp_path):
 
     monkeypatch.setattr(tools, "send_request", fake_send_request)
     parser = cli.agentctl_parser()
-    await cli.cmd_ask(parser.parse_args(["ask", "B:desk", "obj", "--leader", "--as", "A:me"]), None)
-    await cli.cmd_ask(parser.parse_args(["ask", "B:desk", "obj", "--as", "A:me"]), None)
+    blanks = ["--reason", "r", "--expect", "x", "--accept", "y"]                # the 需求 template (D-109)
+    await cli.cmd_ask(parser.parse_args(["ask", "B:desk", "obj", "--leader", "--as", "A:me", *blanks]), None)
+    await cli.cmd_ask(parser.parse_args(["ask", "B:desk", "obj", "--as", "A:me", *blanks]), None)
     assert sent == [True, False]
 
 

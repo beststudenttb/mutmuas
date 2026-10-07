@@ -18,6 +18,7 @@ from conftest import Orphan, auto_worker_node, owned_task
 from mutmuas import cli, tools
 from mutmuas.hub import Hub
 from mutmuas.node import NodeDaemon, proc_start
+from mutmuas.protocol import Envelope
 
 
 def _node(tmp_path, mode="worker", **extra):
@@ -375,4 +376,21 @@ async def test_cancelling_stops_the_whole_command_of_a_started_job(tmp_path):
     finally:
         with contextlib.suppress(ProcessLookupError):
             os.killpg(out["pid"], 9)
+        ledger.close()
+
+
+async def test_a_worker_only_posts_mail_on_a_task_is_marked_read_once_its_run_is_over(tmp_path):
+    """D-111 (B:ops: 40 unread, the oldest 13 days): a post with workers only has nobody to read its inbox; once a
+    run of a task is over, the task's mail is marked read."""
+    agent, ledger, daemon = _node(tmp_path)
+    req = owned_task(ledger, "T-r", "ACCEPTED", ingest=True)
+    ledger.mark_handled(req.message_id)
+    note = Envelope(type="UPDATE", sender="A:sender", to="B:desk", task_id="T-r", body={"message": "use v2"})
+    ledger.ingest(note)
+    ledger.mark_handled(note.message_id)
+    try:
+        assert len(await tools.inbox(daemon.hub, "B:desk", peek=True, types=None)) == 2
+        await daemon._execute(agent, "T-r")
+        assert await tools.inbox(daemon.hub, "B:desk", peek=True, types=None) == []
+    finally:
         ledger.close()

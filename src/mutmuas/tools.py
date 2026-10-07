@@ -17,11 +17,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from . import node   # node imports tools as well: its names are looked up when called
+from . import letters, node   # node imports tools as well: its names are looked up when called
 from .hub import Hub
 from .ids import Address, parse_iso
 from .visibility import acl, artifact_visible, is_participant, short
-from .protocol import OPEN_STATES, TERMINAL_STATES, ArtifactRef, Envelope, request_body, result_body
+from .protocol import (ACCEPTANCE_VERDICTS, DELIVERED, OPEN_STATES, TERMINAL_STATES, ArtifactRef, Envelope,
+                       request_body, result_body)
 
 
 def _current_task() -> str | None:
@@ -57,18 +58,9 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                        parent_task: str | None = None, priority: str = "normal",
                        reply: str | None = None, observers: list[str] | None = None,
                        leader: bool = False, project: str | None = None,
-                       reply_to: str | None = None) -> dict[str, Any]:
-    """reply_to (D-104): the open task of the recipient's this letter delivers; "new" for a new request whatever
-    the sender holds. Without it, a letter to someone with exactly one open task of theirs in the sender's hands
-    delivers that task; with several it is refused until reply_to says which."""
-    if reply_to != "new" and not parent_task:
-        if (delivering := await _delivers(hub, me, to, reply_to)):
-            task_id, recipient = delivering
-            out = await submit_result(hub, me, "complete", objective, task_id=task_id, outputs=inputs or None,
-                                      artifacts=artifacts, next=recipient, notes=reason)
-            return {**out, "delivered_as_result_of": task_id,
-                    "note": f"sent as the result of {task_id}, the open task {recipient} asked of you "
-                            "(reply_to='new' sends a new request instead)"}
+                       acceptance: str | None = None) -> dict[str, Any]:
+    """acceptance="manual" (D-109; what agents get through MCP): the delivery waits for this agent to accept it
+    (accept_delivery). Otherwise it is accepted on delivery, as for scripts."""
     default_deadline = None
     for observer in observers or []:
         Address.parse(observer)        # before anything goes out: a bad one is refused, not half sent
@@ -79,28 +71,10 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                         constraints=constraints, acceptance_criteria=acceptance_criteria,
                         deadline=deadline or default_deadline, timeout_s=timeout_s, reply=reply, observers=observers,
                         deadline_default=bool(default_deadline),  # the owner can tell it from a chosen one
-                        leader=leader)
+                        leader=leader, acceptance=acceptance)
+    body["title"] = letters.title("request", {"objective": objective})
     return await _send_request(hub, me, to, body, artifacts=artifacts, parent_task=parent_task, priority=priority,
                                project=project)
-
-
-async def _delivers(hub: Hub, me: str, to: str, reply_to: str | None) -> tuple[str, str] | None:
-    """(task, its requester): the open task of `to`'s that a letter from `me` delivers, if any (D-104 item 3).
-    Only tasks the caller may act on count: a worker's own task, or for a session the tasks no worker is doing."""
-    addr, recipient = str(hub.local_agent(me)[0]), await hub.resolve(to)
-    worker_of = node.worker_task(hub.ledger, addr)
-    held = [t["task_id"] for t in hub.ledger.tasks(role="owner", local_agent=addr, statuses=OPEN_STATES, limit=None)
-            if t["requester"] == recipient
-            and (t["task_id"] == worker_of if worker_of else t.get("runner") != "worker")]
-    if reply_to:
-        if reply_to not in held:
-            raise ValueError(f"reply_to={reply_to}: not an open task {recipient} asked of you"
-                             f"{' (yours: ' + ', '.join(held) + ')' if held else ''}; reply_to='new' for a new request")
-        return reply_to, recipient
-    if len(held) > 1:
-        raise ValueError(f"you hold {len(held)} open tasks {recipient} asked of you ({', '.join(held)}): say which "
-                         "this letter delivers with reply_to=<task id>, or reply_to='new' for a new request")
-    return (held[0], recipient) if held else None
 
 
 LONG_KINDS = ("experiment", "code")       # their default deadline is long_reply_deadline_s (D-098)
@@ -367,7 +341,8 @@ async def accept_task(hub: Hub, me: str, task_id: str, eta: str | None = None) -
     if refused and "worker" in refused:
         raise PermissionError(f"{task_id} is being done by the worker the daemon started before this session; "
                               "it is not interrupted (D-032a): wait for its result (whoami: worker_running)")
-    body = {"state": "RUNNING", "message": f"accepted by {me}" + (f"; eta {eta}" if eta else "")}
+    body = {"state": "RUNNING", "message": f"accepted by {me}" + (f"; eta {eta}" if eta else ""),
+            "title": letters.title("receipt", {}, _original(hub, task_id))}
     if eta:
         body["eta"] = eta                         # the requester's node chases it once it passes (D-076)
         hub.ledger.update_task(task_id, "owner", eta=eta)
@@ -425,9 +400,11 @@ async def add_job(hub: Hub, me: str, task_id: str | None = None, pid: int | None
     return {"task_id": task_id, "job_id": job_id, "state": "WAITING"}
 
 
-async def reject_task(hub: Hub, me: str, task_id: str, reason: str) -> dict[str, Any]:
+async def reject_task(hub: Hub, me: str, task_id: str, reason: str, suggest: str | None = None) -> dict[str, Any]:
     _check_actor(hub, _owned(hub, me, task_id))
-    ok = await hub.owner_transition(task_id, "FAILED", reason, msg_type="REJECT", body={"reason": reason})
+    body = {"reason": reason, "title": letters.title("refusal", {}, _original(hub, task_id)),
+            **({"suggest": suggest} if suggest else {})}                     # who to ask instead (D-109)
+    ok = await hub.owner_transition(task_id, "FAILED", reason, msg_type="REJECT", body=body)
     return {"task_id": task_id, "rejected": ok}
 
 
@@ -439,11 +416,16 @@ async def report_progress(hub: Hub, me: str, message: str, task_id: str | None =
         raise ValueError("task_id is required outside of a delegated task")
     task = _owned(hub, me, task_id)
     _check_actor(hub, task)
+    if task["status"] == DELIVERED:
+        # it would go out as RUNNING and take the delivery back unsaid (B:ops P4)
+        raise ValueError(f"{task_id} is delivered and waits for {task['requester']} to accept it: no progress to "
+                         "report; withdraw_delivery to take it back and work on")
     new_state = state or task["status"]
     if new_state not in ("RUNNING", "WAITING", "BLOCKED"):
         new_state = "RUNNING"
     msg_type = "BLOCKED" if new_state == "BLOCKED" else "UPDATE"
     body = {"reason": message} if msg_type == "BLOCKED" else {"state": new_state, "message": message}
+    body["title"] = letters.title("progress", {}, task["request"].get("objective"))
     if next:
         body["next"] = next
     if (eta := from_now(eta, "eta")):
@@ -467,9 +449,13 @@ async def submit_result(hub: Hub, me: str, status: str, summary: str, *, task_id
     task = _owned(hub, me, task_id)
     if task["status"] in TERMINAL_STATES:
         return {"task_id": task_id, "error": f"task already {task['status']}; result not changed"}
+    if task["status"] == DELIVERED:
+        raise ValueError(f"{task_id} is delivered and waits for {task['requester']} to accept it: withdraw_delivery "
+                         "first to deliver anew")
     worker_of = _check_actor(hub, task)
     body = result_body(status, summary, outputs=outputs, evidence=evidence, limitations=limitations,
                        follow_up=follow_up, how=how, notes=notes)
+    body["title"] = letters.title("delivery", {}, task["request"].get("objective"))
     if next:
         body["next"] = next
     refs = [ArtifactRef.from_dict(a) for a in artifacts or []]
@@ -483,7 +469,8 @@ async def submit_result(hub: Hub, me: str, status: str, summary: str, *, task_id
 
 
 async def ask_question(hub: Hub, me: str, task_id: str, question: str, next: str | None = None) -> dict[str, Any]:
-    delivery = await hub.reply(me, task_id, "QUESTION", {"question": question, **({"next": next} if next else {})})
+    delivery = await hub.reply(me, task_id, "QUESTION", {"question": question, **({"next": next} if next else {}),
+                                                         "title": letters.title("question", {}, _original(hub, task_id))})
     return {"task_id": task_id, "delivery": delivery}
 
 
@@ -499,7 +486,8 @@ async def control_task(hub: Hub, me: str, task_id: str, action: str, message: st
     if action not in CONTROLS:
         raise ValueError(f"action={action!r}: one of {', '.join(CONTROLS)}")
     addr, _ = hub.local_agent(me)
-    body = {"message": message, action: True}
+    body = {"message": message, action: True,
+            "title": letters.title("control", {"action": action}, _original(hub, task_id))}
     asked = hub.ledger.task(task_id, "requester")
     if asked and asked["local_agent"] == str(addr):
         delivery = await hub.reply(me, task_id, "UPDATE", body)
@@ -528,8 +516,102 @@ async def resume_quota_waits(hub: Hub, me: str, message: str = "the usage limit 
     return {"resumed": resumed}
 
 
+def _original(hub: Hub, task_id: str) -> str | None:
+    """The title of the task a letter is about: its objective."""
+    task = hub.ledger.task(task_id)
+    return ((task or {}).get("request") or {}).get("objective")
+
+
+async def send_notice(hub: Hub, me: str, to: str, text: str, *, priority: str = "normal",
+                      kind: str = "notice") -> dict[str, Any]:
+    """告知 (D-109): a notice that needs no reply (it closes once read). kind: notice, or patrol (巡查汇总)."""
+    body = request_body(text, letters.TEMPLATES[kind]["name"], reply="none")
+    body["title"] = letters.title(kind, {"text": text})
+    return await _send_request(hub, me, to, body, artifacts=None, parent_task=None, priority=priority, project=None)
+
+
+async def send_relay(hub: Hub, me: str, to: str, words: str, understanding: str, ask: str) -> dict[str, Any]:
+    """转达 (D-111): pass on the leader's word: his exact words, the relayer's understanding (to be corrected), and
+    who should answer what. It is the leader's (leader: true); the answer comes back as is (no acceptance)."""
+    text = f"leader 原话:「{words}」\n我的理解(请纠正):{understanding}\n要谁回什么:{ask}"
+    body = request_body(text, letters.TEMPLATES["relay"]["name"], inputs={"words": words,
+                        "understanding": understanding, "ask": ask}, leader=True)
+    body["title"] = letters.title("relay", {"words": words})
+    return await _send_request(hub, me, to, body, artifacts=None, parent_task=None, priority="normal", project=None)
+
+
+async def send_data(hub: Hub, me: str, to: str, artifacts: list[dict], note: str,
+                    task_id: str | None = None) -> dict[str, Any]:
+    """数据 (D-109): artifacts with a note on what they are and where they go. On a task: an UPDATE to its other
+    party; else a notice carrying them."""
+    if not task_id:
+        body = request_body(note, letters.TEMPLATES["data"]["name"], reply="none")
+        body["title"] = letters.title("data", {"note": note})
+        return await _send_request(hub, me, to, body, artifacts=artifacts, parent_task=None, priority="normal",
+                                   project=None)
+    body = {"message": note, "data": True, "title": letters.title("data", {"note": note})}
+    delivery = await hub.reply(me, task_id, "UPDATE", body, [ArtifactRef.from_dict(a) for a in artifacts],
+                               to=await hub.resolve(to))
+    return {"task_id": task_id, "delivery": delivery}
+
+
+async def chase_task(hub: Hub, me: str, task_id: str, message: str | None = None) -> dict[str, Any]:
+    """催交 (D-109): the requester asks the owner where its task stands; it names the owner next (wakes it)."""
+    addr, _ = hub.local_agent(me)
+    task = hub.ledger.task(task_id, "requester")
+    if task is None or task["local_agent"] != str(addr):
+        raise PermissionError(f"{addr} did not request {task_id}: only its requester chases it")
+    body = {"message": message or "where does this stand? an eta or the result, please", "next": task["owner"],
+            "title": letters.title("chase", {}, _original(hub, task_id))}
+    return {"task_id": task_id, "delivery": await hub.reply(me, task_id, "UPDATE", body)}
+
+
+async def accept_delivery(hub: Hub, me: str, task_id: str, verdict: str, reason: str | None = None) -> dict[str, Any]:
+    """验收 (D-109): the requester of a delivered task says whether it got what it asked for. pass: done (a complete
+    result only); reject: back to its owner, with the reason; close: a partial or failed result ends as failed
+    (such a result never counts as done). The verdict goes to the owner and stays on the task's record."""
+    if verdict not in ACCEPTANCE_VERDICTS:
+        raise ValueError(f"verdict={verdict!r}: one of {', '.join(ACCEPTANCE_VERDICTS)}")
+    addr, _ = hub.local_agent(me)
+    task = hub.ledger.task(task_id, "requester")
+    if task is None or task["local_agent"] != str(addr):
+        raise PermissionError(f"{addr} did not request {task_id}: only its requester accepts its delivery")
+    if task["status"] != DELIVERED:
+        raise ValueError(f"{task_id} is {task['status']}: there is no delivery waiting for acceptance")
+    complete = task.get("result_status") == "complete"
+    if verdict == "pass" and not complete:
+        raise ValueError(f"{task_id} delivered a {task.get('result_status')} result: only a complete one can pass; "
+                         "reject it (with a reason) or close it as failed")
+    if verdict != "pass" and not reason:
+        raise ValueError(f"verdict {verdict} needs a reason")
+    if verdict == "close" and complete:
+        raise ValueError(f"{task_id} delivered a complete result: pass it, or reject it with a reason")
+    body = {"message": f"{verdict}" + (f": {reason}" if reason else ""), "acceptance": verdict,
+            **({"reason": reason} if reason else {}),
+            **({"next": task["owner"]} if verdict == "reject" else {}),       # the owner carries on: wake it
+            "title": letters.title("acceptance", {"verdict": verdict}, _original(hub, task_id))}
+    delivery = await hub.reply(me, task_id, "UPDATE", body)
+    status = {"pass": "COMPLETED", "close": "FAILED", "reject": "ACCEPTED"}[verdict]
+    hub.ledger.update_task(task_id, "requester", status=status)
+    return {"task_id": task_id, "verdict": verdict, "status": status, "delivery": delivery}
+
+
+async def withdraw_delivery(hub: Hub, me: str, task_id: str, reason: str) -> dict[str, Any]:
+    """撤回 (D-109): the owner takes back a delivery its requester has not accepted yet; the task is running again."""
+    task = _owned(hub, me, task_id)
+    if task["status"] != DELIVERED:
+        raise ValueError(f"{task_id} is {task['status']}: no delivery waiting for acceptance to withdraw")
+    _check_actor(hub, task)
+    body = {"state": "RUNNING", "message": f"delivery withdrawn: {reason}", "withdraw_delivery": True,
+            "title": letters.title("withdrawal", {}, _original(hub, task_id))}
+    ok = await hub.owner_transition(task_id, "RUNNING", body["message"], body=body)
+    hub.ledger.update_task(task_id, "owner", result=None, result_status=None)
+    return {"task_id": task_id, "withdrawn": ok}
+
+
 async def answer(hub: Hub, me: str, task_id: str, text: str, next: str | None = None) -> dict[str, Any]:
-    delivery = await hub.reply(me, task_id, "ANSWER", {"answer": text, **({"next": next} if next else {})})
+    delivery = await hub.reply(me, task_id, "ANSWER", {"answer": text, **({"next": next} if next else {}),
+                                                       "title": letters.title("answer", {}, _original(hub, task_id))})
     return {"task_id": task_id, "delivery": delivery}
 
 

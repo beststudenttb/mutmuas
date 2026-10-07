@@ -120,6 +120,32 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   `delivery` a message it sent has failed to go out for 5 minutes; `worker` runs of two or more different tasks
   failed within the hour with nothing finished since). Never a task id or content. Both keys are absent when
   nothing holds it up. Example: `{"stuck": true, "stuck_reason": "blocked,delivery"}`.
+- **Letters follow templates** (D-109): every letter an agent writes has a fixed template,
+  `src/mutmuas/letters.yaml` (the wording lives there alone): sent directly — 需求 request (send_request), 告知
+  notice (send_notice), 交付回执 delivery (submit_result, naming its task), 数据 data (send_data); receipts — 收到
+  (accept_task), 退回 refusal (reject_task, with whom to ask instead: `suggest`); other kinds — question, answer,
+  催交 chase (chase_task), progress, pause/resume/interrupt, reminder, 巡查汇总 patrol (send_notice
+  kind=patrol). The framework renders each letter's `title` (body key, e.g. `"【需求】<objective>"`,
+  `"Re:<the task's objective>"`); a required blank left empty refuses the letter at the MCP tool or agentctl
+  command, before anything is sent (`agentctl ask` asks for no expected outputs or acceptance criteria: a
+  script's request is accepted on delivery). Code calling the tools directly is not checked. A delivery is always a
+  delivery receipt naming its task: a new letter is never taken for one.
+- **Acceptance** (D-109): a REQUEST with `acceptance: "manual"` (what agents send through MCP; not scripts through
+  `agentctl ask`, nor code calling the tools) is not done when delivered. Its RESULT carries `acceptance:
+  "pending"` and names the requester `next`; both sides mark the task `DELIVERED`, a state neither open nor
+  finished (nothing runs it again or chases it, pause / resume / interrupt leave it alone, and progress on it is
+  refused; `wait_for_result` returns).
+  The requesting agent itself decides with `accept_delivery(task_id, pass | reject | close, reason)`, an UPDATE
+  with `acceptance` on the task's record: `pass` completes it (a complete result only); `reject` (a reason
+  required) sends it back: the owner's task is ACCEPTED again, the reason handed to its next run (not counted as
+  a failed attempt); `close` ends a partial or failed result as FAILED (such a result never counts as done).
+  Before that the owner may `withdraw_delivery` (RUNNING again on both sides). The delivery wakes the requester
+  (its online session, or its worker through the task the request belongs to); when nothing can be woken (no
+  session and no open task, or the requester retired; an offline node judges this itself when it is back) the
+  node tells
+  `escalate_to` (the secretary): an UPDATE with `follow_up: "acceptance"`. No time limit, no acceptance by default.
+  `DELIVERED` is never sent as an UPDATE state; only requests that ask for acceptance get it (an older requester
+  still gets a final RESULT).
 - **Waiting for quota** (D-104): a worker run that ends at the vendor account's usage limit (the vendor CLI's own
   words, e.g. Claude's "usage limit reached", Codex's `usage_limit_reached`, or a line `MUTMUAS_QUOTA: <what>`
   from any runtime or script) does not fail its task: the task waits, paused with `wait_reason: quota` (in the
@@ -127,11 +153,6 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   jobs run on. Nothing restarts it by itself: the account is shared, so when the secretary is back, everyone is.
   The secretary lists all such tasks with the MCP `quota_waits` and resumes them with `resume_quota_waits`
   (`control_task resume` to each; a resume clears the reason).
-- **A letter that delivers** (D-104): `send_request` first looks at the open tasks the recipient asked of the
-  sender (those the caller may act on: a worker's own task; for a session, those no worker is doing). Exactly
-  one: the letter is that task's delivery: its RESULT (`complete`, summary = the objective, artifacts and inputs
-  carried over, the requester named `next`), and the task is closed. Several: refused until `reply_to=<task id>`
-  says which. None, `reply_to: "new"`, or an explicit `parent_task` (a child task): a new request.
 - **Urgent work** (D-104): a REQUEST's `priority` has two levels, `normal` and `high`; the sender marks it as it
   needs, and the leader's work (`leader: true`) counts as high. The owner's node decides once more with what the
   post is doing: urgent work that arrives while the post's worker runs something not urgent stops that run; the
@@ -198,7 +219,11 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   automatically inside a worker run). `add_job(children=True)` makes the task wait on its direct children; so does
   reporting `state: WAITING` while a child is open. The wait ends once every child has a result, was refused or
   cancelled, or is past its deadline (reported as overdue and left running: the parent decides; each child is
-  reported overdue once, so a wait registered again afterwards lasts until that child really ends). The task is then
+  reported overdue once, so a wait registered again afterwards lasts until that child really ends). A delivered
+  child (D-109) counts as ended until the parent has been told of it (a run of the parent lists it, or a wait ended
+  on it): this catches a delivery whose wake found the parent's run still going; after that it is open until the
+  parent accepts it, but it holds a wait only while nothing is new: another child that ended since the parent was
+  last told, or a child past its deadline (a delivered one too, once), still ends it. The task is then
   woken once, as for a background job, and the wake-up lists how each child ended. Cancelling a task sends CANCEL
   to its open children (their nodes cascade further down).
 - `next: <address>` on RESULT, UPDATE, QUESTION or ANSWER names whose move it is. That agent is woken exactly

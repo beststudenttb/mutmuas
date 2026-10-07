@@ -47,7 +47,8 @@ async def test_send_request_and_agentctl_ask_carry_the_project(tmp_path, monkeyp
         calls.append(kw.get("project"))
         return {"task_id": "T-x"}
     monkeypatch.setattr(tools, "send_request", fake_send)
-    args = cli.agentctl_parser().parse_args(["ask", "C:vision", "do it", "--project", "robo", "--as", "B:desk"])
+    args = cli.agentctl_parser().parse_args(["ask", "C:vision", "do it", "--project", "robo", "--as", "B:desk",
+                                             "--reason", "r", "--expect", "x", "--accept", "y"])
     await cli.cmd_ask(args, None)
     assert calls == ["robo"]
 
