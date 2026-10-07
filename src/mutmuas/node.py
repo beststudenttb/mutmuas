@@ -852,8 +852,9 @@ class NodeDaemon:
             ctx.workdir, ctx.git_branch = wt.path, wt.branch
         where = f", branch {wt.branch}" if wt else ""
         await hub.owner_transition(task_id, "RUNNING", f"started (attempt {attempt}, runtime {agent.runtime}{where})")
+        runtime = make_runtime(agent, self.cfg)
         try:
-            outcome = await asyncio.wait_for(make_runtime(agent, self.cfg).run(ctx), timeout)
+            outcome = await asyncio.wait_for(runtime.run(ctx), timeout)
         except asyncio.TimeoutError:
             self._mark_unstopped(task_id, spawned)
             await self._run_failed(agent, task_id, attempt, result_body(
@@ -881,6 +882,9 @@ class NodeDaemon:
         current = hub.ledger.task(task_id, "owner")
         if current["status"] in TERMINAL_STATES:
             return      # the agent already closed the task through its tools
+        if not current.get("result_draft") and (why := runtime.quota(outcome)):
+            await self._hold_for_quota(task_id, why)      # not a failed run; its jobs run on
+            return
         if hub.ledger.jobs(task_id):
             return      # it waits on a background job it registered: the heartbeat wakes it when the job ends
         if current["status"] == "BLOCKED" and not current.get("result_draft"):
@@ -902,6 +906,18 @@ class NodeDaemon:
         await self._notify(agent, current["owner"], task_id,
                            f"FYI: {current['owner']} finished {task_id} for {current['requester']} "
                            f"({body['status']})")
+
+    async def _hold_for_quota(self, task_id: str, why: str) -> None:
+        """D-104: the run stopped at the account's usage limit. The task waits, paused with wait_reason "quota",
+        until the secretary resumes it (one account: back for everyone); the run is not counted as an attempt, and
+        its jobs are not touched."""
+        task = self.hub.ledger.task(task_id, "owner")
+        self.hub.ledger.update_task(task_id, "owner", paused=1, wait_reason="quota",
+                                    attempts=max(0, task["attempts"] - 1))
+        self._note_interrupt(task_id, f"your previous run stopped at the account's usage limit ({short(why, 160)}); "
+                                      "the task was resumed once it was back: carry on from where you were")
+        log.warning("task %s waits for quota: %s", task_id, why)
+        await self._settle(task_id, f"waiting for quota: the account's usage limit was reached ({short(why, 160)})")
 
     async def _run_failed(self, agent: AgentConfig, task_id: str, attempt: int, body: dict[str, Any],
                           refs: list[ArtifactRef] | None = None) -> None:
@@ -1157,7 +1173,7 @@ class NodeDaemon:
             if kind == "interrupt":
                 hub.ledger.update_task(task_id, "owner", attempts=0)       # the next run starts afresh
             else:
-                hub.ledger.update_task(task_id, "owner", paused=int(kind == "pause"))
+                hub.ledger.update_task(task_id, "owner", paused=int(kind == "pause"), wait_reason=None)
             self._note_interrupt(task_id, {"pause": "paused by ", "resume": "resumed by "}.get(kind, "") + text)
             why = {"pause": f"paused by {env.sender}", "resume": f"resumed by {env.sender}"}.get(
                 kind, f"interrupted by {env.sender}: the run was stopped and is laid out again with the new message")

@@ -514,6 +514,22 @@ async def control_task(hub: Hub, me: str, task_id: str, action: str, message: st
     return {"task_id": task_id, "action": action, "delivery": delivery}
 
 
+async def quota_waits(hub: Hub, me: str) -> list[dict[str, Any]]:
+    """Every open task, on any node, that waits for the account's usage limit to come back (D-104): from the shared
+    task records (all of them for a coordinator such as the secretary)."""
+    return [r for r in await hub.all_tasks(limit=10000, viewer=me)
+            if r.get("wait_reason") == "quota" and r.get("status") not in TERMINAL_STATES]
+
+
+async def resume_quota_waits(hub: Hub, me: str, message: str = "the usage limit is back: carry on") -> dict[str, Any]:
+    """Resume every task that waits for quota (control_task resume to each owner; the owner's node decides)."""
+    resumed = []
+    for record in await quota_waits(hub, me):
+        await control_task(hub, me, record["task_id"], "resume", message)
+        resumed.append(record["task_id"])
+    return {"resumed": resumed}
+
+
 async def answer(hub: Hub, me: str, task_id: str, text: str, next: str | None = None) -> dict[str, Any]:
     delivery = await hub.reply(me, task_id, "ANSWER", {"answer": text, **({"next": next} if next else {})})
     return {"task_id": task_id, "delivery": delivery}

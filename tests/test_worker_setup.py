@@ -265,11 +265,11 @@ def test_the_claude_result_names_the_limit_it_hit(tmp_path, subtype):
 async def test_a_run_stopped_at_a_limit_is_a_failed_run_laid_out_once_more(tmp_path, monkeypatch):
     """R5.4: recorded in the failures, run once more; the second time the task fails."""
     from mutmuas import node as node_module
-    from mutmuas.runtime import RunOutcome
+    from mutmuas.runtime import RunOutcome, SubprocessRuntime
     agent, ledger, daemon = _node(tmp_path)
     owned_task(ledger, "T-l", "ACCEPTED", ingest=True)
 
-    class Limited:
+    class Limited(SubprocessRuntime):
         def __init__(self, *_):
             pass
 

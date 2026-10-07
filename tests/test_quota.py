@@ -1,0 +1,88 @@
+"""D-104 item 1: a run that ends because the vendor account's usage limit was reached does not fail its task: the
+task waits (paused, wait_reason "quota"), the run is not counted as an attempt, and its jobs run on. The secretary
+lists every such task at once and resumes them when the account is back (one account: back for everyone)."""
+
+from __future__ import annotations
+
+import sys
+
+from conftest import Orphan, owned_task
+from test_interrupt import _deliver, _update
+from test_job_wake import _node
+
+from mutmuas import tools
+from mutmuas.config import AgentConfig, NodeConfig
+from mutmuas.node import proc_start
+from mutmuas.runtime import ClaudeCodeRuntime, CodexRuntime, RunOutcome
+
+
+def _script(agent, text):
+    agent.command = [sys.executable, "-c", f"print({text!r}); raise SystemExit(1)"]
+
+
+async def test_a_run_stopped_by_the_usage_limit_leaves_its_task_waiting_and_its_job_running(tmp_path):
+    agent, ledger, daemon = _node(tmp_path)
+    _script(agent, "MUTMUAS_QUOTA: usage limit reached, resets 5pm")
+    owned_task(ledger, "T-q", "ACCEPTED", ingest=True)
+    job = Orphan("import time; time.sleep(30)")
+    ledger.add_job("T-q", "B:desk", job.pid, proc_start(job.pid), None, None, "training")
+    try:
+        await daemon._execute(agent, "T-q")
+        task = ledger.task("T-q", "owner")
+        assert task["status"] == "WAITING" and task["paused"] and task["wait_reason"] == "quota"
+        assert task["attempts"] == 0 and task["result"] is None                   # not a failed run
+        assert any("usage limit" in note for note in task["interrupts"])          # the next run is told
+        assert job.poll() is None and ledger.jobs("T-q")                          # its job runs on
+        assert not daemon._retry and "T-q" not in daemon._queued["B:desk"]
+    finally:
+        job.kill()
+        ledger.close()
+
+
+def test_only_the_vendor_clis_own_words_count_as_the_usage_limit(tmp_path):
+    node = NodeConfig(project="p", node="B", data_dir=str(tmp_path))
+    claude = ClaudeCodeRuntime(AgentConfig(id="c", runtime="claude-code"), node)
+    codex = CodexRuntime(AgentConfig(id="x", runtime="codex"), node)
+    assert claude.quota(RunOutcome(1, '{"is_error":true,"result":"Claude AI usage limit reached|1759"}'))
+    assert claude.quota(RunOutcome(1, "You've hit your session limit · resets 5pm"))
+    assert codex.quota(RunOutcome(1, "ERROR: usage_limit_reached"))
+    for text in ("OSError: Disk quota exceeded", "HTTP 429 from api.example.com", "rate limit exceeded on S3"):
+        assert claude.quota(RunOutcome(1, text)) is None and codex.quota(RunOutcome(1, text)) is None
+    assert claude.quota(RunOutcome(0, "usage limit reached in the paper we read")) is None   # a run that worked
+
+
+async def test_a_resume_clears_the_quota_wait_and_lays_the_task_out(tmp_path):
+    agent, ledger, daemon = _node(tmp_path)
+    daemon.cfg.trusted_controllers = ["B:secretary"]
+    _script(agent, "MUTMUAS_QUOTA: usage limit reached")
+    owned_task(ledger, "T-q", "ACCEPTED", ingest=True)
+    try:
+        await daemon._execute(agent, "T-q")
+        await _deliver(daemon, agent, _update("T-q", sender="B:secretary", resume=True, message="limit is back"))
+        task = ledger.task("T-q", "owner")
+        assert not task["paused"] and task["wait_reason"] is None and "T-q" in daemon._queued["B:desk"]
+    finally:
+        ledger.close()
+
+
+async def test_the_secretary_lists_and_resumes_every_quota_wait(tmp_path, monkeypatch):
+    _, ledger, daemon = _node(tmp_path, mode="interactive")
+    records = [{"task_id": "T-1", "owner": "B:rl", "status": "WAITING", "wait_reason": "quota"},
+               {"task_id": "T-2", "owner": "C:vision", "status": "WAITING", "wait_reason": "quota"},
+               {"task_id": "T-3", "owner": "C:vision", "status": "WAITING"}]               # waiting on something else
+
+    async def all_tasks(limit=100, viewer=None):
+        return records
+    sent = []
+
+    async def control(hub, me, task_id, action, message):
+        sent.append((task_id, action))
+        return {"task_id": task_id, "action": action, "delivery": "sent"}
+    monkeypatch.setattr(daemon.hub, "all_tasks", all_tasks)
+    monkeypatch.setattr(tools, "control_task", control)
+    try:
+        assert [t["task_id"] for t in await tools.quota_waits(daemon.hub, "B:desk")] == ["T-1", "T-2"]
+        out = await tools.resume_quota_waits(daemon.hub, "B:desk")
+        assert sent == [("T-1", "resume"), ("T-2", "resume")] and out["resumed"] == ["T-1", "T-2"]
+    finally:
+        ledger.close()

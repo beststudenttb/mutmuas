@@ -107,6 +107,13 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   takes all of them, as before. Which project a session is in is found by file identity, so a case variant of
   the directory or a link into it counts as that project. An agent without `auto_worker` has nobody to hand
   the rest to, so its session takes and sees all work wherever it was started.
+- **Waiting for quota** (D-104): a worker run that ends at the vendor account's usage limit (the vendor CLI's own
+  words, e.g. Claude's "usage limit reached", Codex's `usage_limit_reached`, or a line `MUTMUAS_QUOTA: <what>`
+  from any runtime or script) does not fail its task: the task waits, paused with `wait_reason: quota` (in the
+  shared task record), the run is not counted as an attempt, the next run is told why it stopped, and the task's
+  jobs run on. Nothing restarts it by itself: the account is shared, so when the secretary is back, everyone is.
+  The secretary lists all such tasks with the MCP `quota_waits` and resumes them with `resume_quota_waits`
+  (`control_task resume` to each; a resume clears the reason).
 - **A letter that delivers** (D-104): `send_request` first looks at the open tasks the recipient asked of the
   sender (those the caller may act on: a worker's own task; for a session, those no worker is doing). Exactly
   one: the letter is that task's delivery: its RESULT (`complete`, summary = the objective, artifacts and inputs

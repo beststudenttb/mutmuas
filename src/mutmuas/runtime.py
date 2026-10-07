@@ -96,8 +96,33 @@ class RunOutcome:
     limit: str | None = None                   # the run was stopped at a worker limit (e.g. "error_max_turns")
 
 
+# Any runtime or script may say its run stopped at the account's usage limit with a line "<marker> <what>" (D-104)
+QUOTA_SIGNAL = "MUTMUAS_QUOTA:"
+
+
 class SubprocessRuntime:
     name = "subprocess"
+    # How this runtime's vendor CLI itself says the account's usage limit was reached. Only the vendor's own words:
+    # a task's own errors ("Disk quota exceeded", another API's 429) are not the account's limit.
+    quota_patterns: tuple[str, ...] = ()
+
+    def quota(self, outcome: RunOutcome) -> str | None:
+        """What says this run stopped at the account's usage limit, or None (D-104 item 1)."""
+        if outcome.exit_code == 0 and not (outcome.result or {}).get("is_error"):
+            return None
+        text = outcome.output_tail or ""
+        if outcome.log_path:
+            with contextlib.suppress(OSError), open(outcome.log_path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - TAIL_BYTES))
+                text += "\n" + f.read().decode(errors="replace")
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith(QUOTA_SIGNAL):
+                return line[len(QUOTA_SIGNAL):].strip() or "usage limit reached"
+            if any(p in line.lower() for p in self.quota_patterns):
+                return line[:300]
+        return None
 
     def __init__(self, agent: AgentConfig, node: NodeConfig):
         self.agent = agent
@@ -264,6 +289,8 @@ Rules:
 
 class ClaudeCodeRuntime(SubprocessRuntime):
     name = "claude-code"
+    quota_patterns = ("usage limit reached", "hit your session limit", "hit your weekly limit", "hit your usage limit",
+                      "credit balance is too low")
 
     def start_dir(self, ctx: TaskContext) -> Path:
         return llm_start_dir(ctx)
@@ -316,6 +343,7 @@ class ClaudeCodeRuntime(SubprocessRuntime):
 
 class CodexRuntime(SubprocessRuntime):
     name = "codex"
+    quota_patterns = ("usage_limit_reached", "hit your usage limit", "out of credits", "insufficient_quota")
 
     def start_dir(self, ctx: TaskContext) -> Path:
         return llm_start_dir(ctx)

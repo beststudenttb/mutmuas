@@ -362,6 +362,9 @@ show a pattern.
 
 Known risks (protections removed on purpose; one line each):
 
+- The usage limit is recognised by the vendor CLI's own wording (runtime.py quota_patterns): if a vendor changes
+  it, such a run counts as an ordinary failed run (laid out once more, then failed) until the pattern is added.
+
 - An old worker's children that outlive their leader after a daemon crash are not looked for; a retry can run
   next to them.
 - Observer copies of a REQUEST are sent by the owner's node once it has the request (D-102), so they arrive

@@ -49,12 +49,12 @@ def test_a_brain_run_resumes_its_batch(tmp_path):
 
 async def test_brain_runs_share_a_conversation_until_an_idle_spell(tmp_path, monkeypatch):
     from mutmuas import node as node_module
-    from mutmuas.runtime import RunOutcome
+    from mutmuas.runtime import RunOutcome, SubprocessRuntime
     agent, _, ledger, hub, daemon = _node(tmp_path)
     agent.runtime = "claude-code"                                     # brain batches are claude-code's
     seen = []
 
-    class Brain:
+    class Brain(SubprocessRuntime):
         def __init__(self, *_):
             pass
 
@@ -80,14 +80,14 @@ async def test_brain_runs_share_a_conversation_until_an_idle_spell(tmp_path, mon
 
 async def test_a_failed_resume_starts_the_next_attempt_afresh(tmp_path, monkeypatch):
     from mutmuas import node as node_module
-    from mutmuas.runtime import RunOutcome
+    from mutmuas.runtime import RunOutcome, SubprocessRuntime
     agent, _, ledger, hub, daemon = _node(tmp_path)
     agent.runtime = "claude-code"
     _parent(ledger)
     ledger.update_task("T-p", "owner", status="ACCEPTED")
     ledger.set_brain_session("B:desk", "robo", "S-gone")
 
-    class Lost:
+    class Lost(SubprocessRuntime):
         def __init__(self, *_):
             pass
 

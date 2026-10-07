@@ -361,6 +361,16 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         return dump(await tools.answer(hub(), state["me"], task_id, answer, next=next))
 
     @server.tool()
+    async def quota_waits() -> str:
+        """Every open task (on any node you may see) that waits for the account's usage limit to come back."""
+        return dump(await tools.quota_waits(hub(), state["me"]))
+
+    @server.tool()
+    async def resume_quota_waits(message: str = "the usage limit is back: carry on") -> str:
+        """The usage limit is back: resume every task waiting for it (pause/resume rights apply on each node)."""
+        return dump(await tools.resume_quota_waits(hub(), state["me"], message))
+
+    @server.tool()
     async def control_task(task_id: str, action: str, message: str) -> str:
         """Pause, resume or interrupt one task; only that task is affected. action: pause | resume | interrupt.
         pause stops its run and keeps it waiting until resume; interrupt stops its run (if it runs) and lays it
