@@ -534,6 +534,8 @@ def node_service(args):
     dirs = [str(venv_bin)] + [str(Path(p).parent) for p in (shutil.which("claude"), shutil.which("codex")) if p]
     dirs += ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
     path_env = ":".join(dict.fromkeys(d for d in dirs if Path(d).is_dir()))
+    # Stopping the service stops the daemon only (D-104): runs and jobs in progress go on, the next daemon adopts
+    # them (systemd: KillMode=process, not the whole cgroup; launchd: AbandonProcessGroup).
     if sys.platform == "darwin":
         label = f"dev.mutmuas.{cfg.project}.{cfg.node}{suffix}"   # unique per node: several nodes can share a Mac
         items = "\n".join(f"    <string>{a}</string>" for a in argv)
@@ -551,6 +553,7 @@ def node_service(args):
   <dict><key>PATH</key><string>{path_env}</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>AbandonProcessGroup</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>
   <key>StandardOutPath</key><string>{log}</string>
   <key>StandardErrorPath</key><string>{log}</string>
@@ -572,7 +575,7 @@ ExecStart={' '.join(argv)}
 Restart=always
 RestartSec=5
 Environment=PATH={path_env}
-KillMode=mixed
+KillMode=process
 TimeoutStopSec=30
 
 [Install]

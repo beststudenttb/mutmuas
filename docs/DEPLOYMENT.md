@@ -348,6 +348,20 @@ unless that id is configured, and the directory back from its archive unless som
 says so); then start the node. What is on disk decides, so a run that stopped midway is undone too. Refused and
 withdrawn tasks stay so.
 
+## 8c. Deploying without stopping work (D-104)
+
+A deploy restarts the daemon on the new code; it does not stop the work in progress (as nginx reloads):
+- Stopping the daemon leaves its runs running: each run and each job has its own session, and its output goes to
+  its own log, not through the daemon. The service stops the daemon alone: the systemd unit has
+  `KillMode=process`, the launchd plist `AbandonProcessGroup` (measured on macOS 2026-10-07: after `launchctl
+  bootout` a child in its own session lives on even without it; with it, a child in the job's group does too).
+  Units written before D-104 must be written again once (`agent-node service --write`) as part of a deploy.
+- The new daemon takes new work, adopts each run it finds still going (recover), and when it ends delivers its
+  result (the draft it submitted, or what it printed), or runs the task again if it left none.
+- Old and new code work side by side meanwhile: runs finish on the code they started with (a process loads all of
+  mutmuas when it starts), the ledger and the messages only ever gain fields and columns (ledger.ADDED_COLUMNS),
+  never lose or change one.
+
 ## 8a. Supervision and known risks
 
 Errors are skipped and recorded rather than defended against (D-039, D-040); patches follow once the records

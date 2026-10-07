@@ -106,6 +106,25 @@ def test_service_units_do_not_clobber_other_nodes(tmp_path, monkeypatch):
     assert str(tmp_path / "A.yaml") in paths["A"].read_text()
 
 
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_stopping_the_daemons_service_leaves_its_runs_running(tmp_path, monkeypatch, capsys, platform):
+    """D-104 hot deploy: stopping the service stops the daemon only. systemd: KillMode=process (not the whole
+    cgroup); launchd: AbandonProcessGroup (runs and jobs have their own sessions anyway)."""
+    import sys
+
+    from mutmuas import cli
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(cli.Path, "home", lambda: tmp_path)
+    cfg = tmp_path / "B.yaml"
+    cfg.write_text(yaml.safe_dump({"project": "p", "node": "B", "agents": []}))
+    cli.agent_node(["service", "--config", str(cfg)])
+    text = capsys.readouterr().out
+    if platform == "darwin":
+        assert "<key>AbandonProcessGroup</key><true/>" in text
+    else:
+        assert "KillMode=process" in text and "KillMode=mixed" not in text
+
+
 @pytest.mark.parametrize("kind", ["query", "artifact", "code", "experiment"])
 @pytest.mark.parametrize("permissions, sandbox, claude_can_edit", [
     (["READ", "PUBLISH_ARTIFACT"], "read-only", False),
