@@ -1475,6 +1475,8 @@ class NodeDaemon:
                 **(public_session(seen) if agent.mode == "interactive" else {}),
                 **({"activity": activity, "activity_at": session["activity_at"]} if activity else {}),
                 **({"project": project} if project else {}),
+                **({"stuck": True, "stuck_reason": ",".join(stuck)} if (stuck := hub.ledger.stuck_reasons(addr))
+                   else {}),
                 "heartbeat_s": self.cfg.heartbeat_s, "last_heartbeat": now}
             await bus.kv_put(bus.names.agents_kv, f"{self.cfg.node}.{agent.id}",
                              {k: v for k, v in card.items() if k in CARD_KEYS})

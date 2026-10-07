@@ -624,6 +624,30 @@ class Ledger:
     def end_job(self, job_id: int, ended: str) -> None:
         self.db.execute("UPDATE jobs SET ended_at=?, ended=? WHERE job_id=?", (now_iso(), ended, job_id))
 
+    def stuck_reasons(self, local_agent: str) -> list[str]:
+        """Why this post is held up (D-108), as kinds only: "blocked" (a task it owns is BLOCKED), "quota" (one
+        waits for the account's usage limit), "delivery" (a message it sent keeps failing to go out), "worker"
+        (its last two runs failed, with nothing finished since)."""
+        reasons = []
+        if self.db.execute("SELECT 1 FROM tasks WHERE role='owner' AND local_agent=? AND status='BLOCKED'",
+                           (local_agent,)).fetchone():
+            reasons.append("blocked")
+        if self.db.execute("SELECT 1 FROM tasks WHERE role='owner' AND local_agent=? AND paused=1"
+                           " AND wait_reason='quota'"
+                           f" AND status NOT IN ({','.join('?' * len(TERMINAL_STATES))})",
+                           (local_agent, *TERMINAL_STATES)).fetchone():
+            reasons.append("quota")
+        if self.db.execute("SELECT 1 FROM messages WHERE direction='out' AND local_agent=? AND state='queued'"
+                           " AND last_error IS NOT NULL", (local_agent,)).fetchone():
+            reasons.append("delivery")
+        done = self.db.execute("SELECT MAX(updated_at) FROM tasks WHERE role='owner' AND local_agent=?"
+                               " AND status='COMPLETED'", (local_agent,)).fetchone()[0] or ""
+        failed = [r[0] for r in self.db.execute("SELECT at FROM failures WHERE stage='run' AND address=?"
+                                               " ORDER BY rowid DESC LIMIT 2", (local_agent,))]
+        if len(failed) == 2 and all(at > done for at in failed):
+            reasons.append("worker")
+        return reasons
+
     def failures(self, limit: int = 50) -> list[dict[str, Any]]:
         return [dict(r) for r in self.db.execute("SELECT * FROM failures ORDER BY rowid DESC LIMIT ?", (limit,))]
 

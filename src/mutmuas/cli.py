@@ -142,6 +142,7 @@ async def cmd_status(args, hub: Hub):
             busy = f"  {c['availability']}" if c.get("availability") and c["online"] else ""
             activity = f"  activity {c['activity']}" if c.get("activity") and c["online"] else ""
             project = f"  project {c['project']}" if c.get("project") else ""
+            project += f"  STUCK ({c['stuck_reason']})" if c.get("stuck") else ""
             print(f"  {c['address']}{alias}  {state}{busy}  [{c.get('mode')}/{c.get('runtime') or '-'}]{session}"
                   f"{activity}{project}")
     if not known and not by_node:

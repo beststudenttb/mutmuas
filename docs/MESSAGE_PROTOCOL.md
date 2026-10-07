@@ -115,6 +115,11 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   the task in hand, else the project directory the session is in, else the post's `default_project`.
   Example: `{"state": "working", "activity": "busy", "activity_at": "2026-10-07T05:51:02.120+00:00",
   "project": "visualrl", ...}`. `agentctl status` shows both.
+- **Held up** (D-108): the card carries `stuck: true` (a boolean) and `stuck_reason` (a string: the kinds, comma
+  separated, in this order: `blocked` a task the post owns is BLOCKED; `quota` one waits for the usage limit;
+  `delivery` a message it sent keeps failing to go out; `worker` its last two runs failed with nothing finished
+  since). Never a task id or content. Both keys are absent when nothing holds it up. Example: `{"stuck": true,
+  "stuck_reason": "blocked,delivery"}`.
 - **Waiting for quota** (D-104): a worker run that ends at the vendor account's usage limit (the vendor CLI's own
   words, e.g. Claude's "usage limit reached", Codex's `usage_limit_reached`, or a line `MUTMUAS_QUOTA: <what>`
   from any runtime or script) does not fail its task: the task waits, paused with `wait_reason: quota` (in the
@@ -281,7 +286,7 @@ There are four layers (`src/mutmuas/visibility.py`):
 
 | layer | who | what |
 |---|---|---|
-| public | everyone | address, role, capabilities, provider, mode, `accepts_kinds`, online/offline, `session` on duty, `availability` available/busy, `activity` busy/idle and `activity_at`, `project` (D-108) |
+| public | everyone | address, role, capabilities, provider, mode, `accepts_kinds`, online/offline, `session` on duty, `availability` available/busy, `activity` busy/idle and `activity_at`, `project`, `stuck` and `stuck_reason` (D-108) |
 | task status | coordinators + participants | task id, first 80 characters of the objective, status, requester → owner, last update |
 | task content | participants only: requester, owner, `observers` | reason, inputs, the thread, the RESULT, artifacts |
 | private | nobody | session reasoning, memory, work logs, transcripts, raw run logs. Never sent over mutmuas; ask the person, who answers with a condensed summary |

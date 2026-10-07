@@ -102,3 +102,50 @@ async def test_a_post_with_no_project_shows_none(tmp_path):
         assert "project" not in await _card(daemon)
     finally:
         ledger.close()
+
+
+# --------------------------------------------------------------------------- stuck (D-108 addition)
+
+
+async def test_a_post_that_is_really_held_up_shows_stuck_with_the_kind_only(tmp_path):
+    """stuck on the public card: a blocked task, waiting for quota, a send that keeps failing, or a worker that
+    keeps failing. stuck_reason names the kinds only, never a task or its content."""
+    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    try:
+        card = await _card(daemon)
+        assert "stuck" not in card and "stuck_reason" not in card
+        owned_task(ledger, "T-b", "BLOCKED", ingest=True)
+        card = await _card(daemon)
+        assert card["stuck"] is True and card["stuck_reason"] == "blocked"
+        owned_task(ledger, "T-q", "WAITING", ingest=True)
+        ledger.update_task("T-q", "owner", paused=1, wait_reason="quota")
+        assert (await _card(daemon))["stuck_reason"] == "blocked,quota"
+        out = Envelope(type="UPDATE", sender="B:desk", to="A:sender", task_id="T-b", body={"message": "x"})
+        ledger.queue_outgoing(out)
+        ledger.mark_send_error(out.message_id, "BusUnavailable: no servers")
+        assert (await _card(daemon))["stuck_reason"] == "blocked,quota,delivery"
+        for _ in range(2):
+            ledger.record_failure("run", "runtime error: claude not found", address="B:desk", task_id="T-q")
+        card = await _card(daemon)
+        assert card["stuck_reason"] == "blocked,quota,delivery,worker" and "T-" not in card["stuck_reason"]
+    finally:
+        ledger.close()
+
+
+async def test_stuck_clears_once_the_trouble_is_over(tmp_path):
+    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    try:
+        out = Envelope(type="UPDATE", sender="B:desk", to="A:sender", task_id="T-1", body={"message": "x"})
+        ledger.queue_outgoing(out)
+        ledger.mark_send_error(out.message_id, "BusUnavailable")
+        ledger.record_failure("run", "runtime error", address="B:desk")
+        ledger.record_failure("run", "runtime error", address="B:desk")
+        assert (await _card(daemon))["stuck"] is True
+        ledger.mark_sent(out.message_id)                                       # the send went through after all
+        owned_task(ledger, "T-ok", "ACCEPTED", ingest=True)
+        ledger.update_task("T-ok", "owner", status="COMPLETED")                # a run worked since the failures
+        assert "stuck" not in await _card(daemon)
+        ledger.record_failure("run", "runtime error", address="B:desk")       # one failure is not "keeps failing"
+        assert "stuck" not in await _card(daemon)
+    finally:
+        ledger.close()
