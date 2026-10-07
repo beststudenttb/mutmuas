@@ -167,8 +167,9 @@ async def cmd_ask(args, hub: Hub):
         inputs=_parse_kv(args.input) or None, expected_outputs=args.expect, acceptance_criteria=args.accept,
         constraints=args.constraint, timeout_s=args.timeout, priority=args.priority,
         reply=args.reply, deadline=args.due, observers=args.observer,
-        artifacts=[{"uri": uri} for uri in args.artifact or []], leader=args.leader, project=args.project)
-    if args.wait is not None:
+        artifacts=[{"uri": uri} for uri in args.artifact or []], leader=args.leader, project=args.project,
+        reply_to=args.reply_to)
+    if args.wait is not None and not out.get("delivered_as_result_of"):      # a delivery waits for nothing
         out = await tools.wait_for_result(hub, out["task_id"], args.wait, me=_me(args))
     _print(out, args.json)
 
@@ -684,6 +685,8 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--expect", action="append", help="expected output (repeatable)")
     p.add_argument("--accept", action="append", help="acceptance criterion (repeatable)")
     p.add_argument("--constraint", action="append", help="constraint on how to do it (repeatable)")
+    p.add_argument("--reply-to", metavar="TASK|new",
+                   help="the open task of theirs this delivers (needed when you hold several); new: a new request")
     p.add_argument("--priority", default="normal", choices=["normal", "high"],
                    help="high: urgent, runs first and stops work that is not urgent (D-104)")
     p.add_argument("--timeout", type=float, help="task timeout on the owner side (s)")

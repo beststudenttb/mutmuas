@@ -103,6 +103,11 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   takes all of them, as before. Which project a session is in is found by file identity, so a case variant of
   the directory or a link into it counts as that project. An agent without `auto_worker` has nobody to hand
   the rest to, so its session takes and sees all work wherever it was started.
+- **A letter that delivers** (D-104): `send_request` first looks at the open tasks the recipient asked of the
+  sender (those the caller may act on: a worker's own task; for a session, those no worker is doing). Exactly
+  one: the letter is that task's delivery: its RESULT (`complete`, summary = the objective, artifacts and inputs
+  carried over, the requester named `next`), and the task is closed. Several: refused until `reply_to=<task id>`
+  says which. None, `reply_to: "new"`, or an explicit `parent_task` (a child task): a new request.
 - **Urgent work** (D-104): a REQUEST's `priority` has two levels, `normal` and `high`; the sender marks it as it
   needs, and the leader's work (`leader: true`) counts as high. The owner's node decides once more with what the
   post is doing: urgent work that arrives while the post's worker runs something not urgent stops that run; the

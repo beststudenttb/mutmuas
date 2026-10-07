@@ -220,8 +220,11 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
                            timeout_s: float | None = None, artifacts: list[dict[str, Any]] | None = None,
                            priority: str = "normal", reply: str = "required", deadline: str | None = None,
                            observers: list[str] | None = None, leader: bool = False,
-                           project: str | None = None) -> str:
+                           project: str | None = None, reply_to: str | None = None) -> str:
         """Delegate a task to another agent. kind: query | artifact | experiment | code.
+        A letter to someone with exactly one open task of theirs in your hands is that task's delivery (its
+        RESULT, summary = objective); with several, say which with reply_to=<task id>; reply_to="new" always
+        sends a new request.
         project: the project the work belongs to (the recipient works in its directory for it); default: theirs.
         leader: true only when the leader asked for this task (it goes first in their queue).
         reply: required (the default: they owe you a RESULT) | none (a notice; closed once they read it).
@@ -231,7 +234,7 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
             hub(), state["me"], to, objective, reason, kind=kind, inputs=inputs, expected_outputs=expected_outputs,
             constraints=constraints, acceptance_criteria=acceptance_criteria, timeout_s=timeout_s,
             artifacts=artifacts, priority=priority, reply=reply, deadline=deadline, observers=observers,
-            leader=leader, project=project))
+            leader=leader, project=project, reply_to=reply_to))
 
     @server.tool()
     async def check_task(task_id: str) -> str:
