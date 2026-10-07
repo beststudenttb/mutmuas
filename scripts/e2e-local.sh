@@ -13,6 +13,7 @@
 #   TEST 6  B:secretary, trusted on B, pauses and resumes a task it did not request (run before TEST 5)
 #   TEST 7  a hot deploy: B's daemon restarts while a run and a job go on; both finish, the run once (D-104)
 #   TEST 8  a run stops at the usage limit: it waits; B:secretary lists and resumes it (D-104)
+#   TEST 9  a delivery waits for its requester: sent back once with a reason, then passed (D-109)
 #   TEST 5  B retires its post B:data (daemon stopped) and undoes it
 #
 # Usage: scripts/e2e-local.sh [--keep]     (work dir: .local/e2e/, kept with --keep)
@@ -140,6 +141,11 @@ async def main(cmd, task_id, *rest):
             out = await tools.control_task(hub, ME, task_id, rest[0], rest[1])
         elif cmd == "answer":
             out = await tools.answer(hub, ME, task_id, rest[0], next=rest[1])
+        elif cmd == "request":       # task_id here is the recipient; what agents send through MCP (D-109)
+            out = await tools.send_request(hub, ME, task_id, rest[0], "end-to-end check", kind="experiment",
+                                           inputs=json.loads(rest[1]), acceptance="manual")
+        elif cmd == "accept":
+            out = await tools.accept_delivery(hub, ME, task_id, rest[0], rest[1] if len(rest) > 1 else None)
         elif cmd == "quota_waits":
             out = await tools.quota_waits(hub, ME)
         elif cmd == "resume_quota":
@@ -304,6 +310,17 @@ CTL_AS=B:secretary ctl_b quota_waits - | check "[t['task_id'] for t in d]==['$TA
 CTL_AS=B:secretary ctl_b resume_quota - | check "d['resumed']==['$TASK8']" "resume_quota_waits resumes it"
 ctl wait "$TASK8" | check "d['result_status']=='complete' and d['result']['summary']=='done after the limit came back'" \
   "it ran again and finished"
+
+step "TEST 9: a delivery waits for the requester: sent back once with a reason, then passed (D-109)"
+TASK9=$(ctl request B:b1 "Train with acceptance" '{"action": "experiment", "steps": 3, "step_s": 0.1}' | json "d['task_id']")
+wait_status "$TASK9" "d['status']=='DELIVERED' and d['local_status']=='DELIVERED'" "delivered: it waits for A to accept it"
+ctl accept "$TASK9" reject "the seed is not recorded" >/dev/null
+wait_status "$TASK9" "d['status']=='DELIVERED' and d['local_status']=='DELIVERED' and len([m for m in d['thread'] if m['type']=='RESULT'])==2" \
+  "sent back with the reason, B ran it again and delivered anew"
+RUNS=$(ls "$W/B/data/runs/" | grep -c "^$TASK9\..*\.log$")
+[ "$RUNS" = "2" ] && echo "PASS: two runs: the first delivery and the one after the reason" || { echo "FAIL: $RUNS runs"; exit 1; }
+ctl accept "$TASK9" pass >/dev/null
+wait_status "$TASK9" "d['status']=='COMPLETED' and d['local_status']=='COMPLETED'" "passed: done on both sides"
 
 step "TEST 5: retire B:data (B's daemon stopped), then undo"
 kill "$PID_B"; wait "$PID_B" 2>/dev/null || true
