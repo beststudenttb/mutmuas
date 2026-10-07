@@ -108,10 +108,28 @@ class SubprocessRuntime:
     # a task's own errors ("Disk quota exceeded", another API's 429) are not the account's limit.
     quota_patterns: tuple[str, ...] = ()
 
+    # What a run's whole output starts with when it ended at the limit and still exited 0: then only a short output
+    # that starts with one counts (a run that worked may mention a usage limit anywhere).
+    quota_notices: tuple[str, ...] = ()
+
     def quota(self, outcome: RunOutcome) -> str | None:
         """What says this run stopped at the account's usage limit, or None (D-104 item 1)."""
-        if outcome.exit_code == 0 and not (outcome.result or {}).get("is_error"):
-            return None
+        text = (outcome.output_tail or "") + "\n" + (log_tail(outcome.log_path) if outcome.log_path else "")
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        for line in lines:
+            if line.startswith(QUOTA_SIGNAL):
+                return line[len(QUOTA_SIGNAL):].strip() or "usage limit reached"
+        failed = (outcome.exit_code != 0 or (outcome.result or {}).get("is_error")
+                  or (_last_json(outcome.output_tail or "") or {}).get("type") == "error")
+        if failed:
+            for line in lines:
+                if any(p in _plain(line) for p in self.quota_patterns):
+                    return line[:300]
+        elif len((outcome.output_tail or "").strip()) <= 400:
+            head = _plain(outcome.output_tail or "").lstrip("{\"' ")
+            if any(head.startswith(n) for n in self.quota_notices):
+                return (outcome.output_tail or "").strip()[:300]
+        return None
         text = (outcome.output_tail or "") + "\n" + (log_tail(outcome.log_path) if outcome.log_path else "")
         for line in text.splitlines():
             line = line.strip()
@@ -284,8 +302,15 @@ Rules:
 
 class ClaudeCodeRuntime(SubprocessRuntime):
     name = "claude-code"
-    quota_patterns = ("usage limit reached", "hit your session limit", "hit your weekly limit", "hit your usage limit",
-                      "credit balance is too low")
+    # The CLI's words over its versions (GitHub issues 4658, 9236, 55820; 2026-10): "Claude AI usage limit
+    # reached|<time>", "You've hit your session / weekly / usage limit", "You've hit your limit · resets …",
+    # "You've reached your usage limit …", "Weekly limit reached · Retrying in …", error type
+    # grace_daily_limit_reached; and "Credit balance is too low" (API keys).
+    quota_patterns = ("usage limit reached", "hit your limit", "hit your session limit", "hit your weekly limit",
+                      "hit your usage limit", "reached your usage limit", "weekly limit reached",
+                      "grace_daily_limit_reached", "credit balance is too low")
+    quota_notices = ("claude ai usage limit reached", "usage limit reached", "you've hit your", "you've reached your "
+                     "usage limit", "weekly limit reached", "credit balance is too low")
 
     def start_dir(self, ctx: TaskContext) -> Path:
         return llm_start_dir(ctx)
@@ -364,6 +389,11 @@ class CodexRuntime(SubprocessRuntime):
 
 
 RUNTIMES = {"script": ScriptRuntime, "claude-code": ClaudeCodeRuntime, "codex": CodexRuntime}
+
+
+def _plain(text: str) -> str:
+    """Lower case, typographic apostrophes as plain ones: how the patterns are written."""
+    return text.lower().replace("\u2019", "'")
 
 
 def log_tail(path: str | Path) -> str:

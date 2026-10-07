@@ -87,3 +87,24 @@ def test_an_existing_ledger_gains_the_priority_column(tmp_path):
         assert "priority" in [r["name"] for r in ledger.db.execute("PRAGMA table_info(tasks)")]
     finally:
         ledger.close()
+
+
+async def test_urgent_work_does_not_stop_a_run_that_has_submitted_its_result(tmp_path, blocking):
+    """A normal run has already submitted its result (draft) when urgent work arrives: it should not be run again."""
+    agent, _, ledger, hub, daemon = _node(tmp_path)
+    owned_task(ledger, "T-n", "ACCEPTED", ingest=True)
+    runner = await _running(daemon, agent, "T-n")
+    ledger.update_task("T-n", "owner", result_draft={"status": "complete", "summary": "done"})
+    try:
+        env = Envelope(type="REQUEST", sender="A:sender", to="B:desk", task_id="T-u",
+                                      priority="high", body=request_body("urgent", "test"))
+        ledger.ingest(env)
+        await daemon._handle(agent, env)
+        await asyncio.sleep(0.5)
+        # not stopped: still its one run, no stop noted (_queued holds a task until its run ends)
+        assert [ctx.task_id for ctx in blocking.runs] == ["T-n"] and "T-n" not in daemon._stopped_runs
+        assert not ledger.task("T-n", "owner").get("interrupts")
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        ledger.close()

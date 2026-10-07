@@ -741,7 +741,8 @@ class NodeDaemon:
         (the stopped run is not counted as an attempt; its next run is told why). Urgent behind urgent waits."""
         for task_id, runner in list(self._running.items()):
             task = self.hub.ledger.task(task_id, "owner")
-            if not task or task["owner"] != addr or _urgent(task) or runner.done() or task_id in self._stopped_runs:
+            if (not task or task["owner"] != addr or _urgent(task) or runner.done() or task_id in self._stopped_runs
+                    or task.get("result_draft")):          # it has submitted its result: let it finish
                 continue
             self._note_interrupt(task_id, f"stopped for the urgent task {urgent_id}; carry on from where you were "
                                           "once it is done")
@@ -872,6 +873,10 @@ class NodeDaemon:
             self._mark_unstopped(task_id, spawned)       # its cleanup may have failed too
             await self._run_failed(agent, task_id, attempt, result_body("failed", f"runtime error: {e!r}"))
             return
+        finally:
+            # this daemon has the run's end and reads it now; only a deploy leaves the log to the next daemon
+            if not self._stopping:
+                hub.ledger.update_task(task_id, "owner", run_log=None)
 
         if brain:
             if outcome.exit_code != 0 and ctx.resume:
@@ -1117,14 +1122,18 @@ class NodeDaemon:
         return "child tasks done: " + "; ".join(lines)
 
     def _stop_jobs(self, task_id: str) -> None:
-        """A cancelled task's background jobs: a job whose process still runs gets SIGTERM (that pid only, R4.1);
-        a done-file-only job has no process the node knows and is not stopped. Either way it is closed, so it
-        wakes nobody."""
+        """A cancelled task's background jobs: a job whose process still runs gets SIGTERM: its whole process group
+        when it leads one (start_job's shell and the command under it), else that pid only (R4.1). A done-file-only
+        job has no process the node knows and is not stopped. Either way it is closed, so it wakes nobody."""
         for job in self.hub.ledger.jobs(task_id):
             ended = "cancelled with its task"
             if job["pid"] and same_process(job["pid"], job["pid_start"]):
-                os.kill(job["pid"], signal.SIGTERM)
-                ended += f"; SIGTERM sent to pid {job['pid']}"
+                if os.getpgid(job["pid"]) == job["pid"]:
+                    os.killpg(job["pid"], signal.SIGTERM)
+                    ended += f"; SIGTERM sent to its process group {job['pid']}"
+                else:
+                    os.kill(job["pid"], signal.SIGTERM)
+                    ended += f"; SIGTERM sent to pid {job['pid']}"
             elif job["children"]:
                 ended += "; its open child tasks are cancelled"
             elif not job["pid"]:
@@ -1387,6 +1396,7 @@ class NodeDaemon:
             return False
         runtime = make_runtime(agent, self.cfg)
         tail = log_tail(path)
+        self.hub.ledger.update_task(task["task_id"], "owner", run_log=None)      # read once
         if why := runtime.quota(RunOutcome(-1, tail, log_path=path)):
             await self._hold_for_quota(task["task_id"], why)
             return True
