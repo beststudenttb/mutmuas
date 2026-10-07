@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -306,6 +307,11 @@ async def cmd_session(args, hub: Hub):
 
 
 async def cmd_job(args, hub: Hub):
+    if args.action == "start":
+        if not args.command or not args.note:
+            raise SystemExit("job start needs --note and the command after --")
+        return _print(await tools.start_job(hub, _me(args), shlex.join(args.command), args.note, task_id=args.task),
+                      args.json)
     _print(await tools.add_job(hub, _me(args), args.task, pid=args.pid, done_file=args.done_file, log=args.log,
                                note=args.note, children=args.children), args.json)
 
@@ -735,8 +741,10 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p = add("session", cmd_session, "my session: off = online but takes no work (the worker does); on = back",
             bus=False)
     p.add_argument("action", choices=["off", "on"])
-    p = add("job", cmd_job, "register a background job my task waits on; the node wakes me when it ends", bus=False)
-    p.add_argument("action", choices=["add"])
+    p = add("job", cmd_job, "start (or register) a background job my task waits on; the node wakes me when it ends",
+            bus=False)
+    p.add_argument("action", choices=["start", "add"],
+                   help="start: run the command after -- on its own and wait on it; add: register one already running")
     p.add_argument("--task", help="default: $MUTMUAS_TASK_ID (inside a worker run)")
     p.add_argument("--pid", type=int, help="ends when this process is gone (same machine)")
     p.add_argument("--done-file", help="ends when this file appears (write the exit code into it)")
@@ -744,6 +752,7 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--note", help="one line: what runs, and what to do when it ends")
     p.add_argument("--children", action="store_true",
                    help="wait on this task's child tasks instead (ends when each is done, refused or overdue)")
+    p.add_argument("command", nargs="*", help="(start) the command and its arguments, after --")
     p = add("submit-result", cmd_submit, "finish a task I own", bus=False)
     p.add_argument("--task")
     p.add_argument("--status", choices=["complete", "partial", "failed"])

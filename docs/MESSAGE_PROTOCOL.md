@@ -85,8 +85,12 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   to the post's `worker-log.md` (`time | from | task | output / to whom | how | notes`), taking `how` and `notes`
   from the RESULT ('未填' when missing). If the post's `PLAN.md` has a heading naming the task id, that section goes
   into `outputs.plan` and off the board. Notices closed by being read (`reply: none`) are not logged.
-- **Long jobs** (D-050): the owner of a task registers a background job it waits on (`agentctl job add --pid
-  <pid> --done-file <path> --log <path> --note <line>`, or the MCP `add_job`). The task becomes WAITING, and a worker
+- **Long jobs** (D-050, D-104): the owner of a task starts a long command as a job with the MCP `start_job` (or
+  `agentctl job start --note <line> -- <command>`): it runs on its own session (the end or stop of the run that
+  started it, or of the daemon, leaves it alone), its output goes to `runs/jobs/<task>.<time>.log`, its exit code
+  to a done-file. Only a post with RUN_EXPERIMENT (what gives its workers a shell) may start one. A job already
+  running can be registered instead (`agentctl job add --pid <pid> --done-file <path> --log <path> --note
+  <line>`, or the MCP `add_job`). The task becomes WAITING, and a worker
   may end its run without a result: it is neither finished nor retried, and a restart leaves it alone. Each
   heartbeat checks every open job; a job has ended when its process is gone (same machine; the exit code is not
   known, so write it into the done-file) or its done-file exists. When the task's last job ends, a worker's task is

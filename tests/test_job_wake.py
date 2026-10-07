@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import sys
 
+import pytest
+
 from conftest import Orphan, auto_worker_node, owned_task
 
 from mutmuas import cli, tools
@@ -129,7 +131,7 @@ def test_the_resumed_worker_is_told_how_its_jobs_ended(tmp_path):
 
     from mutmuas.runtime import worker_prompt
     _, ctx, _ = _claude_ctx(tmp_path)
-    assert "add_job" in worker_prompt(ctx) and "nohup" in worker_prompt(ctx)
+    assert "start_job" in worker_prompt(ctx) and "add_job" in worker_prompt(ctx)
     ctx.jobs = [{"job_id": 1, "note": "training", "ended": "process 42 ended", "log": "/tmp/train.log"}]
     prompt = worker_prompt(ctx)
     assert "job 1 (training): process 42 ended; log /tmp/train.log" in prompt and "PLAN.md" in prompt
@@ -308,4 +310,46 @@ async def test_named_next_wakes_a_blocked_worker_task_with_a_job(tmp_path):
         assert "T-j" in daemon._queued["B:desk"], ledger.task("T-j", "owner")["status"]   # ... so it must run
     finally:
         job.terminate()
+        ledger.close()
+
+
+async def test_start_job_runs_the_command_detached_and_registers_it(tmp_path):
+    """D-104 item 1: the agent only starts a long job; the job lives on its own (its own session, so stopping the
+    run's process group leaves it alone) and its end wakes the task with the exit code."""
+    import os
+    _, ledger, daemon = _node(tmp_path, permissions=["READ", "REQUEST_TASK", "RUN_EXPERIMENT"])
+    owned_task(ledger, "T-j", "RUNNING", ingest=True)
+    try:
+        out = await tools.start_job(daemon.hub, "B:desk", "echo training; sleep 0.3; exit 3", note="training",
+                                    task_id="T-j")
+        assert out["state"] == "WAITING" and os.getsid(out["pid"]) == out["pid"] != os.getsid(0)
+        [row] = ledger.jobs("T-j")
+        assert row["pid"] == out["pid"] and row["note"] == "training" and row["log"] == out["log"]
+        for _ in range(100):
+            if os.path.exists(out["done_file"]):
+                break
+            await asyncio.sleep(0.05)
+        await asyncio.sleep(0.1)
+        assert open(out["done_file"]).read().strip() == "3" and "training" in open(out["log"]).read()
+        await daemon._check_jobs()
+        assert ledger.jobs("T-j") == [] and "T-j" in daemon._queued["B:desk"]        # the task is woken
+    finally:
+        ledger.close()
+
+
+def test_agentctl_job_start_takes_the_command_after_a_double_dash():
+    args = cli.agentctl_parser().parse_args(["job", "start", "--note", "train", "--", "python", "train.py", "--lr",
+                                             "3e-4"])
+    assert args.action == "start" and args.command == ["python", "train.py", "--lr", "3e-4"] and args.note == "train"
+
+
+async def test_start_job_needs_the_permission_that_grants_a_shell(tmp_path):
+    """start_job runs a shell command: a post without RUN_EXPERIMENT (no Bash for its workers) may not."""
+    _, ledger, daemon = _node(tmp_path, mode="interactive")             # default permissions: READ, REQUEST_TASK
+    owned_task(ledger, "T-j", "RUNNING", ingest=True)
+    try:
+        with pytest.raises(PermissionError, match="RUN_EXPERIMENT"):
+            await tools.start_job(daemon.hub, "B:desk", f"touch {tmp_path / 'ran'}", note="x", task_id="T-j")
+        assert ledger.jobs("T-j") == [] and not (tmp_path / "ran").exists()
+    finally:
         ledger.close()

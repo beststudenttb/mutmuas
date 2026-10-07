@@ -11,6 +11,8 @@ import asyncio
 import functools
 import re
 import os
+import shlex
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -372,6 +374,31 @@ async def accept_task(hub: Hub, me: str, task_id: str, eta: str | None = None) -
         hub.ledger.update_task(task_id, "owner", eta=eta)
     ok = await hub.owner_transition(task_id, "RUNNING", body["message"], msg_type="ACK", body=body)
     return {"task_id": task_id, "accepted": ok, **({"eta": eta} if eta else {})}
+
+
+async def start_job(hub: Hub, me: str, command: str, note: str, task_id: str | None = None,
+                    cwd: str | None = None) -> dict[str, Any]:
+    """Start a long job and let the task wait on it (D-104): the command runs on its own (its own session, so the
+    end or stop of the run that started it, or of the daemon, leaves it alone), its output goes to a log under the
+    node's runs/jobs, and its exit code to a done-file. The node wakes the task when it ends."""
+    task_id = task_id or _current_task()
+    if not task_id:
+        raise ValueError("task_id is required outside of a delegated task")
+    addr, agent = hub.local_agent(me)
+    if not agent.has("RUN_EXPERIMENT"):                 # a shell command: what grants this post's workers Bash
+        raise PermissionError(f"{addr} lacks RUN_EXPERIMENT permission: it may not start commands")
+    _check_actor(hub, _owned(hub, me, task_id))            # refused before anything starts
+    jobs = hub.cfg.data_path / "runs" / "jobs"
+    jobs.mkdir(parents=True, exist_ok=True)
+    stem = jobs / f"{task_id}.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
+    log, done = f"{stem}.log", f"{stem}.done"
+    # a subshell, so an `exit` in the command still leaves its exit code in the done-file
+    script = f"(\n{command}\n)\necho $? > {shlex.quote(done)}.tmp && mv {shlex.quote(done)}.tmp {shlex.quote(done)}\n"
+    with open(log, "wb") as out:
+        proc = subprocess.Popen(["/bin/sh", "-c", script], cwd=cwd or os.getcwd(), stdin=subprocess.DEVNULL,
+                                stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+    job = await add_job(hub, me, task_id, pid=proc.pid, done_file=done, log=log, note=note)
+    return {**job, "pid": proc.pid, "log": log, "done_file": done}
 
 
 async def add_job(hub: Hub, me: str, task_id: str | None = None, pid: int | None = None,

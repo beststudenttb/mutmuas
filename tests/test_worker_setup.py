@@ -294,6 +294,6 @@ def test_the_worker_prompt_sends_long_commands_to_the_background(tmp_path):
     is never run in the foreground of a worker run; Claude Code's own settings are left alone."""
     _, ctx, _ = _claude_ctx(tmp_path)
     prompt = worker_prompt(ctx)
-    assert "longer than 10 minutes" in prompt and "add_job" in prompt and "foreground" in prompt
+    assert "longer than 10 minutes" in prompt and "start_job" in prompt and "foreground" in prompt
     ctx.node.background_after_min = 30
     assert "longer than 30 minutes" in worker_prompt(ctx)

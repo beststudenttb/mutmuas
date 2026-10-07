@@ -319,6 +319,14 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         return dump(await tools.report_progress(hub(), state["me"], message, task_id, state_, next=next, eta=eta))
 
     @server.tool()
+    async def start_job(command: str, note: str, task_id: str | None = None, cwd: str | None = None) -> str:
+        """Start a long command (training, a long build or test suite) as a background job of your task and wait
+        on it: it runs on its own (ending or stopping your run does not stop it), output in a log, exit code in a
+        done-file. Then end your run without a result: the node wakes you when the job ends. note: one line on
+        what runs and what to do next."""
+        return dump(await tools.start_job(hub(), state["me"], command, note, task_id=task_id, cwd=cwd))
+
+    @server.tool()
     async def add_job(pid: int | None = None, done_file: str | None = None, log: str | None = None,
                       note: str | None = None, task_id: str | None = None, children: bool = False) -> str:
         """Register a background job (e.g. training, started detached) your task waits on. The task becomes
