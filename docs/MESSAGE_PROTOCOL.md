@@ -117,9 +117,9 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   "project": "visualrl", ...}`. `agentctl status` shows both.
 - **Held up** (D-108): the card carries `stuck: true` (a boolean) and `stuck_reason` (a string: the kinds, comma
   separated, in this order: `blocked` a task the post owns is BLOCKED; `quota` one waits for the usage limit;
-  `delivery` a message it sent keeps failing to go out; `worker` its last two runs failed with nothing finished
-  since). Never a task id or content. Both keys are absent when nothing holds it up. Example: `{"stuck": true,
-  "stuck_reason": "blocked,delivery"}`.
+  `delivery` a message it sent has failed to go out for 5 minutes; `worker` runs of two or more different tasks
+  failed within the hour with nothing finished since). Never a task id or content. Both keys are absent when
+  nothing holds it up. Example: `{"stuck": true, "stuck_reason": "blocked,delivery"}`.
 - **Waiting for quota** (D-104): a worker run that ends at the vendor account's usage limit (the vendor CLI's own
   words, e.g. Claude's "usage limit reached", Codex's `usage_limit_reached`, or a line `MUTMUAS_QUOTA: <what>`
   from any runtime or script) does not fail its task: the task waits, paused with `wait_reason: quota` (in the

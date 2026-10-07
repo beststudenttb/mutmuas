@@ -631,8 +631,8 @@ class Ledger:
     def stuck_reasons(self, local_agent: str) -> list[str]:
         """Why this post is really held up (D-108), as kinds only: "blocked" (a task it owns is BLOCKED), "quota"
         (one waits for the account's usage limit), "delivery" (a message it sent has failed to go out for 5
-        minutes), "worker" (its last two runs failed on two different tasks within the hour, nothing finished
-        since: the worker itself, not one task's trouble)."""
+        minutes), "worker" (runs of two or more different tasks failed within the hour, nothing finished since:
+        the worker itself, not one task's trouble)."""
         reasons = []
         if self.db.execute("SELECT 1 FROM tasks WHERE role='owner' AND local_agent=? AND status='BLOCKED'",
                            (local_agent,)).fetchone():
@@ -649,10 +649,9 @@ class Ledger:
             reasons.append("delivery")
         done = self.db.execute("SELECT MAX(updated_at) FROM tasks WHERE role='owner' AND local_agent=?"
                                " AND status='COMPLETED'", (local_agent,)).fetchone()[0] or ""
-        failed = [tuple(r) for r in self.db.execute("SELECT at, task_id FROM failures WHERE stage='run' AND address=?"
-                                                     " ORDER BY rowid DESC LIMIT 2", (local_agent,))]
         since = max(done, (now - timedelta(hours=1)).isoformat())
-        if len(failed) == 2 and failed[0][1] != failed[1][1] and all(at > since for at, _ in failed):
+        if self.db.execute("SELECT COUNT(DISTINCT task_id) FROM failures WHERE stage='run' AND address=? AND at > ?",
+                           (local_agent, since)).fetchone()[0] >= 2:
             reasons.append("worker")
         return reasons
 

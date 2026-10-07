@@ -210,3 +210,19 @@ async def test_a_new_session_does_not_inherit_the_old_ones_busy(tmp_path):
     finally:
         ledger.close()
 
+
+async def test_a_broken_worker_two_tasks_each_failing_twice_shows_stuck(tmp_path):
+    """B:ops S1b (probe p3): a failed run is tried again before new work, so a broken worker's last two failures are
+    one task's; two different tasks failing within the hour, nothing finished, is the worker itself."""
+    agent, _, ledger, hub, daemon = auto_worker_node(tmp_path)
+    try:
+        for task_id in ("T-a", "T-b"):
+            owned_task(ledger, task_id, "ACCEPTED", ingest=True)
+            for attempt in (1, 2):
+                ledger.record_failure("run", "runtime error: claude not found", address="B:desk", task_id=task_id,
+                                      attempt=attempt)
+            ledger.update_task(task_id, "owner", status="FAILED")
+        assert (await _card(daemon)).get("stuck_reason") == "worker"
+    finally:
+        ledger.close()
+
