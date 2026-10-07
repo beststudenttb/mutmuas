@@ -1,6 +1,6 @@
 """Write a ledger and a set of messages with the mutmuas found on PYTHONPATH, for the compatibility test (D-104):
 `PYTHONPATH=<that version>/src python tests/compat/make_fixtures.py <out dir>` writes <out>/ledger.sql (an SQLite
-dump) and <out>/envelopes.json. Uses only what every version since 8bc01bb has."""
+dump) and <out>/envelopes.json. Uses only what every version since 8bc01bb has (fixtures: tests/compat/<the version that wrote them>)."""
 
 from __future__ import annotations
 

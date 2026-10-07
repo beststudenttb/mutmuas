@@ -23,7 +23,7 @@ from mutmuas.ledger import Ledger
 from mutmuas.node import NodeDaemon
 from mutmuas.protocol import Envelope, request_body
 
-PREVIOUS = "8bc01bb"                                   # the version exp/flow builds on (deployed as claude)
+PREVIOUS = "db50415"                                   # the version deployed now (exp/flow merged into claude)
 FIXTURES = Path(__file__).parent / "compat" / PREVIOUS
 REPO = Path(__file__).parents[1]
 
@@ -43,7 +43,7 @@ async def test_this_code_works_on_the_previous_versions_ledger(tmp_path):
     try:
         task = ledger.task("T-compat-1", "owner")
         assert task["status"] == "WAITING" and task["paused"] and task["interrupts"] == ["hold on"]
-        assert task["priority"] == "normal" and task["wait_reason"] is None and task["run_log"] is None
+        assert task["priority"] == "high" and task["wait_reason"] is None and task["run_log"] is None
         assert task["request"]["leader"] is True       # still urgent: the leader's work counts as high
         assert [j["note"] for j in ledger.jobs("T-compat-1")] == ["training"]
         assert [e.task_id for e in ledger.outbox()] == ["T-compat-3"]
