@@ -4,6 +4,7 @@ lists every such task at once and resumes them when the account is back (one acc
 
 from __future__ import annotations
 
+import asyncio
 import sys
 
 from conftest import Orphan, owned_task
@@ -26,8 +27,13 @@ async def test_a_run_stopped_by_the_usage_limit_leaves_its_task_waiting_and_its_
     owned_task(ledger, "T-q", "ACCEPTED", ingest=True)
     job = Orphan("import time; time.sleep(30)")
     ledger.add_job("T-q", "B:desk", job.pid, proc_start(job.pid), None, None, "training")
+    daemon._enqueue("B:desk", "T-q")
+    runner = asyncio.create_task(daemon._runner(agent, "B:desk", daemon._queues["B:desk"]))    # as a run goes
     try:
-        await daemon._execute(agent, "T-q")
+        for _ in range(100):
+            if ledger.task("T-q", "owner")["status"] == "WAITING":
+                break
+            await asyncio.sleep(0.05)
         task = ledger.task("T-q", "owner")
         assert task["status"] == "WAITING" and task["paused"] and task["wait_reason"] == "quota"
         assert task["attempts"] == 0 and task["result"] is None                   # not a failed run
@@ -35,6 +41,8 @@ async def test_a_run_stopped_by_the_usage_limit_leaves_its_task_waiting_and_its_
         assert job.poll() is None and ledger.jobs("T-q")                          # its job runs on
         assert not daemon._retry and "T-q" not in daemon._queued["B:desk"]
     finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
         job.kill()
         ledger.close()
 

@@ -910,13 +910,17 @@ class NodeDaemon:
         """D-104: the run stopped at the account's usage limit. The task waits, paused with wait_reason "quota",
         until the secretary resumes it (one account: back for everyone); the run is not counted as an attempt, and
         its jobs are not touched."""
-        task = self.hub.ledger.task(task_id, "owner")
-        self.hub.ledger.update_task(task_id, "owner", paused=1, wait_reason="quota",
-                                    attempts=max(0, task["attempts"] - 1))
+        self.hub.ledger.update_task(task_id, "owner", paused=1, wait_reason="quota")
         self._note_interrupt(task_id, f"your previous run stopped at the account's usage limit ({short(why, 160)}); "
                                       "the task was resumed once it was back: carry on from where you were")
         log.warning("task %s waits for quota: %s", task_id, why)
-        await self._settle(task_id, f"waiting for quota: the account's usage limit was reached ({short(why, 160)})")
+        settled = f"waiting for quota: the account's usage limit was reached ({short(why, 160)})"
+        if task_id in self._running:
+            self._stopped_runs[task_id] = settled         # the runner lets go of it, uncounted, and settles it
+            return
+        task = self.hub.ledger.task(task_id, "owner")      # a run adopted after a deploy: settled here
+        self.hub.ledger.update_task(task_id, "owner", attempts=max(0, task["attempts"] - 1))
+        await self._settle(task_id, settled)
 
     async def _run_failed(self, agent: AgentConfig, task_id: str, attempt: int, body: dict[str, Any],
                           refs: list[ArtifactRef] | None = None) -> None:
