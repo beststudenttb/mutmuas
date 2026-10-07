@@ -51,6 +51,16 @@ data:
     artifacts: {required: true, label: 附件}
     note: {required: true, label: "说明(是什么, 放到对方哪个位置)"}
 
+relay:
+  name: 转达
+  tool: send_relay
+  cli: null
+  title: "【转达】{words}"
+  fields:
+    words: {required: true, label: leader 原话(一字不改)}
+    understanding: {required: true, label: 我的理解(请纠正)}
+    ask: {required: true, label: 要谁回什么}
+
 # ---- 回执 (receipts) ---------------------------------------------------------------------------------------------
 receipt:
   name: 收到

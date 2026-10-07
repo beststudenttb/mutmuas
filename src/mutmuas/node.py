@@ -899,6 +899,8 @@ class NodeDaemon:
             # this daemon has the run's end and reads it now; only a deploy leaves the log to the next daemon
             if not self._stopping:
                 hub.ledger.update_task(task_id, "owner", run_log=None)
+                if agent.mode == "worker":
+                    hub.ledger.mark_seen(task_id, task["owner"])  # D-111: a post with workers only has nobody to read it
 
         if brain:
             if outcome.exit_code != 0 and ctx.resume:

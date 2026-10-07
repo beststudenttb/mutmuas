@@ -13,7 +13,7 @@ from mutmuas.ledger import Ledger
 
 LETTER_TOOLS = {"send_request", "send_notice", "send_data", "submit_result", "accept_task", "reject_task",
                 "ask_question", "answer_question", "chase_task", "report_progress", "control_task", "remind_me",
-                "accept_delivery", "withdraw_delivery"}
+                "accept_delivery", "withdraw_delivery", "send_relay"}
 
 
 def _sent(ledger, type_):
@@ -115,5 +115,25 @@ async def test_data_and_a_chase_go_on_the_task(tmp_path):
         assert chase.to == "C:far" and chase.body["next"] == "C:far" and chase.body["title"] == "【催交】train it"
         with pytest.raises(PermissionError):
             await tools.chase_task(hub, "B:desk", "T-1")                  # not one it requested
+    finally:
+        ledger.close()
+
+
+async def test_a_relay_carries_the_leaders_words_the_relayers_understanding_and_who_answers(tmp_path, monkeypatch):
+    """D-111: C:claude passes on the leader's word: his exact words, its own understanding (to be corrected), and
+    who should answer what. It is the leader's (leader: true); the reply needs no acceptance."""
+    server, ledger = await _server(tmp_path, monkeypatch)
+    try:
+        async with server.settings.lifespan(server):
+            text = await _call(server, "send_relay", {"to": "B:secretary", "words": "切"})
+            assert "understanding" in text and "ask" in text and ledger.outbox() == []
+            text = await _call(server, "send_relay", {"to": "B:secretary", "words": "切",
+                                                      "understanding": "switch the run to the new env",
+                                                      "ask": "B:secretary: confirm and give it a D number"})
+            [relay] = _sent(ledger, "REQUEST")
+            assert relay.body["title"] == "【转达】切" and relay.body["leader"] is True
+            assert relay.body["inputs"] == {"words": "切", "understanding": "switch the run to the new env",
+                                            "ask": "B:secretary: confirm and give it a D number"}
+            assert "acceptance" not in relay.body
     finally:
         ledger.close()

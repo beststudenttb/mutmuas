@@ -390,6 +390,13 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
                                             kind=kind if kind in ("notice", "patrol") else "notice"))
 
     @server.tool()
+    async def send_relay(to: str, words: str, understanding: str = "", ask: str = "") -> str:
+        """转达: pass on the leader's word: words (his exact words, unchanged), understanding (yours, for them to
+        correct), ask (who should answer what). It goes as the leader's (first in their queue)."""
+        letters.check("relay", {"words": words, "understanding": understanding, "ask": ask})
+        return dump(await tools.send_relay(hub(), state["me"], to, words, understanding, ask))
+
+    @server.tool()
     async def send_data(to: str, artifacts: list[dict[str, Any]], note: str, task_id: str | None = None) -> str:
         """数据: hand someone artifacts (references from publish_artifact) with a note on what they are and where
         they go; on a task (task_id) or on their own."""

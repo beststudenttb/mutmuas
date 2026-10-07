@@ -292,7 +292,8 @@ Rules:
    one-line note; it runs on its own, its output goes to a log and its exit code to a done-file), note in
    PLAN.md what you wait for, and end this run without submit_result. You are started again when the job ends,
    told how it ended; a run that ends or is stopped meanwhile does not stop the job. (A process you started
-   yourself, detached, can be registered with add_job instead.)
+   yourself, detached, can be registered with add_job instead.) Your Bash tool stops a foreground command after 2
+   minutes unless you give it a timeout (at most 10 minutes): past 2 minutes set one; past 10 use start_job.
 8. Parts you delegate with send_request are this task's child tasks (parent_task is set for you). To wait for
    them, call add_job(children=True) and end this run without submit_result: you are started again once
    each has a result, was refused or cancelled, or is past its deadline, and told how each ended. Wait on

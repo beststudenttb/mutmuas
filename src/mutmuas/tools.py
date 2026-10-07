@@ -526,6 +526,16 @@ async def send_notice(hub: Hub, me: str, to: str, text: str, *, priority: str = 
     return await _send_request(hub, me, to, body, artifacts=None, parent_task=None, priority=priority, project=None)
 
 
+async def send_relay(hub: Hub, me: str, to: str, words: str, understanding: str, ask: str) -> dict[str, Any]:
+    """转达 (D-111): pass on the leader's word: his exact words, the relayer's understanding (to be corrected), and
+    who should answer what. It is the leader's (leader: true); the answer comes back as is (no acceptance)."""
+    text = f"leader 原话:「{words}」\n我的理解(请纠正):{understanding}\n要谁回什么:{ask}"
+    body = request_body(text, letters.TEMPLATES["relay"]["name"], inputs={"words": words,
+                        "understanding": understanding, "ask": ask}, leader=True)
+    body["title"] = letters.title("relay", {"words": words})
+    return await _send_request(hub, me, to, body, artifacts=None, parent_task=None, priority="normal", project=None)
+
+
 async def send_data(hub: Hub, me: str, to: str, artifacts: list[dict], note: str,
                     task_id: str | None = None) -> dict[str, Any]:
     """数据 (D-109): artifacts with a note on what they are and where they go. On a task: an UPDATE to its other
