@@ -195,6 +195,10 @@ none). They map to `claude -p --max-turns` / `--max-budget-usd`; Codex has no eq
 bounded by `task_timeout_s` only. A run stopped at a limit without a result counts as a failed run (recorded,
 laid out once more, then failed).
 
+Long commands (D-104): a worker's prompt tells it to run any command it expects to take longer than
+`background_after_min` minutes (top level of node.yaml, default 10) as a background job (detached, registered with
+add_job), never in the foreground of its run. Claude Code's own settings are not changed for this.
+
 Runtime notes:
 - `claude-code` runs `claude -p` with only the mutmuas MCP server (`--strict-mcp-config`) and the tools
   allowed by the agent's permissions (ARCHITECTURE_V1 §5). `extra_args` are appended to the command line.
@@ -344,6 +348,23 @@ unless that id is configured, and the directory back from its archive unless som
 says so); then start the node. What is on disk decides, so a run that stopped midway is undone too. Refused and
 withdrawn tasks stay so.
 
+## 8c. Deploying without stopping work (D-104)
+
+A deploy restarts the daemon on the new code; it does not stop the work in progress (as nginx reloads):
+- Stopping the daemon leaves its runs running: each run and each job has its own session, and its output goes to
+  its own log, not through the daemon. The service stops the daemon alone: the systemd unit has
+  `KillMode=process`, the launchd plist `AbandonProcessGroup` (measured on macOS 2026-10-07: after `launchctl
+  bootout` a child in its own session lives on even without it; with it, a child in the job's group does too).
+  Units written before D-104 must be written again once (`agent-node service --write`) as part of a deploy.
+- The new daemon takes new work, adopts each run it finds still going (recover), and when it ends delivers its
+  result (the draft it submitted, or what it printed), or runs the task again if it left none.
+- Old and new code work side by side meanwhile: runs finish on the code they started with (a process loads all of
+  mutmuas when it starts), the ledger and the messages only ever gain fields and columns (ledger.ADDED_COLUMNS),
+  never lose or change one. tests/test_compat.py checks both ways against the previous version: this code on its
+  ledger and messages (fixtures it wrote, tests/compat/<sha>/, made with tests/compat/make_fixtures.py), and its
+  code (from git) on this code's, its daemon included (a rollback). After each deploy, regenerate the fixtures
+  with the version now running and move PREVIOUS to it.
+
 ## 8a. Supervision and known risks
 
 Errors are skipped and recorded rather than defended against (D-039, D-040); patches follow once the records
@@ -357,6 +378,18 @@ show a pattern.
 - **Background loops** (heartbeat, receive, handle, outbox, notify, follow-ups) record their errors and carry on.
 
 Known risks (protections removed on purpose; one line each):
+
+- Any process of the same user on a node can report another post's activity there (`agentctl activity busy --as
+  <post>`), as with `session off|on`: the same trust model (one user per node). It changes only what the card
+  shows (state, activity, find_agent's order), nothing about work, leases or tasks.
+
+- A run adopted after a deploy is no longer bound by its task_timeout_s: the new daemon waits for it to end
+  (a control or a cancel still stops it).
+- A deploy that lands while the daemon is creating a run's process can leave a process whose pid was not yet
+  recorded: the new daemon does not see it and runs the task again beside it.
+
+- The usage limit is recognised by the vendor CLI's own wording (runtime.py quota_patterns): if a vendor changes
+  it, such a run counts as an ordinary failed run (laid out once more, then failed) until the pattern is added.
 
 - An old worker's children that outlive their leader after a daemon crash are not looked for; a retry can run
   next to them.

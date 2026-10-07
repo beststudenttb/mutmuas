@@ -49,6 +49,8 @@ class TaskContext:
     resume: str | None = None            # a brain batch's conversation to continue (D-073)
     interrupts: list[str] = field(default_factory=list)   # what interrupted the previous run (D-089)
     session_id: str | None = None        # a new brain conversation's id, chosen by the node before the run
+    run_log: str | None = None           # this run's log (its output too), set as it starts
+    handing_over: Any = None             # () -> True while the daemon stops for a deploy: the run is left running
 
     @property
     def home(self) -> Path:
@@ -96,8 +98,40 @@ class RunOutcome:
     limit: str | None = None                   # the run was stopped at a worker limit (e.g. "error_max_turns")
 
 
+# Any runtime or script may say its run stopped at the account's usage limit with a line "<marker> <what>" (D-104)
+QUOTA_SIGNAL = "MUTMUAS_QUOTA:"
+
+
 class SubprocessRuntime:
     name = "subprocess"
+    # How this runtime's vendor CLI itself says the account's usage limit was reached. Only the vendor's own words:
+    # a task's own errors ("Disk quota exceeded", another API's 429) are not the account's limit.
+    quota_patterns: tuple[str, ...] = ()
+
+    # What a run's whole output starts with when it ended at the limit and still exited 0: then only a short output
+    # that starts with one counts (a run that worked may mention a usage limit anywhere).
+    quota_notices: tuple[str, ...] = ()
+
+    def quota(self, outcome: RunOutcome) -> str | None:
+        """What says this run stopped at the account's usage limit, or None (D-104 item 1)."""
+        text = (outcome.output_tail or "") + "\n" + (log_tail(outcome.log_path) if outcome.log_path else "")
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        for line in lines:
+            if line.startswith(QUOTA_SIGNAL):
+                return line[len(QUOTA_SIGNAL):].strip() or "usage limit reached"
+        cli = _last_json(outcome.output_tail or "") or {}
+        if cli.get("type") == "result" and cli.get("is_error") is False:
+            return None                     # the CLI itself says the run worked, whatever its answer quotes
+        failed = (outcome.exit_code != 0 or (outcome.result or {}).get("is_error") or cli.get("type") == "error")
+        if failed:
+            for line in lines:
+                if any(p in _plain(line) for p in self.quota_patterns):
+                    return line[:300]
+        elif len((outcome.output_tail or "").strip()) <= 400:
+            head = _plain(outcome.output_tail or "").lstrip("{\"' ")
+            if any(head.startswith(n) for n in self.quota_notices):
+                return (outcome.output_tail or "").strip()[:300]
+        return None
 
     def __init__(self, agent: AgentConfig, node: NodeConfig):
         self.agent = agent
@@ -122,33 +156,29 @@ class SubprocessRuntime:
         workdir = self.start_dir(ctx)
         workdir.mkdir(parents=True, exist_ok=True)
         log.info("task %s: starting %s in %s", ctx.task_id, argv[0], workdir)
-        with open(log_path, "wb") as logf:
+        # Its input is a file written in full before it starts and its output goes straight into its log: nothing
+        # passes through a pipe to this daemon, so the run neither starts with half its prompt nor stops when the
+        # daemon is replaced (D-104).
+        input_path = runs / f"{ctx.task_id}.{stamp}.attempt{ctx.attempt}.input"
+        input_path.write_bytes(stdin or b"")
+        with open(log_path, "wb") as logf, open(input_path, "rb") as inp:
             logf.write(f"$ {' '.join(argv)}\n".encode())
             logf.flush()
+            ctx.run_log = str(log_path)
             proc = await asyncio.create_subprocess_exec(
-                *argv, cwd=str(workdir), env=ctx.env(), stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE, stderr=logf, start_new_session=True)
+                *argv, cwd=str(workdir), env=ctx.env(), stdin=inp, stdout=logf, stderr=logf, start_new_session=True)
             if ctx.on_spawn:
                 ctx.on_spawn(proc.pid)
-            tail = bytearray()
             try:
-                # a command that does not read its input may close it first: not an error, its exit code says how it
-                # went
-                with contextlib.suppress(BrokenPipeError, ConnectionResetError):
-                    if stdin is not None:
-                        proc.stdin.write(stdin)
-                        await proc.stdin.drain()
-                    proc.stdin.close()
-                while chunk := await proc.stdout.read(65536):
-                    logf.write(chunk)
-                    logf.flush()
-                    tail.extend(chunk)
-                    del tail[:-TAIL_BYTES]
                 code = await proc.wait()
-            except BaseException:          # timeout, cancel, shutdown: never leave orphans behind
-                await _kill_group(proc)
+                input_path.unlink(missing_ok=True)      # it holds the task's content: gone with the run
+            except BaseException:
+                if ctx.handing_over and ctx.handing_over():
+                    raise                  # the daemon is being replaced: the run goes on; the next one adopts it
+                await _kill_group(proc)    # timeout, a control's stop: never leave orphans behind
+                input_path.unlink(missing_ok=True)
                 raise
-        outcome = self.parse(ctx, code, tail.decode(errors="replace"))
+        outcome = self.parse(ctx, code, log_tail(log_path))
         outcome.log_path = str(log_path)
         return outcome
 
@@ -228,7 +258,7 @@ REQUEST:
 Attached artifact references: {json.dumps([a.to_dict() for a in req.artifacts], ensure_ascii=False)}
 
 You have the MCP server "mutmuas" with tools: report_progress, publish_artifact, fetch_artifact,
-submit_result, list_agents, find_agent, send_request, wait_for_result, check_task, add_job.
+submit_result, list_agents, find_agent, send_request, wait_for_result, check_task, start_job, add_job.
 {jobs}
 {git_note}
 Rules:
@@ -247,9 +277,12 @@ Rules:
    failed = nothing usable. Never report partial work as complete. List limitations.
 5. If you need something only the requester can provide, say so in follow_up and use status partial or failed.
 6. This task was accepted for you when this run started: do not call accept_task.
-7. Work that runs long (e.g. training): start it detached, `nohup <command> > <log> 2>&1 < /dev/null &`
-   (then `echo $!` is its pid), register it with add_job (pid and/or done_file, log, a one-line note), note in
-   PLAN.md what you wait for, and end this run without submit_result. You are started again when the job ends.
+7. A command you expect to run longer than {ctx.node.background_after_min} minutes (training, a long test suite or
+   build, a big download) never runs in the foreground of this run: start it with start_job (the command, a
+   one-line note; it runs on its own, its output goes to a log and its exit code to a done-file), note in
+   PLAN.md what you wait for, and end this run without submit_result. You are started again when the job ends,
+   told how it ended; a run that ends or is stopped meanwhile does not stop the job. (A process you started
+   yourself, detached, can be registered with add_job instead.)
 8. Parts you delegate with send_request are this task's child tasks (parent_task is set for you). To wait for
    them, call add_job(children=True) and end this run without submit_result: you are started again once
    each has a result, was refused or cancelled, or is past its deadline, and told how each ended. Wait on
@@ -261,6 +294,15 @@ Rules:
 
 class ClaudeCodeRuntime(SubprocessRuntime):
     name = "claude-code"
+    # The CLI's words over its versions (GitHub issues 4658, 9236, 55820; 2026-10): "Claude AI usage limit
+    # reached|<time>", "You've hit your session / weekly / usage limit", "You've hit your limit · resets …",
+    # "You've reached your usage limit …", "Weekly limit reached · Retrying in …", error type
+    # grace_daily_limit_reached; and "Credit balance is too low" (API keys).
+    quota_patterns = ("usage limit reached", "hit your limit", "hit your session limit", "hit your weekly limit",
+                      "hit your usage limit", "reached your usage limit", "weekly limit reached",
+                      "grace_daily_limit_reached", "credit balance is too low")
+    quota_notices = ("claude ai usage limit reached", "usage limit reached", "you've hit your", "you've reached your "
+                     "usage limit", "weekly limit reached", "credit balance is too low")
 
     def start_dir(self, ctx: TaskContext) -> Path:
         return llm_start_dir(ctx)
@@ -313,6 +355,7 @@ class ClaudeCodeRuntime(SubprocessRuntime):
 
 class CodexRuntime(SubprocessRuntime):
     name = "codex"
+    quota_patterns = ("usage_limit_reached", "hit your usage limit", "out of credits", "insufficient_quota")
 
     def start_dir(self, ctx: TaskContext) -> Path:
         return llm_start_dir(ctx)
@@ -338,6 +381,20 @@ class CodexRuntime(SubprocessRuntime):
 
 
 RUNTIMES = {"script": ScriptRuntime, "claude-code": ClaudeCodeRuntime, "codex": CodexRuntime}
+
+
+def _plain(text: str) -> str:
+    """Lower case, typographic apostrophes as plain ones: how the patterns are written."""
+    return text.lower().replace("\u2019", "'")
+
+
+def log_tail(path: str | Path) -> str:
+    """The end of a run's log (its output and errors), or "" if it cannot be read."""
+    with contextlib.suppress(OSError), open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        f.seek(max(0, f.tell() - TAIL_BYTES))
+        return f.read().decode(errors="replace")
+    return ""
 
 
 def make_runtime(agent: AgentConfig, node: NodeConfig) -> SubprocessRuntime:

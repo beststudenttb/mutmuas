@@ -32,7 +32,7 @@ from typing import Any
 
 from nats.errors import TimeoutError as NatsTimeoutError
 
-from . import __version__
+from . import __version__, tools   # tools imports node as well: looked up when called
 from .bus import Names
 from .config import AgentConfig, NodeConfig
 from .hub import Hub
@@ -40,7 +40,7 @@ from .ids import Address, InvalidAddress, check_token, now_iso, parse_iso
 from .ledger import is_info
 from .protocol import (OPEN_STATES, REQUEST_KINDS, TERMINAL_STATES, ArtifactRef, Envelope, ProtocolError,
                        reply_required, result_body, task_state_for_result)
-from .runtime import TaskContext, group_alive, make_runtime, stop_group
+from .runtime import RunOutcome, TaskContext, group_alive, log_tail, make_runtime, stop_group
 from .visibility import CARD_KEYS, accepts_kinds, acl, short
 from .worktree import GitError, Worktree
 
@@ -140,6 +140,11 @@ def live_worker_runs(ledger, agent: str) -> dict[int, str]:
     return {pid: task_id for pid, start, task_id in ledger.worker_runs(agent) if same_process(pid, start)}
 
 
+def _urgent(task: dict[str, Any]) -> bool:
+    """High priority, or the leader's (D-049): such work goes first (D-104)."""
+    return task.get("priority") == "high" or bool(task["request"].get("leader"))
+
+
 def worker_task(ledger, agent: str | None = None) -> str | None:
     """The task this process works on as a worker: MUTMUAS_TASK_ID, which the daemon sets when it starts a run, if
     that task is this agent's and its worker process still runs (D-102: checked against the ledger, not taken on
@@ -183,6 +188,19 @@ def session_fields(session: dict[str, Any] | None) -> dict[str, Any]:
     if online and session.get("cwd"):
         out["session_cwd"] = session["cwd"]
     return out
+
+
+ACTIVITY_STALE_S = 3600          # a busy report not renewed this long counts as idle: a Stop hook was lost (D-108)
+
+
+def _activity(session: dict[str, Any] | None) -> str | None:
+    """What the session's hooks last reported (busy | idle), a stale busy as idle; None if they never did."""
+    if not session or not session.get("activity"):
+        return None
+    if session["activity"] == "busy" and (
+            datetime.now(timezone.utc) - parse_iso(session["activity_at"])).total_seconds() < ACTIVITY_STALE_S:
+        return "busy"
+    return "idle"
 
 
 def _code_version() -> str:
@@ -263,7 +281,8 @@ class NodeDaemon:
                 delay = min(delay * 2, 30)
 
     async def stop(self) -> None:
-        """Graceful stop: running tasks are interrupted and resumed by recover() next start."""
+        """Graceful stop, e.g. for a deploy (D-104): the runs in progress are left running (their output goes to their
+        own logs); the next daemon adopts them in recover() and delivers each result when it ends."""
         self._stopping = True
         for task in self._tasks:
             task.cancel()
@@ -340,17 +359,13 @@ class NodeDaemon:
                 continue
             if agent.mode != "worker" and not agent.auto_worker:
                 continue
-            if agent.auto_worker:
+            if agent.auto_worker or task["status"] in ("ACCEPTED", "RUNNING"):
+                # its run may have outlived the old daemon (a deploy, D-104): adopted, never run twice
                 await self._recover_auto(task)
                 continue
-            if task["status"] not in ("PENDING", "ACCEPTED", "RUNNING"):
-                continue
-            if task["status"] == "RUNNING":
-                await hub.owner_transition(task["task_id"], "ACCEPTED",
-                                           f"node {self.cfg.node} restarted; task will be resumed")
-            elif task["status"] == "PENDING":
+            if task["status"] == "PENDING":
                 await self._accept(task["task_id"])
-            self._enqueue(task["owner"], task["task_id"])
+                self._enqueue(task["owner"], task["task_id"])
         for task in hub.ledger.tasks(role="owner", limit=500):
             await hub.publish_task_record(task["task_id"])
         await hub.flush_outbox()
@@ -555,8 +570,7 @@ class NodeDaemon:
             # (a requester that adds an observer sends the copies itself: relaying would duplicate them) An observer
             # added them: as the owner, relay the copies, so that a node that never saw the task can check the sender
             # against the task record.
-            from .tools import send_observer_copies
-            self._background_job(send_observer_copies(self.hub, env.to, env.task_id, new))
+            self._background_job(tools.send_observer_copies(self.hub, env.to, env.task_id, new))
         return None
 
     def _failed(self, stage: str, error: BaseException | str, address: str | None = None, task_id: str | None = None,
@@ -669,8 +683,7 @@ class NodeDaemon:
             log.warning("ignored CANCEL of %s from %s: not its requester %s", env.task_id, env.sender,
                         task["requester"])
             return "rejected"
-        from .tools import cancel_children
-        await cancel_children(self.hub, env.task_id, env.body.get("reason") or "cancelled by its requester")
+        await tools.cancel_children(self.hub, env.task_id, env.body.get("reason") or "cancelled by its requester")
         if task["status"] == "PENDING":
             # Withdrawn before anyone picked it up: close it and keep it out of the interactive inbox
             # (both the REQUEST and this CANCEL are noise to someone who never saw the request).
@@ -731,8 +744,23 @@ class NodeDaemon:
             return
         self._queued[addr].add(task_id)
         task = self.hub.ledger.task(task_id, "owner")
-        self._queues[addr].put_nowait((0 if task["request"].get("leader") else 1, task["created_at"],
-                                       next(self._arrivals), task_id))
+        urgent = _urgent(task)
+        self._queues[addr].put_nowait((0 if urgent else 1, task["created_at"], next(self._arrivals), task_id))
+        if urgent:
+            self._make_way(addr, task_id)
+
+    def _make_way(self, addr: str, urgent_id: str) -> None:
+        """D-104: urgent work stops a run of this post that is not urgent; that task is laid out again behind it
+        (the stopped run is not counted as an attempt; its next run is told why). Urgent behind urgent waits."""
+        for task_id, runner in list(self._running.items()):
+            task = self.hub.ledger.task(task_id, "owner")
+            if (not task or task["owner"] != addr or _urgent(task) or runner.done() or task_id in self._stopped_runs
+                    or task.get("result_draft")):          # it has submitted its result: let it finish
+                continue
+            self._note_interrupt(task_id, f"stopped for the urgent task {urgent_id}; carry on from where you were "
+                                          "once it is done")
+            self._stopped_runs[task_id] = f"stopped for the urgent task {urgent_id}; laid out again after it"
+            runner.cancel()
 
     async def _runner(self, agent: AgentConfig, addr: str, queue: asyncio.PriorityQueue) -> None:
         while True:
@@ -819,6 +847,8 @@ class NodeDaemon:
         def on_spawn(pid: int) -> None:
             spawned.append(pid)
             self._record_worker(task_id, pid)
+            hub.ledger.update_task(task_id, "owner", run_log=ctx.run_log)
+        ctx.handing_over = lambda: self._stopping
         ctx.on_spawn = on_spawn
         wt = None
         if request.body.get("kind") == "code" and agent.copies_code:
@@ -833,14 +863,17 @@ class NodeDaemon:
             ctx.workdir, ctx.git_branch = wt.path, wt.branch
         where = f", branch {wt.branch}" if wt else ""
         await hub.owner_transition(task_id, "RUNNING", f"started (attempt {attempt}, runtime {agent.runtime}{where})")
+        runtime = make_runtime(agent, self.cfg)
         try:
-            outcome = await asyncio.wait_for(make_runtime(agent, self.cfg).run(ctx), timeout)
+            outcome = await asyncio.wait_for(runtime.run(ctx), timeout)
         except asyncio.TimeoutError:
             self._mark_unstopped(task_id, spawned)
             await self._run_failed(agent, task_id, attempt, result_body(
                 "failed", f"timed out after {timeout:.0f}s", limitations=["process was killed at the deadline"]))
             return
         except asyncio.CancelledError:
+            if self._stopping:
+                raise                                    # a deploy: the run goes on; the next daemon adopts it
             self._mark_unstopped(task_id, spawned)
             if task_id in self._stopped_runs:
                 return                                   # a control stopped it: the runner settles it
@@ -853,6 +886,10 @@ class NodeDaemon:
             self._mark_unstopped(task_id, spawned)       # its cleanup may have failed too
             await self._run_failed(agent, task_id, attempt, result_body("failed", f"runtime error: {e!r}"))
             return
+        finally:
+            # this daemon has the run's end and reads it now; only a deploy leaves the log to the next daemon
+            if not self._stopping:
+                hub.ledger.update_task(task_id, "owner", run_log=None)
 
         if brain:
             if outcome.exit_code != 0 and ctx.resume:
@@ -862,6 +899,9 @@ class NodeDaemon:
         current = hub.ledger.task(task_id, "owner")
         if current["status"] in TERMINAL_STATES:
             return      # the agent already closed the task through its tools
+        if not current.get("result_draft") and (why := runtime.quota(outcome)):
+            await self._hold_for_quota(task_id, why)      # not a failed run; its jobs run on
+            return
         if hub.ledger.jobs(task_id):
             return      # it waits on a background job it registered: the heartbeat wakes it when the job ends
         if current["status"] == "BLOCKED" and not current.get("result_draft"):
@@ -883,6 +923,22 @@ class NodeDaemon:
         await self._notify(agent, current["owner"], task_id,
                            f"FYI: {current['owner']} finished {task_id} for {current['requester']} "
                            f"({body['status']})")
+
+    async def _hold_for_quota(self, task_id: str, why: str) -> None:
+        """D-104: the run stopped at the account's usage limit. The task waits, paused with wait_reason "quota",
+        until the secretary resumes it (one account: back for everyone); the run is not counted as an attempt, and
+        its jobs are not touched."""
+        self.hub.ledger.update_task(task_id, "owner", paused=1, wait_reason="quota")
+        self._note_interrupt(task_id, f"your previous run stopped at the account's usage limit ({short(why, 160)}); "
+                                      "the task was resumed once it was back: carry on from where you were")
+        log.warning("task %s waits for quota: %s", task_id, why)
+        settled = f"waiting for quota: the account's usage limit was reached ({short(why, 160)})"
+        if task_id in self._running:
+            self._stopped_runs[task_id] = settled         # the runner lets go of it, uncounted, and settles it
+            return
+        task = self.hub.ledger.task(task_id, "owner")      # a run adopted after a deploy: settled here
+        self.hub.ledger.update_task(task_id, "owner", attempts=max(0, task["attempts"] - 1))
+        await self._settle(task_id, settled)
 
     async def _run_failed(self, agent: AgentConfig, task_id: str, attempt: int, body: dict[str, Any],
                           refs: list[ArtifactRef] | None = None) -> None:
@@ -1079,14 +1135,18 @@ class NodeDaemon:
         return "child tasks done: " + "; ".join(lines)
 
     def _stop_jobs(self, task_id: str) -> None:
-        """A cancelled task's background jobs: a job whose process still runs gets SIGTERM (that pid only, R4.1);
-        a done-file-only job has no process the node knows and is not stopped. Either way it is closed, so it
-        wakes nobody."""
+        """A cancelled task's background jobs: a job whose process still runs gets SIGTERM: its whole process group
+        when it leads one (start_job's shell and the command under it), else that pid only (R4.1). A done-file-only
+        job has no process the node knows and is not stopped. Either way it is closed, so it wakes nobody."""
         for job in self.hub.ledger.jobs(task_id):
             ended = "cancelled with its task"
             if job["pid"] and same_process(job["pid"], job["pid_start"]):
-                os.kill(job["pid"], signal.SIGTERM)
-                ended += f"; SIGTERM sent to pid {job['pid']}"
+                if os.getpgid(job["pid"]) == job["pid"]:
+                    os.killpg(job["pid"], signal.SIGTERM)
+                    ended += f"; SIGTERM sent to its process group {job['pid']}"
+                else:
+                    os.kill(job["pid"], signal.SIGTERM)
+                    ended += f"; SIGTERM sent to pid {job['pid']}"
             elif job["children"]:
                 ended += "; its open child tasks are cancelled"
             elif not job["pid"]:
@@ -1138,7 +1198,7 @@ class NodeDaemon:
             if kind == "interrupt":
                 hub.ledger.update_task(task_id, "owner", attempts=0)       # the next run starts afresh
             else:
-                hub.ledger.update_task(task_id, "owner", paused=int(kind == "pause"))
+                hub.ledger.update_task(task_id, "owner", paused=int(kind == "pause"), wait_reason=None)
             self._note_interrupt(task_id, {"pause": "paused by ", "resume": "resumed by "}.get(kind, "") + text)
             why = {"pause": f"paused by {env.sender}", "resume": f"resumed by {env.sender}"}.get(
                 kind, f"interrupted by {env.sender}: the run was stopped and is laid out again with the new message")
@@ -1300,10 +1360,10 @@ class NodeDaemon:
         self.hub.ledger.set_runner_pid(task_id, pid, proc_start(pid))
 
     async def _recover_auto(self, task: dict[str, Any]) -> None:
-        """auto_worker after a restart: deliver the draft its worker submitted, or run the task again. A worker
-        from before the restart that still runs is not stopped: skip it this round, record it once, look again at
-        the next heartbeat (D-040). A PENDING task still claimed by the worker is released for _auto_dispatch; a
-        session's task stays the session's."""
+        """A worker's task after a restart: deliver the draft its run submitted or the result it printed, or run the
+        task again. A run from before the restart that still runs (it outlived a deploy, D-104) is not stopped:
+        skip it this round, record it once, look again at the next heartbeat (D-040). An auto_worker's PENDING task
+        still claimed by the worker is released for _auto_dispatch; a session's task stays the session's."""
         hub, task_id = self.hub, task["task_id"]
         if task.get("runner") == "session":
             return
@@ -1316,15 +1376,14 @@ class NodeDaemon:
                 await self._settle(task_id, "paused")      # waits for resume like any paused task
             return
         if self._worker_alive(task):
-            if hub.ledger.notice_once(task_id, "old-worker-running"):
-                self._failed("recover", "a worker from before the restart still runs; checked again each heartbeat",
-                             address=task["owner"], task_id=task_id)
+            if hub.ledger.notice_once(task_id, "old-worker-running"):     # normal after a deploy: not a failure
+                log.info("task %s: adopted its run from before the restart; looked at again each heartbeat", task_id)
             self._recheck.add(task_id)
             return
         self._recheck.discard(task_id)
         if task.get("stuck_pgid"):
             hub.ledger.update_task(task_id, "owner", stuck_pgid=None)          # its group has gone
-        if await self._deliver_draft(task_id):
+        if await self._deliver_draft(task_id) or await self._deliver_logged(task):
             return
         hub.ledger.set_runner_pid(task_id, None)
         await self._settle(task_id, f"node {self.cfg.node} restarted; the task is run again")   # paused: waits
@@ -1339,6 +1398,27 @@ class NodeDaemon:
         draft = dict(draft)
         refs = [ArtifactRef.from_dict(a) for a in draft.pop("artifacts", None) or []]
         await self.hub.finish(task_id, draft, refs)
+        return True
+
+    async def _deliver_logged(self, task: dict[str, Any]) -> bool:
+        """A run that ended while no daemon watched it (it outlived a deploy, D-104): what it printed into its log
+        decides, as at the end of any run: the account's usage limit, or the result it printed. Its exit code is
+        not known (it was not this daemon's child)."""
+        agent, path = self._agent_cfg(task["owner"]), task.get("run_log")
+        if agent is None or not path or task["status"] in TERMINAL_STATES:
+            return False
+        runtime = make_runtime(agent, self.cfg)
+        tail = log_tail(path)
+        self.hub.ledger.update_task(task["task_id"], "owner", run_log=None)      # read once
+        if why := runtime.quota(RunOutcome(-1, tail, log_path=path)):
+            await self._hold_for_quota(task["task_id"], why)
+            return True
+        outcome = runtime.parse(None, 0, tail)
+        if not _structured(outcome.result):
+            return False
+        body, refs = _result_from(None, outcome)
+        body.setdefault("limitations", []).append("its run outlived a restart of the node: exit code not known")
+        await self.hub.finish(task["task_id"], body, refs)
         return True
 
     async def _auto_dispatch(self) -> None:
@@ -1375,7 +1455,15 @@ class NodeDaemon:
                                           statuses=OPEN_STATES)
             if agent.mode == "interactive":      # an accepted task is RUNNING until its result is submitted
                 running = [t["task_id"] for t in owned_open if t["status"] == "RUNNING"]
-            state = state_override or ("working" if running else "idle")
+            session = hub.ledger.session_of(addr) if agent.mode == "interactive" else None
+            seen = session_fields(session) if agent.mode == "interactive" else {}
+            activity = _activity(session) if seen.get("session") == "online" else None
+            state = state_override or ("working" if running or activity == "busy" else "idle")
+            # D-108: the project of the task in hand, else the session's project directory, else the post's default
+            if running:
+                project = agent.project_of(hub.ledger.task(running[0], "owner")["request"])
+            else:
+                project = agent.session_project(seen.get("session_cwd")) or agent.default_project or None
             card = {
                 "address": addr, "node": self.cfg.node, "agent_id": agent.id, "display": agent.display,
                 "role": agent.role, "provider": agent.provider, "mode": agent.mode,
@@ -1384,8 +1472,11 @@ class NodeDaemon:
                 # Public layer only (visibility.py): coarse availability, no current task, queue or inbox
                 # counts, no session directory. The agent reads its own details locally (whoami).
                 "state": state, "availability": "busy" if running or owned_open else "available",
-                **(public_session(session_fields(hub.ledger.session_of(addr)))
-                   if agent.mode == "interactive" else {}),
+                **(public_session(seen) if agent.mode == "interactive" else {}),
+                **({"activity": activity, "activity_at": session["activity_at"]} if activity else {}),
+                **({"project": project} if project else {}),
+                **({"stuck": True, "stuck_reason": ",".join(stuck)} if (stuck := hub.ledger.stuck_reasons(addr))
+                   else {}),
                 "heartbeat_s": self.cfg.heartbeat_s, "last_heartbeat": now}
             await bus.kv_put(bus.names.agents_kv, f"{self.cfg.node}.{agent.id}",
                              {k: v for k, v in card.items() if k in CARD_KEYS})

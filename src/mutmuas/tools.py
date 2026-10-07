@@ -11,10 +11,13 @@ import asyncio
 import functools
 import re
 import os
+import shlex
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from . import node   # node imports tools as well: its names are looked up when called
 from .hub import Hub
 from .ids import Address, parse_iso
 from .visibility import acl, artifact_visible, is_participant, short
@@ -53,7 +56,19 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                        deadline: str | None = None, artifacts: list[dict] | None = None,
                        parent_task: str | None = None, priority: str = "normal",
                        reply: str | None = None, observers: list[str] | None = None,
-                       leader: bool = False, project: str | None = None) -> dict[str, Any]:
+                       leader: bool = False, project: str | None = None,
+                       reply_to: str | None = None) -> dict[str, Any]:
+    """reply_to (D-104): the open task of the recipient's this letter delivers; "new" for a new request whatever
+    the sender holds. Without it, a letter to someone with exactly one open task of theirs in the sender's hands
+    delivers that task; with several it is refused until reply_to says which."""
+    if reply_to != "new" and not parent_task:
+        if (delivering := await _delivers(hub, me, to, reply_to)):
+            task_id, recipient = delivering
+            out = await submit_result(hub, me, "complete", objective, task_id=task_id, outputs=inputs or None,
+                                      artifacts=artifacts, next=recipient, notes=reason)
+            return {**out, "delivered_as_result_of": task_id,
+                    "note": f"sent as the result of {task_id}, the open task {recipient} asked of you "
+                            "(reply_to='new' sends a new request instead)"}
     default_deadline = None
     for observer in observers or []:
         Address.parse(observer)        # before anything goes out: a bad one is refused, not half sent
@@ -67,6 +82,25 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                         leader=leader)
     return await _send_request(hub, me, to, body, artifacts=artifacts, parent_task=parent_task, priority=priority,
                                project=project)
+
+
+async def _delivers(hub: Hub, me: str, to: str, reply_to: str | None) -> tuple[str, str] | None:
+    """(task, its requester): the open task of `to`'s that a letter from `me` delivers, if any (D-104 item 3).
+    Only tasks the caller may act on count: a worker's own task, or for a session the tasks no worker is doing."""
+    addr, recipient = str(hub.local_agent(me)[0]), await hub.resolve(to)
+    worker_of = node.worker_task(hub.ledger, addr)
+    held = [t["task_id"] for t in hub.ledger.tasks(role="owner", local_agent=addr, statuses=OPEN_STATES, limit=None)
+            if t["requester"] == recipient
+            and (t["task_id"] == worker_of if worker_of else t.get("runner") != "worker")]
+    if reply_to:
+        if reply_to not in held:
+            raise ValueError(f"reply_to={reply_to}: not an open task {recipient} asked of you"
+                             f"{' (yours: ' + ', '.join(held) + ')' if held else ''}; reply_to='new' for a new request")
+        return reply_to, recipient
+    if len(held) > 1:
+        raise ValueError(f"you hold {len(held)} open tasks {recipient} asked of you ({', '.join(held)}): say which "
+                         "this letter delivers with reply_to=<task id>, or reply_to='new' for a new request")
+    return (held[0], recipient) if held else None
 
 
 LONG_KINDS = ("experiment", "code")       # their default deadline is long_reply_deadline_s (D-098)
@@ -177,10 +211,9 @@ WAKE = ("REQUEST", "QUESTION", "ANSWER", "BLOCKED", "REJECT", "CANCEL", "ERROR")
 def _project_view(hub: Hub, me: str) -> tuple[str, str] | None:
     """A project's session sees only its project's requests (D-072): (its project, the post's default project);
     the rest go to the worker, so only when there is one. None: the session sees all."""
-    from .node import session_alive
     addr, agent = hub.local_agent(me)
     session = hub.ledger.session_of(str(addr))
-    alive = session and session_alive(session)
+    alive = session and node.session_alive(session)
     if alive and agent.auto_worker and not session.get("accepting", 1):
         return ("\x00off", agent.default_project)    # switched off: no request is the session's (none matches)
     mine = agent.session_project(session["cwd"]) if alive else None
@@ -342,6 +375,31 @@ async def accept_task(hub: Hub, me: str, task_id: str, eta: str | None = None) -
     return {"task_id": task_id, "accepted": ok, **({"eta": eta} if eta else {})}
 
 
+async def start_job(hub: Hub, me: str, command: str, note: str, task_id: str | None = None,
+                    cwd: str | None = None) -> dict[str, Any]:
+    """Start a long job and let the task wait on it (D-104): the command runs on its own (its own session, so the
+    end or stop of the run that started it, or of the daemon, leaves it alone), its output goes to a log under the
+    node's runs/jobs, and its exit code to a done-file. The node wakes the task when it ends."""
+    task_id = task_id or _current_task()
+    if not task_id:
+        raise ValueError("task_id is required outside of a delegated task")
+    addr, agent = hub.local_agent(me)
+    if not agent.has("RUN_EXPERIMENT"):                 # a shell command: what grants this post's workers Bash
+        raise PermissionError(f"{addr} lacks RUN_EXPERIMENT permission: it may not start commands")
+    _check_actor(hub, _owned(hub, me, task_id))            # refused before anything starts
+    jobs = hub.cfg.data_path / "runs" / "jobs"
+    jobs.mkdir(parents=True, exist_ok=True)
+    stem = jobs / f"{task_id}.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
+    log, done = f"{stem}.log", f"{stem}.done"
+    # a subshell, so an `exit` in the command still leaves its exit code in the done-file
+    script = f"(\n{command}\n)\necho $? > {shlex.quote(done)}.tmp && mv {shlex.quote(done)}.tmp {shlex.quote(done)}\n"
+    with open(log, "wb") as out:
+        proc = subprocess.Popen(["/bin/sh", "-c", script], cwd=cwd or os.getcwd(), stdin=subprocess.DEVNULL,
+                                stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+    job = await add_job(hub, me, task_id, pid=proc.pid, done_file=done, log=log, note=note)
+    return {**job, "pid": proc.pid, "log": log, "done_file": done}
+
+
 async def add_job(hub: Hub, me: str, task_id: str | None = None, pid: int | None = None,
                   done_file: str | None = None, log: str | None = None, note: str | None = None,
                   children: bool = False) -> dict[str, Any]:
@@ -350,7 +408,6 @@ async def add_job(hub: Hub, me: str, task_id: str | None = None, pid: int | None
     (process pid gone, or done_file appears) and wakes the post: a worker's task is queued again, a session gets
     a wake-up. No time limit. children=True (D-066): wait on the task's direct child tasks instead (sent with
     parent_task); it ends when each has a result, was refused or cancelled, or is past its deadline."""
-    from .node import proc_start
     task_id = task_id or _current_task()
     if not task_id:
         raise ValueError("task_id is required outside of a delegated task")
@@ -360,7 +417,7 @@ async def add_job(hub: Hub, me: str, task_id: str | None = None, pid: int | None
     _check_actor(hub, task)
     if children and not hub.ledger.children(task_id):
         raise ValueError(f"{task_id} has no child task to wait on: send them with parent_task={task_id} first")
-    job_id = hub.ledger.add_job(task_id, task["owner"], pid, proc_start(pid) if pid else None, done_file, log,
+    job_id = hub.ledger.add_job(task_id, task["owner"], pid, node.proc_start(pid) if pid else None, done_file, log,
                                 note, children=children)
     what = note or ("its child tasks" if children else f"pid {pid}" if pid else f"until {done_file}")
     await hub.owner_transition(task_id, "WAITING", f"waiting on a background job ({what}); resumes when it ends",
@@ -455,9 +512,36 @@ async def control_task(hub: Hub, me: str, task_id: str, action: str, message: st
     return {"task_id": task_id, "action": action, "delivery": delivery}
 
 
+async def quota_waits(hub: Hub, me: str) -> list[dict[str, Any]]:
+    """Every open task, on any node, that waits for the account's usage limit to come back (D-104): from the shared
+    task records (all of them for a coordinator such as the secretary)."""
+    return [r for r in await hub.all_tasks(limit=10000, viewer=me)
+            if r.get("wait_reason") == "quota" and r.get("status") not in TERMINAL_STATES]
+
+
+async def resume_quota_waits(hub: Hub, me: str, message: str = "the usage limit is back: carry on") -> dict[str, Any]:
+    """Resume every task that waits for quota (control_task resume to each owner; the owner's node decides)."""
+    resumed = []
+    for record in await quota_waits(hub, me):
+        await control_task(hub, me, record["task_id"], "resume", message)
+        resumed.append(record["task_id"])
+    return {"resumed": resumed}
+
+
 async def answer(hub: Hub, me: str, task_id: str, text: str, next: str | None = None) -> dict[str, Any]:
     delivery = await hub.reply(me, task_id, "ANSWER", {"answer": text, **({"next": next} if next else {})})
     return {"task_id": task_id, "delivery": delivery}
+
+
+async def report_activity(hub: Hub, me: str, activity: str) -> dict[str, Any]:
+    """D-108: the session says it is at work (busy: it started on a prompt) or done (idle: it stopped). Its hooks
+    call it; the card shows the post working while busy, with or without a mutmuas task."""
+    if activity not in ("busy", "idle"):
+        raise ValueError(f"activity={activity!r}: busy or idle")
+    addr, _ = hub.local_agent(me)
+    if not hub.ledger.set_activity(str(addr), activity):
+        raise KeyError(f"{addr} has no session on this node: nothing to mark {activity}")
+    return {"address": str(addr), "activity": activity}
 
 
 async def set_session_taking_work(hub: Hub, me: str, on: bool) -> dict[str, Any]:
@@ -588,7 +672,6 @@ async def list_tasks(hub: Hub, me: str | None = None, limit: int = 50) -> list[d
 
 async def whoami(hub: Hub, me: str | None = None) -> dict[str, Any]:
     """My own details, read from this node's ledger: private, never on the shared card."""
-    from .node import session_fields
     addr, agent = hub.local_agent(me)
     open_tasks = hub.ledger.tasks(role="owner", local_agent=str(addr),
                                   statuses=OPEN_STATES)
@@ -599,7 +682,7 @@ async def whoami(hub: Hub, me: str | None = None) -> dict[str, Any]:
            **_push_fields(hub.ledger.push_state(str(addr))),
            "coordinator": str(addr) in (hub.cfg.coordinators or [])}
     if agent.mode == "interactive":
-        out.update(session_fields(hub.ledger.session_of(str(addr))))
+        out.update(node.session_fields(hub.ledger.session_of(str(addr))))
     out["jobs_waiting"] = [{k: j[k] for k in ("job_id", "task_id", "pid", "done_file", "log", "note", "created_at")}
                            for j in hub.ledger.jobs(owner=str(addr))]
     if agent.auto_worker:
@@ -651,8 +734,7 @@ def _check_actor(hub: Hub, task: dict[str, Any]) -> str | None:
     - A task held by the worker is changed only by its worker.
     - A task held by the session is not changed by a worker.
     Returns the task the caller is the worker of (None: not a worker)."""
-    from .node import worker_task
-    worker_of = worker_task(hub.ledger, task["owner"])
+    worker_of = node.worker_task(hub.ledger, task["owner"])
     if worker_of and task["task_id"] != worker_of:
         raise PermissionError(f"a worker process (task {worker_of}) acts only on its own task, not on "
                               f"{task['task_id']}, which belongs to the session or to another run")

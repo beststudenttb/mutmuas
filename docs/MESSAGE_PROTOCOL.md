@@ -15,7 +15,7 @@ from: A:main                     # NODE:agent  (must match the node in the NATS 
 to: B:experimenter
 type: REQUEST
 timestamp: 2026-09-24T07:54:12.207+00:00
-priority: normal                 # low | normal | high
+priority: normal                 # normal | high (urgent, D-104); "low" from older nodes counts as normal
 body: { … }                      # type-specific, below
 artifacts: [ ArtifactRef, … ]    # references only, never payloads
 reply_to: msg-…                  # message this one answers (optional)
@@ -85,8 +85,12 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   to the post's `worker-log.md` (`time | from | task | output / to whom | how | notes`), taking `how` and `notes`
   from the RESULT ('未填' when missing). If the post's `PLAN.md` has a heading naming the task id, that section goes
   into `outputs.plan` and off the board. Notices closed by being read (`reply: none`) are not logged.
-- **Long jobs** (D-050): the owner of a task registers a background job it waits on (`agentctl job add --pid
-  <pid> --done-file <path> --log <path> --note <line>`, or the MCP `add_job`). The task becomes WAITING, and a worker
+- **Long jobs** (D-050, D-104): the owner of a task starts a long command as a job with the MCP `start_job` (or
+  `agentctl job start --note <line> -- <command>`): it runs on its own session (the end or stop of the run that
+  started it, or of the daemon, leaves it alone), its output goes to `runs/jobs/<task>.<time>.log`, its exit code
+  to a done-file. Only a post with RUN_EXPERIMENT (what gives its workers a shell) may start one. A job already
+  running can be registered instead (`agentctl job add --pid <pid> --done-file <path> --log <path> --note
+  <line>`, or the MCP `add_job`). The task becomes WAITING, and a worker
   may end its run without a result: it is neither finished nor retried, and a restart leaves it alone. Each
   heartbeat checks every open job; a job has ended when its process is gone (same machine; the exit code is not
   known, so write it into the done-file) or its done-file exists. When the task's last job ends, a worker's task is
@@ -103,6 +107,37 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   takes all of them, as before. Which project a session is in is found by file identity, so a case variant of
   the directory or a link into it counts as that project. An agent without `auto_worker` has nobody to hand
   the rest to, so its session takes and sees all work wherever it was started.
+- **At work, and where** (D-108): an interactive post's card carries `activity` (`"busy"` | `"idle"`, a string)
+  and `activity_at` (ISO time of the last report), set by the session's own hooks with `agentctl activity
+  busy|idle` (UserPromptSubmit: busy; Stop: idle; allowed beside the session, no lease). Only while the session is
+  online; a busy report older than an hour shows as idle (a lost Stop hook). `state` is `"working"` while busy,
+  with or without a mutmuas task. `project` (a string, only the name; absent when there is none): the project of
+  the task in hand, else the project directory the session is in, else the post's `default_project`.
+  Example: `{"state": "working", "activity": "busy", "activity_at": "2026-10-07T05:51:02.120+00:00",
+  "project": "visualrl", ...}`. `agentctl status` shows both.
+- **Held up** (D-108): the card carries `stuck: true` (a boolean) and `stuck_reason` (a string: the kinds, comma
+  separated, in this order: `blocked` a task the post owns is BLOCKED; `quota` one waits for the usage limit;
+  `delivery` a message it sent has failed to go out for 5 minutes; `worker` runs of two or more different tasks
+  failed within the hour with nothing finished since). Never a task id or content. Both keys are absent when
+  nothing holds it up. Example: `{"stuck": true, "stuck_reason": "blocked,delivery"}`.
+- **Waiting for quota** (D-104): a worker run that ends at the vendor account's usage limit (the vendor CLI's own
+  words, e.g. Claude's "usage limit reached", Codex's `usage_limit_reached`, or a line `MUTMUAS_QUOTA: <what>`
+  from any runtime or script) does not fail its task: the task waits, paused with `wait_reason: quota` (in the
+  shared task record), the run is not counted as an attempt, the next run is told why it stopped, and the task's
+  jobs run on. Nothing restarts it by itself: the account is shared, so when the secretary is back, everyone is.
+  The secretary lists all such tasks with the MCP `quota_waits` and resumes them with `resume_quota_waits`
+  (`control_task resume` to each; a resume clears the reason).
+- **A letter that delivers** (D-104): `send_request` first looks at the open tasks the recipient asked of the
+  sender (those the caller may act on: a worker's own task; for a session, those no worker is doing). Exactly
+  one: the letter is that task's delivery: its RESULT (`complete`, summary = the objective, artifacts and inputs
+  carried over, the requester named `next`), and the task is closed. Several: refused until `reply_to=<task id>`
+  says which. None, `reply_to: "new"`, or an explicit `parent_task` (a child task): a new request.
+- **Urgent work** (D-104): a REQUEST's `priority` has two levels, `normal` and `high`; the sender marks it as it
+  needs, and the leader's work (`leader: true`) counts as high. The owner's node decides once more with what the
+  post is doing: urgent work that arrives while the post's worker runs something not urgent stops that run; the
+  stopped task is laid out again behind the urgent one (the stop is not counted as a failed attempt, the next run
+  is told why, the requester sees "stopped for the urgent task …"). Urgent behind urgent waits its turn; work that
+  is not urgent waits for the run in hand. There is no "later" level. A session's work is not stopped.
 - **Interrupt, pause, resume** (D-089: "my instruction can interrupt directly"):
   - Who may do it (Codex review of 9f39ff0): a node lists in node.yaml `trusted_controllers` the addresses that
     may interrupt or pause any of its posts (at first only the secretary: the leader's word comes relayed by
@@ -251,7 +286,7 @@ There are four layers (`src/mutmuas/visibility.py`):
 
 | layer | who | what |
 |---|---|---|
-| public | everyone | address, role, capabilities, provider, mode, `accepts_kinds`, online/offline, `session` on duty, `availability` available/busy |
+| public | everyone | address, role, capabilities, provider, mode, `accepts_kinds`, online/offline, `session` on duty, `availability` available/busy, `activity` busy/idle and `activity_at`, `project`, `stuck` and `stuck_reason` (D-108) |
 | task status | coordinators + participants | task id, first 80 characters of the objective, status, requester → owner, last update |
 | task content | participants only: requester, owner, `observers` | reason, inputs, the thread, the RESULT, artifacts |
 | private | nobody | session reasoning, memory, work logs, transcripts, raw run logs. Never sent over mutmuas; ask the person, who answers with a condensed summary |

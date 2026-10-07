@@ -132,6 +132,24 @@ elif action == "block_only":
 
     asyncio.run(with_hub(run))
 
+elif action == "job_then_result":
+    # Starts a long job with start_job and ends without a result; woken when it has ended, it reports.
+    if not Path(inputs["flag"]).exists():
+        async def run(hub):
+            await tools.start_job(hub, me, f"sleep {inputs.get('job_s', 3)}; touch {inputs['flag']}", note="sleeps")
+
+        asyncio.run(with_hub(run))
+    else:
+        print(json.dumps({"status": "complete", "summary": "job finished"}))
+
+elif action == "quota_once":
+    # The first run stops at the account's usage limit; the run after a resume finishes.
+    if not Path(inputs["flag"]).exists():
+        Path(inputs["flag"]).touch()
+        print("MUTMUAS_QUOTA: usage limit reached (simulated)")
+        sys.exit(1)
+    print(json.dumps({"status": "complete", "summary": "done after the limit came back"}))
+
 elif action == "block_once":
     # Blocked until the requester has answered (the test creates inputs["flag"]), then done.
     if not Path(inputs["flag"]).exists():

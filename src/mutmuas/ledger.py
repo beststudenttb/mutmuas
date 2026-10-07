@@ -17,6 +17,7 @@ import json
 import sqlite3
 import threading
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -73,6 +74,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     eta             TEXT,                    -- the owner's estimate (D-076)
     interrupts      TEXT,                    -- messages that stopped a run, for the next run (D-089)
     paused          INTEGER NOT NULL DEFAULT 0,
+    priority        TEXT NOT NULL DEFAULT 'normal',   -- the REQUEST's: high runs first and stops normal (D-104)
+    wait_reason     TEXT,                    -- why a paused task waits: "quota" = the account's usage limit (D-104)
+    run_log         TEXT,                    -- the latest run's log: its result is read from it after a deploy
     PRIMARY KEY (task_id, role)
 );
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(role, status);
@@ -86,7 +90,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     cwd             TEXT,
     started_at      TEXT NOT NULL,
     last_seen       TEXT NOT NULL,
-    accepting       INTEGER NOT NULL DEFAULT 1   -- 0: online but takes no work (`off`)
+    accepting       INTEGER NOT NULL DEFAULT 1,  -- 0: online but takes no work (`off`)
+    activity        TEXT,                       -- busy | idle, as the session's hooks report it (D-108)
+    activity_at     TEXT                        -- when it last did
 );
 
 -- Artifacts an agent of this node published itself: with inbound mail, the only source of artifact access
@@ -156,6 +162,17 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 """
 
+# Columns added since the schema above was first deployed (D-104): a ledger an older version created gets them
+# when it is opened. Columns are only ever added, never renamed or dropped, so old and new code can share a ledger
+# while a deploy hands over (old runs finish on the old code).
+ADDED_COLUMNS = (
+    ("tasks", "priority", "TEXT NOT NULL DEFAULT 'normal'"),
+    ("tasks", "wait_reason", "TEXT"),
+    ("tasks", "run_log", "TEXT"),
+    ("sessions", "activity", "TEXT"),
+    ("sessions", "activity_at", "TEXT"),
+)
+
 TASK_JSON_FIELDS = ("request", "result", "result_draft", "input_refs", "output_refs", "interrupts")
 
 
@@ -182,6 +199,9 @@ class Ledger:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=30000")
         self.db.executescript(SCHEMA)
+        for table, column, decl in ADDED_COLUMNS:
+            if column not in [r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")]:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def close(self) -> None:
         self.db.close()
@@ -368,6 +388,9 @@ class Ledger:
     _BEAT_SQL = ("INSERT INTO sessions (local_agent, pid, session_pid, cwd, started_at, last_seen)"
                  " VALUES (?,?,?,?,?,?) ON CONFLICT(local_agent) DO UPDATE SET pid=excluded.pid,"
                  " session_pid=excluded.session_pid, cwd=excluded.cwd, last_seen=excluded.last_seen,"
+                 # a new session (another MCP process) starts idle: the old one's busy is not its own (D-108)
+                 " activity=CASE WHEN sessions.pid=excluded.pid THEN sessions.activity END,"
+                 " activity_at=CASE WHEN sessions.pid=excluded.pid THEN sessions.activity_at END,"
                  " started_at=CASE WHEN sessions.pid=excluded.pid THEN sessions.started_at"
                  " ELSE excluded.started_at END")
 
@@ -560,6 +583,10 @@ class Ledger:
                                (local_agent,)).fetchone()[0]
         return {"oldest_unread_at": row["oldest"], "last_push_at": last}
 
+    def set_activity(self, local_agent: str, activity: str) -> bool:
+        return self.db.execute("UPDATE sessions SET activity=?, activity_at=? WHERE local_agent=?",
+                               (activity, now_iso(), local_agent)).rowcount == 1
+
     def set_session_accepting(self, local_agent: str, accepting: bool) -> bool:
         cur = self.db.execute("UPDATE sessions SET accepting=? WHERE local_agent=?", (int(accepting), local_agent))
         return cur.rowcount == 1
@@ -600,6 +627,33 @@ class Ledger:
 
     def end_job(self, job_id: int, ended: str) -> None:
         self.db.execute("UPDATE jobs SET ended_at=?, ended=? WHERE job_id=?", (now_iso(), ended, job_id))
+
+    def stuck_reasons(self, local_agent: str) -> list[str]:
+        """Why this post is really held up (D-108), as kinds only: "blocked" (a task it owns is BLOCKED), "quota"
+        (one waits for the account's usage limit), "delivery" (a message it sent has failed to go out for 5
+        minutes), "worker" (runs of two or more different tasks failed within the hour, nothing finished since:
+        the worker itself, not one task's trouble)."""
+        reasons = []
+        if self.db.execute("SELECT 1 FROM tasks WHERE role='owner' AND local_agent=? AND status='BLOCKED'",
+                           (local_agent,)).fetchone():
+            reasons.append("blocked")
+        if self.db.execute("SELECT 1 FROM tasks WHERE role='owner' AND local_agent=? AND paused=1"
+                           " AND wait_reason='quota'"
+                           f" AND status NOT IN ({','.join('?' * len(TERMINAL_STATES))})",
+                           (local_agent, *TERMINAL_STATES)).fetchone():
+            reasons.append("quota")
+        now = datetime.now(timezone.utc)
+        if self.db.execute("SELECT 1 FROM messages WHERE direction='out' AND local_agent=? AND state='queued'"
+                           " AND last_error IS NOT NULL AND created_at < ?",
+                           (local_agent, (now - timedelta(minutes=5)).isoformat())).fetchone():
+            reasons.append("delivery")
+        done = self.db.execute("SELECT MAX(updated_at) FROM tasks WHERE role='owner' AND local_agent=?"
+                               " AND status='COMPLETED'", (local_agent,)).fetchone()[0] or ""
+        since = max(done, (now - timedelta(hours=1)).isoformat())
+        if self.db.execute("SELECT COUNT(DISTINCT task_id) FROM failures WHERE stage='run' AND address=? AND at > ?",
+                           (local_agent, since)).fetchone()[0] >= 2:
+            reasons.append("worker")
+        return reasons
 
     def failures(self, limit: int = 50) -> list[dict[str, Any]]:
         return [dict(r) for r in self.db.execute("SELECT * FROM failures ORDER BY rowid DESC LIMIT ?", (limit,))]
@@ -642,11 +696,11 @@ class Ledger:
         now = now_iso()
         cur = db.execute(
             "INSERT OR IGNORE INTO tasks (task_id, role, local_agent, requester, owner, parent_task,"
-            " conversation_id, status, request, input_refs, last_message, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " conversation_id, status, request, input_refs, last_message, created_at, updated_at, priority)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (req.task_id, role, local_agent, req.sender, req.to, req.body.get("parent_task"),
              req.conversation_id, status, json.dumps(req.body, ensure_ascii=False),
-             json.dumps([a.to_dict() for a in req.artifacts]), req.message_id, now, now))
+             json.dumps([a.to_dict() for a in req.artifacts]), req.message_id, now, now, req.priority))
         return cur.rowcount == 1
 
     def create_owned_task(self, req: Envelope) -> bool:

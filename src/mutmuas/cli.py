@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -21,12 +22,15 @@ from typing import Any
 
 import yaml
 
-from . import __version__, tools
+from . import __version__, mcp_server, tools
 from .bus import Bus, BusUnavailable
 from .config import ConfigError, NodeConfig, dump_config, find_config, load_config
 from .hub import Hub, is_online
 from .ids import Address, parse_iso
+from .node import NodeDaemon, lease_refusal
 from .protocol import ProtocolError
+from .retire import retire, undo
+from .server_config import generate
 
 # --------------------------------------------------------------------------- helpers
 
@@ -76,7 +80,6 @@ async def _with_hub(args, fn, *, require_bus: bool = True, watch: bool = False):
                       and getattr(args, "clear_before", None) is None) or (
             command == "cmd_watch" and getattr(args, "headers_only", False))
         if command not in LEASE_FREE and not reads_only:
-            from .node import lease_refusal
             refusal = lease_refusal(hub.ledger, str(hub.local_agent(_me(args))[0]))
             if refusal:
                 raise SystemExit(f"error: {refusal}")
@@ -85,10 +88,10 @@ async def _with_hub(args, fn, *, require_bus: bool = True, watch: bool = False):
         await hub.close()
 
 
-# Commands that may run beside the session that holds the agent (from a shell or a hook): they only read, or switch
-# the session's own work off and on. `inbox --peek` and `watch --headers-only` read without marking anything.
+# Commands that may run beside the session that holds the agent (from a shell or a hook): they only read, switch
+# the session's own work off and on, or report its activity (its hooks, D-108). `inbox --peek` and `watch --headers-only` read without marking anything.
 LEASE_FREE = {"cmd_status", "cmd_agents", "cmd_find", "cmd_session", "cmd_whoami", "cmd_tasks", "cmd_task",
-              "cmd_failures"}
+              "cmd_failures", "cmd_activity"}
 
 
 def _parse_kv(pairs: list[str] | None) -> dict[str, Any]:
@@ -137,7 +140,11 @@ async def cmd_status(args, hub: Hub):
             alias = f" ({c['display']})" if c.get("display") else ""
             session = f"  session {c['session']}" if c.get("session") else ""
             busy = f"  {c['availability']}" if c.get("availability") and c["online"] else ""
-            print(f"  {c['address']}{alias}  {state}{busy}  [{c.get('mode')}/{c.get('runtime') or '-'}]{session}")
+            activity = f"  activity {c['activity']}" if c.get("activity") and c["online"] else ""
+            project = f"  project {c['project']}" if c.get("project") else ""
+            project += f"  STUCK ({c['stuck_reason']})" if c.get("stuck") else ""
+            print(f"  {c['address']}{alias}  {state}{busy}  [{c.get('mode')}/{c.get('runtime') or '-'}]{session}"
+                  f"{activity}{project}")
     if not known and not by_node:
         print("no nodes registered yet (is any agent-node running?)")
 
@@ -167,8 +174,9 @@ async def cmd_ask(args, hub: Hub):
         inputs=_parse_kv(args.input) or None, expected_outputs=args.expect, acceptance_criteria=args.accept,
         constraints=args.constraint, timeout_s=args.timeout, priority=args.priority,
         reply=args.reply, deadline=args.due, observers=args.observer,
-        artifacts=[{"uri": uri} for uri in args.artifact or []], leader=args.leader, project=args.project)
-    if args.wait is not None:
+        artifacts=[{"uri": uri} for uri in args.artifact or []], leader=args.leader, project=args.project,
+        reply_to=args.reply_to)
+    if args.wait is not None and not out.get("delivered_as_result_of"):      # a delivery waits for nothing
         out = await tools.wait_for_result(hub, out["task_id"], args.wait, me=_me(args))
     _print(out, args.json)
 
@@ -299,12 +307,21 @@ async def cmd_update(args, hub: Hub):
                                        eta=args.eta), args.json)
 
 
+async def cmd_activity(args, hub: Hub):
+    _print(await tools.report_activity(hub, _me(args), args.activity), args.json)
+
+
 async def cmd_session(args, hub: Hub):
     """`mutmuas <post> off|on` (D-073 batch 2): the session stays online but takes no work (the worker does)."""
     _print(await tools.set_session_taking_work(hub, _me(args), args.action == "on"), args.json)
 
 
 async def cmd_job(args, hub: Hub):
+    if args.action == "start":
+        if not args.command or not args.note:
+            raise SystemExit("job start needs --note and the command after --")
+        return _print(await tools.start_job(hub, _me(args), shlex.join(args.command), args.note, task_id=args.task),
+                      args.json)
     _print(await tools.add_job(hub, _me(args), args.task, pid=args.pid, done_file=args.done_file, log=args.log,
                                note=args.note, children=args.children), args.json)
 
@@ -345,8 +362,7 @@ async def cmd_failures(args, hub: Hub):
 
 
 def cmd_mcp(args):
-    from .mcp_server import run
-    run(_cfg(args), _me(args), channel=args.channel, worker_task=args.worker_task)
+    mcp_server.run(_cfg(args), _me(args), channel=args.channel, worker_task=args.worker_task)
 
 
 # --------------------------------------------------------------------------- agent-node commands
@@ -385,7 +401,6 @@ def node_init(args):
 def node_retire_agent(args):
     """agent-node retire-agent <id> [--hand-over ADDR] [--keep-mailbox] [--dry-run] [-y];
     agent-node retire-agent --undo <manifest> [--dry-run]."""
-    from .retire import retire, undo
     try:
         if args.undo:
             print(json.dumps(asyncio.run(undo(args.undo, dry_run=args.dry_run)), indent=2, ensure_ascii=False))
@@ -471,7 +486,6 @@ def node_start(args):
     logging.basicConfig(level=getattr(logging, args.log_level.upper()), handlers=handlers,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("nats").setLevel(logging.WARNING)
-    from .node import NodeDaemon
 
     async def main():
         daemon = NodeDaemon(cfg)
@@ -489,7 +503,6 @@ def node_start(args):
 
 
 def node_server_config(args):
-    from .server_config import generate
     nodes = [n.strip() for n in args.nodes.split(",") if n.strip()]
     tls_hosts = [h.strip() for h in args.tls.split(",") if h.strip()] if args.tls else None
     written = generate(args.project, nodes, Path(args.out), tls_hosts=tls_hosts, port=args.port,
@@ -529,6 +542,8 @@ def node_service(args):
     dirs = [str(venv_bin)] + [str(Path(p).parent) for p in (shutil.which("claude"), shutil.which("codex")) if p]
     dirs += ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
     path_env = ":".join(dict.fromkeys(d for d in dirs if Path(d).is_dir()))
+    # Stopping the service stops the daemon only (D-104): runs and jobs in progress go on, the next daemon adopts
+    # them (systemd: KillMode=process, not the whole cgroup; launchd: AbandonProcessGroup).
     if sys.platform == "darwin":
         label = f"dev.mutmuas.{cfg.project}.{cfg.node}{suffix}"   # unique per node: several nodes can share a Mac
         items = "\n".join(f"    <string>{a}</string>" for a in argv)
@@ -546,6 +561,7 @@ def node_service(args):
   <dict><key>PATH</key><string>{path_env}</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>AbandonProcessGroup</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>
   <key>StandardOutPath</key><string>{log}</string>
   <key>StandardErrorPath</key><string>{log}</string>
@@ -567,7 +583,7 @@ ExecStart={' '.join(argv)}
 Restart=always
 RestartSec=5
 Environment=PATH={path_env}
-KillMode=mixed
+KillMode=process
 TimeoutStopSec=30
 
 [Install]
@@ -684,7 +700,10 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--expect", action="append", help="expected output (repeatable)")
     p.add_argument("--accept", action="append", help="acceptance criterion (repeatable)")
     p.add_argument("--constraint", action="append", help="constraint on how to do it (repeatable)")
-    p.add_argument("--priority", default="normal", choices=["low", "normal", "high"])
+    p.add_argument("--reply-to", metavar="TASK|new",
+                   help="the open task of theirs this delivers (needed when you hold several); new: a new request")
+    p.add_argument("--priority", default="normal", choices=["normal", "high"],
+                   help="high: urgent, runs first and stops work that is not urgent (D-104)")
     p.add_argument("--timeout", type=float, help="task timeout on the owner side (s)")
     p.add_argument("--reply", choices=["required", "none"],
                    help="none: a notice, closed with a read receipt once they read it (default: required)")
@@ -728,11 +747,15 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--state", choices=["RUNNING", "WAITING", "BLOCKED"])
     p.add_argument("--next", metavar="ADDR", help="whose move it is now (wakes them)")
     p.add_argument("--eta", help="a new estimate from now: +2h, +1d")
+    p = add("activity", cmd_activity, "my session is at work (busy) or done (idle): for its hooks (D-108)", bus=False)
+    p.add_argument("activity", choices=["busy", "idle"])
     p = add("session", cmd_session, "my session: off = online but takes no work (the worker does); on = back",
             bus=False)
     p.add_argument("action", choices=["off", "on"])
-    p = add("job", cmd_job, "register a background job my task waits on; the node wakes me when it ends", bus=False)
-    p.add_argument("action", choices=["add"])
+    p = add("job", cmd_job, "start (or register) a background job my task waits on; the node wakes me when it ends",
+            bus=False)
+    p.add_argument("action", choices=["start", "add"],
+                   help="start: run the command after -- on its own and wait on it; add: register one already running")
     p.add_argument("--task", help="default: $MUTMUAS_TASK_ID (inside a worker run)")
     p.add_argument("--pid", type=int, help="ends when this process is gone (same machine)")
     p.add_argument("--done-file", help="ends when this file appears (write the exit code into it)")
@@ -740,6 +763,7 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--note", help="one line: what runs, and what to do when it ends")
     p.add_argument("--children", action="store_true",
                    help="wait on this task's child tasks instead (ends when each is done, refused or overdue)")
+    p.add_argument("command", nargs="*", help="(start) the command and its arguments, after --")
     p = add("submit-result", cmd_submit, "finish a task I own", bus=False)
     p.add_argument("--task")
     p.add_argument("--status", choices=["complete", "partial", "failed"])

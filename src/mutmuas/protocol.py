@@ -38,7 +38,7 @@ MESSAGE_TYPES = (
     "ERROR",     # infrastructure/protocol level failure
 )
 
-PRIORITIES = ("low", "normal", "high")
+PRIORITIES = ("low", "normal", "high")   # two levels (D-104): normal and high; "low" from older senders = normal
 RESULT_STATUSES = ("complete", "partial", "failed")
 
 # Task lifecycle. Terminal states never transition again.

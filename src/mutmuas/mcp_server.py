@@ -220,8 +220,11 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
                            timeout_s: float | None = None, artifacts: list[dict[str, Any]] | None = None,
                            priority: str = "normal", reply: str = "required", deadline: str | None = None,
                            observers: list[str] | None = None, leader: bool = False,
-                           project: str | None = None) -> str:
+                           project: str | None = None, reply_to: str | None = None) -> str:
         """Delegate a task to another agent. kind: query | artifact | experiment | code.
+        A letter to someone with exactly one open task of theirs in your hands is that task's delivery (its
+        RESULT, summary = objective); with several, say which with reply_to=<task id>; reply_to="new" always
+        sends a new request.
         project: the project the work belongs to (the recipient works in its directory for it); default: theirs.
         leader: true only when the leader asked for this task (it goes first in their queue).
         reply: required (the default: they owe you a RESULT) | none (a notice; closed once they read it).
@@ -231,7 +234,7 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
             hub(), state["me"], to, objective, reason, kind=kind, inputs=inputs, expected_outputs=expected_outputs,
             constraints=constraints, acceptance_criteria=acceptance_criteria, timeout_s=timeout_s,
             artifacts=artifacts, priority=priority, reply=reply, deadline=deadline, observers=observers,
-            leader=leader, project=project))
+            leader=leader, project=project, reply_to=reply_to))
 
     @server.tool()
     async def check_task(task_id: str) -> str:
@@ -316,6 +319,14 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         return dump(await tools.report_progress(hub(), state["me"], message, task_id, state_, next=next, eta=eta))
 
     @server.tool()
+    async def start_job(command: str, note: str, task_id: str | None = None, cwd: str | None = None) -> str:
+        """Start a long command (training, a long build or test suite) as a background job of your task and wait
+        on it: it runs on its own (ending or stopping your run does not stop it), output in a log, exit code in a
+        done-file. Then end your run without a result: the node wakes you when the job ends. note: one line on
+        what runs and what to do next."""
+        return dump(await tools.start_job(hub(), state["me"], command, note, task_id=task_id, cwd=cwd))
+
+    @server.tool()
     async def add_job(pid: int | None = None, done_file: str | None = None, log: str | None = None,
                       note: str | None = None, task_id: str | None = None, children: bool = False) -> str:
         """Register a background job (e.g. training, started detached) your task waits on. The task becomes
@@ -348,6 +359,16 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
     async def answer_question(task_id: str, answer: str, next: str | None = None) -> str:
         """Answer a QUESTION about a task."""
         return dump(await tools.answer(hub(), state["me"], task_id, answer, next=next))
+
+    @server.tool()
+    async def quota_waits() -> str:
+        """Every open task (on any node you may see) that waits for the account's usage limit to come back."""
+        return dump(await tools.quota_waits(hub(), state["me"]))
+
+    @server.tool()
+    async def resume_quota_waits(message: str = "the usage limit is back: carry on") -> str:
+        """The usage limit is back: resume every task waiting for it (pause/resume rights apply on each node)."""
+        return dump(await tools.resume_quota_waits(hub(), state["me"], message))
 
     @server.tool()
     async def control_task(task_id: str, action: str, message: str) -> str:
