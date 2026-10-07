@@ -360,7 +360,10 @@ A deploy restarts the daemon on the new code; it does not stop the work in progr
   result (the draft it submitted, or what it printed), or runs the task again if it left none.
 - Old and new code work side by side meanwhile: runs finish on the code they started with (a process loads all of
   mutmuas when it starts), the ledger and the messages only ever gain fields and columns (ledger.ADDED_COLUMNS),
-  never lose or change one.
+  never lose or change one. tests/test_compat.py checks both ways against the previous version: this code on its
+  ledger and messages (fixtures it wrote, tests/compat/<sha>/, made with tests/compat/make_fixtures.py), and its
+  code (from git) on this code's, its daemon included (a rollback). After each deploy, regenerate the fixtures
+  with the version now running and move PREVIOUS to it.
 
 ## 8a. Supervision and known risks
 
