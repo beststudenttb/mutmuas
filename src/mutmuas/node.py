@@ -38,8 +38,8 @@ from .config import AgentConfig, NodeConfig
 from .hub import Hub
 from .ids import Address, InvalidAddress, check_token, now_iso, parse_iso
 from .ledger import is_info
-from .protocol import (OPEN_STATES, REQUEST_KINDS, TERMINAL_STATES, ArtifactRef, Envelope, ProtocolError,
-                       reply_required, result_body, task_state_for_result)
+from .protocol import (ACCEPTANCE_VERDICTS, DELIVERED, OPEN_STATES, REQUEST_KINDS, TERMINAL_STATES, ArtifactRef,
+                       Envelope, ProtocolError, reply_required, result_body, task_state_for_result)
 from .runtime import RunOutcome, TaskContext, group_alive, log_tail, make_runtime, stop_group
 from .visibility import CARD_KEYS, accepts_kinds, acl, short
 from .worktree import GitError, Worktree
@@ -433,7 +433,8 @@ class NodeDaemon:
         state = await self._handle_message(agent, env)
         # not a REQUEST (it starts its own work), not a RESULT (a child's end is the children job's to judge: the parent
         # wakes once all are done), not pause/resume/interrupt
-        if env.type not in ("REQUEST", "RESULT") and env.body.get("next") == env.to and not env.body.get("fyi") \
+        if (env.type != "REQUEST" and (env.type != "RESULT" or env.body.get("acceptance") == "pending")
+                and env.body.get("next") == env.to and not env.body.get("fyi")) \
                 and not any(env.body.get(k) for k in ("pause", "resume", "interrupt")) \
                 and state not in ("rejected", "dropped"):
             what = env.body.get("question") or env.body.get("reason") or env.body.get("answer") \
@@ -499,6 +500,8 @@ class NodeDaemon:
             return self._on_observers_added(env)
         if env.type == "UPDATE" and env.body.get("nudge"):
             await self._on_nudge(env)                    # then kept in the inbox below: it wakes the session
+        if env.type == "UPDATE" and env.body.get("acceptance"):
+            await self._on_acceptance(env)               # then kept in the inbox below: the owner reads why
         if env.type in ("UPDATE", "ANSWER") and (kind := self._interrupt_kind(env)):
             await self._control(agent, env, kind)        # then kept in the inbox below like any message
         elif env.type == "UPDATE" and any(env.body.get(k) for k in ("pause", "resume", "interrupt")):
@@ -727,7 +730,8 @@ class NodeDaemon:
         if env.type == "UPDATE":
             status = env.body.get("state")
         elif env.type == "RESULT":
-            status = task_state_for_result(env.body["status"])
+            # D-109: a delivery that waits for this requester to accept it (accept_delivery)
+            status = DELIVERED if env.body.get("acceptance") == "pending" else task_state_for_result(env.body["status"])
             observers = (task.get("request") or {}).get("observers") or []
             await self.hub.copy_to_observers(task["local_agent"], env, observers)
             fields.update(result=env.body, result_status=env.body["status"],
@@ -835,6 +839,7 @@ class NodeDaemon:
         if notes:
             hub.ledger.update_task(task_id, "owner", interrupts=[])      # handed to this run (D-089)
         ctx = TaskContext(task_id, request, agent, self.cfg, attempt, interrupts=notes,
+                          deliveries=[c for c in hub.ledger.children(task_id) if c["status"] == DELIVERED],
                           jobs=[j for j in hub.ledger.jobs(task_id, open_only=False) if j["ended_at"]],
                           resume=hub.ledger.brain_session(task["owner"], project) if brain else None)
         if brain and not ctx.resume:
@@ -1169,6 +1174,35 @@ class NodeDaemon:
         wake = Envelope(type="UPDATE", sender=owner, to=owner, task_id=task_id, body={"message": text, "next": owner})
         hub.ledger.ingest(wake)
         hub.ledger.mark_handled(wake.message_id)
+
+    async def _on_acceptance(self, env: Envelope) -> None:
+        """D-109: the requester's verdict on a delivered task. pass: done; close: ended as failed (a partial or failed
+        result never counts as done); reject: back to the owner, the reason handed to its next run (not counted as
+        a failed attempt). Only the task's requester decides, only while it is delivered."""
+        hub, verdict = self.hub, env.body["acceptance"]
+        task = hub.ledger.task(env.task_id, "owner")
+        if (not task or task["owner"] != env.to or env.sender != task["requester"] or task["status"] != DELIVERED
+                or verdict not in ACCEPTANCE_VERDICTS):
+            log.warning("ignored a verdict on %s from %s: not its requester, or nothing delivered", env.task_id,
+                        env.sender)
+            return
+        if verdict == "pass" and task.get("result_status") == "complete":
+            hub.ledger.update_task(env.task_id, "owner", status="COMPLETED")
+        elif verdict == "close" and task.get("result_status") != "complete":
+            hub.ledger.update_task(env.task_id, "owner", status="FAILED")
+        elif verdict == "reject":
+            reason = env.body.get("reason") or "(no reason given)"
+            hub.ledger.update_task(env.task_id, "owner", attempts=0, result_draft=None)
+            self._note_interrupt(env.task_id, f"your delivery was sent back by {env.sender}: {reason}")
+            await hub.owner_transition(env.task_id, "ACCEPTED", f"sent back by {env.sender}: {short(reason, 200)}",
+                                       notify=False)
+            await self._settle(env.task_id, f"sent back by {env.sender}: {short(reason, 200)}")
+            return
+        else:
+            log.warning("ignored verdict %s on %s: it does not fit its %s result", verdict, env.task_id,
+                        task.get("result_status"))
+            return
+        await hub.publish_task_record(env.task_id)
 
     def _interrupt_kind(self, env: Envelope) -> str | None:
         """D-089: a trusted controller (node.yaml trusted_controllers; the leader's word comes relayed by the

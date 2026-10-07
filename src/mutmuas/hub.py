@@ -23,7 +23,7 @@ from .config import AgentConfig, NodeConfig
 from .ids import Address, new_task_id, parse_iso
 from .ledger import Ledger
 from .visibility import acl, is_coordinator, is_participant, status_layer
-from .protocol import TERMINAL_STATES, ArtifactRef, Envelope, task_state_for_result
+from .protocol import DELIVERED, TERMINAL_STATES, ArtifactRef, Envelope, task_state_for_result
 
 log = logging.getLogger(__name__)
 
@@ -292,7 +292,7 @@ class Hub:
             view = await self.task_view(task_id, viewer)
             if view is None:
                 raise KeyError(f"unknown task {task_id}")
-            if view.get("status") in TERMINAL_STATES and self._closed_here(task_id, view):
+            if view.get("status") in (*TERMINAL_STATES, DELIVERED) and self._closed_here(task_id, view):
                 return view
             if asyncio.get_running_loop().time() >= deadline:
                 view["timed_out_waiting"] = True
@@ -307,7 +307,7 @@ class Hub:
         between and the stale view returned (717d7e0 on B)."""
         if view.get("local_role") != "requester":
             return True
-        return view.get("local_status") in TERMINAL_STATES
+        return view.get("local_status") in (*TERMINAL_STATES, DELIVERED)       # delivered: there to accept
 
     # ---- owner side ---------------------------------------------------
 
@@ -375,7 +375,7 @@ class Hub:
         task = self.ledger.task(task_id, "owner")
         if task is None:
             raise KeyError(f"task {task_id} is not owned by this node")
-        if task["status"] in TERMINAL_STATES:
+        if task["status"] in TERMINAL_STATES or task["status"] == DELIVERED:
             return False                                         # finished already: the board is not touched
         # an invalid RESULT is refused before anything changes, the board included
         Envelope(type="RESULT", sender=task["owner"], to=task["requester"], body=result, task_id=task_id,
@@ -400,12 +400,16 @@ class Hub:
             outputs = result.get("outputs")
             outputs = outputs if isinstance(outputs, dict) else {"value": outputs} if outputs else {}
             result = {**result, "outputs": {**outputs, "plan": section}}
+        manual = (task.get("request") or {}).get("acceptance") == "manual"
+        if manual:      # D-109: it waits for the requester to accept it, which this RESULT wakes to do
+            result = {**result, "acceptance": "pending", "next": task["requester"]}
         env = Envelope(type="RESULT", sender=task["owner"], to=task["requester"], body=result, task_id=task_id,
                        conversation_id=task["conversation_id"], artifacts=artifacts or [],
                        reply_to=task.get("last_message"))
         env.validate()
         refs = [a.to_dict() for a in env.artifacts]
-        if not self.ledger.update_task(task_id, "owner", status=task_state_for_result(result["status"]),
+        state = DELIVERED if manual else task_state_for_result(result["status"])
+        if not self.ledger.update_task(task_id, "owner", status=state,
                                        result=result, result_status=result["status"], output_refs=refs, queue=env):
             return False
         await self.try_publish(env)

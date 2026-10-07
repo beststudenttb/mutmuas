@@ -33,6 +33,11 @@ human to relay messages:
 - find_agent / list_agents to discover who can do something (by capability or role).
 - send_request to delegate work (state objective, reason, expected outputs and acceptance criteria),
   then wait_for_result or check_task. Results carry artifact references; use fetch_artifact to get data.
+- What you asked for waits for you to accept it once delivered (you are woken): accept_delivery(task_id,
+  pass | reject | close, reason). pass only what is what you asked for (a complete result); reject sends it
+  back to its owner with the reason; a partial or failed result can only be rejected or closed as failed.
+- Every letter follows a template (send_request, send_notice, send_data, submit_result naming its task,
+  reject_task with whom to ask instead, ...): fill in what it asks for; an empty required blank is refused.
 - inbox shows requests and questions addressed to you. accept_task / reject_task / report_progress /
   submit_result are for tasks you own.
 - Large data never goes into messages: publish_artifact and send the reference.
@@ -226,7 +231,8 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         leader: true only when the leader asked for this task (it goes first in their queue).
         reply: required (the default: they owe you a RESULT) | none (a notice; closed once they read it).
         deadline: when you need the reply, from now (+2h, +1d); overdue replies are followed up.
-        Returns a task_id; the message is durable even if the target is offline.
+        Returns a task_id; the message is durable even if the target is offline. Its delivery waits for you to
+        accept it (accept_delivery): you are woken when it comes.
         The 需求 template (letters.yaml): objective, reason, expected_outputs, acceptance_criteria and deadline must
         be filled (a notice, reply="none", needs only its objective: use send_notice)."""
         if reply == "none":
@@ -238,7 +244,7 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
             hub(), state["me"], to, objective, reason, kind=kind, inputs=inputs, expected_outputs=expected_outputs,
             constraints=constraints, acceptance_criteria=acceptance_criteria, timeout_s=timeout_s,
             artifacts=artifacts, priority=priority, reply=reply, deadline=deadline, observers=observers,
-            leader=leader, project=project))
+            leader=leader, project=project, acceptance=None if reply == "none" else "manual"))
 
     @server.tool()
     async def check_task(task_id: str) -> str:
@@ -395,6 +401,20 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         """催交: ask the owner of a task you requested where it stands (wakes them)."""
         letters.check("chase", {"task_id": task_id, "message": message})
         return dump(await tools.chase_task(hub(), state["me"], task_id, message or None))
+
+    @server.tool()
+    async def accept_delivery(task_id: str, verdict: str, reason: str = "") -> str:
+        """验收: a task you requested was delivered: is it what you asked for? verdict: pass (done; a complete result
+        only) | reject (back to its owner; give the reason) | close (a partial or failed result ends as failed; give
+        the reason). A partial or failed result never counts as done."""
+        letters.check("acceptance", {"task_id": task_id, "verdict": verdict})
+        return dump(await tools.accept_delivery(hub(), state["me"], task_id, verdict, reason or None))
+
+    @server.tool()
+    async def withdraw_delivery(task_id: str, reason: str) -> str:
+        """撤回: take back a delivery of yours that its requester has not accepted yet; the task runs again."""
+        letters.check("withdrawal", {"task_id": task_id, "reason": reason})
+        return dump(await tools.withdraw_delivery(hub(), state["me"], task_id, reason))
 
     @server.tool()
     async def quota_waits() -> str:

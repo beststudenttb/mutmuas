@@ -12,7 +12,8 @@ from mutmuas.hub import Hub
 from mutmuas.ledger import Ledger
 
 LETTER_TOOLS = {"send_request", "send_notice", "send_data", "submit_result", "accept_task", "reject_task",
-                "ask_question", "answer_question", "chase_task", "report_progress", "control_task", "remind_me"}
+                "ask_question", "answer_question", "chase_task", "report_progress", "control_task", "remind_me",
+                "accept_delivery", "withdraw_delivery"}
 
 
 def _sent(ledger, type_):
@@ -63,7 +64,7 @@ async def test_a_letter_with_an_empty_required_blank_is_refused_before_anything_
             text = await _call(server, "send_request", {"to": "C:far", "objective": "train it", "reason": "need it",
                                                         "expected_outputs": ["a model"], "deadline": "+2h",
                                                         "acceptance_criteria": ["loss < 0.2"]})
-            assert "task_id" in text and _sent(ledger, "REQUEST")
+            assert "task_id" in text and _sent(ledger, "REQUEST")[0].body["acceptance"] == "manual"   # an agent's
     finally:
         ledger.close()
 

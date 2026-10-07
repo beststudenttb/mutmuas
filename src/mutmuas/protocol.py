@@ -42,7 +42,13 @@ PRIORITIES = ("low", "normal", "high")   # two levels (D-104): normal and high; 
 RESULT_STATUSES = ("complete", "partial", "failed")
 
 # Task lifecycle. Terminal states never transition again.
-TASK_STATES = ("PENDING", "ACCEPTED", "RUNNING", "WAITING", "BLOCKED", "COMPLETED", "FAILED", "CANCELLED")
+TASK_STATES = ("PENDING", "ACCEPTED", "RUNNING", "WAITING", "BLOCKED", "COMPLETED", "FAILED", "CANCELLED",
+               "DELIVERED")
+# D-109: delivered, waiting for the requester to accept it (pass / reject / close). Neither open nor finished: nothing
+# runs it again or chases it; a parent waiting on it keeps waiting. Each node sets it on its own row (a RESULT with
+# acceptance "pending"); it is never sent as an UPDATE state (an older node would refuse that message).
+DELIVERED = "DELIVERED"
+ACCEPTANCE_VERDICTS = ("pass", "reject", "close")
 TERMINAL_STATES = frozenset({"COMPLETED", "FAILED", "CANCELLED"})
 OPEN_STATES = ("PENDING", "ACCEPTED", "RUNNING", "WAITING", "BLOCKED")
 
@@ -244,7 +250,8 @@ def request_body(objective: str, reason: str, *, kind: str = "query", inputs: An
                  expected_outputs: Any = None, constraints: Any = None, acceptance_criteria: Any = None,
                  deadline: str | None = None, timeout_s: float | None = None,
                  reply: str | None = None, observers: list[str] | None = None,
-                 deadline_default: bool = False, leader: bool = False) -> dict[str, Any]:
+                 deadline_default: bool = False, leader: bool = False,
+                 acceptance: str | None = None) -> dict[str, Any]:
     """deadline_default: the deadline was filled in by the requester's node (default_reply_deadline_s), not
     chosen by the requester (docs/MESSAGE_PROTOCOL.md, "Replies, deadlines and the baton").
     leader: the leader asked for this task; the session sending it on his behalf marks it (D-049, honestly:
@@ -259,6 +266,8 @@ def request_body(objective: str, reason: str, *, kind: str = "query", inputs: An
         body["deadline_default"] = True
     if leader:
         body["leader"] = True
+    if acceptance == "manual":
+        body["acceptance"] = "manual"           # D-109: its delivery waits for the requester to accept it
     return body
 
 

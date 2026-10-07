@@ -71,6 +71,25 @@ refusal:
     reason: {required: true, label: 原因}
     suggest: {required: true, label: 建议找谁}
 
+acceptance:
+  name: 验收
+  tool: accept_delivery
+  cli: null
+  title: "【验收:{verdict}】{original}"
+  fields:
+    task_id: {required: true, label: 原单号}
+    verdict: {required: true, label: "pass(通过) / reject(打回) / close(按失败结案)"}
+    reason: {label: 原因(打回和结案必填)}
+
+withdrawal:
+  name: 撤回
+  tool: withdraw_delivery
+  cli: null
+  title: "【撤回交付】{original}"
+  fields:
+    task_id: {required: true, label: 原单号}
+    reason: {required: true, label: 为什么撤回}
+
 # ---- 其他固定类型 (other fixed kinds) ------------------------------------------------------------------------------
 question:
   name: 提问
