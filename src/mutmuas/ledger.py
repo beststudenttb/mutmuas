@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     eta             TEXT,                    -- the owner's estimate (D-076)
     interrupts      TEXT,                    -- messages that stopped a run, for the next run (D-089)
     paused          INTEGER NOT NULL DEFAULT 0,
+    priority        TEXT NOT NULL DEFAULT 'normal',   -- the REQUEST's: high runs first and stops normal (D-104)
     PRIMARY KEY (task_id, role)
 );
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(role, status);
@@ -156,6 +157,13 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 """
 
+# Columns added since the schema above was first deployed (D-104): a ledger an older version created gets them
+# when it is opened. Columns are only ever added, never renamed or dropped, so old and new code can share a ledger
+# while a deploy hands over (old runs finish on the old code).
+ADDED_COLUMNS = (
+    ("tasks", "priority", "TEXT NOT NULL DEFAULT 'normal'"),
+)
+
 TASK_JSON_FIELDS = ("request", "result", "result_draft", "input_refs", "output_refs", "interrupts")
 
 
@@ -182,6 +190,9 @@ class Ledger:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=30000")
         self.db.executescript(SCHEMA)
+        for table, column, decl in ADDED_COLUMNS:
+            if column not in [r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")]:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def close(self) -> None:
         self.db.close()
@@ -642,11 +653,11 @@ class Ledger:
         now = now_iso()
         cur = db.execute(
             "INSERT OR IGNORE INTO tasks (task_id, role, local_agent, requester, owner, parent_task,"
-            " conversation_id, status, request, input_refs, last_message, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " conversation_id, status, request, input_refs, last_message, created_at, updated_at, priority)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (req.task_id, role, local_agent, req.sender, req.to, req.body.get("parent_task"),
              req.conversation_id, status, json.dumps(req.body, ensure_ascii=False),
-             json.dumps([a.to_dict() for a in req.artifacts]), req.message_id, now, now))
+             json.dumps([a.to_dict() for a in req.artifacts]), req.message_id, now, now, req.priority))
         return cur.rowcount == 1
 
     def create_owned_task(self, req: Envelope) -> bool:

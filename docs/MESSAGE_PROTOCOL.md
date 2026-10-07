@@ -15,7 +15,7 @@ from: A:main                     # NODE:agent  (must match the node in the NATS 
 to: B:experimenter
 type: REQUEST
 timestamp: 2026-09-24T07:54:12.207+00:00
-priority: normal                 # low | normal | high
+priority: normal                 # normal | high (urgent, D-104); "low" from older nodes counts as normal
 body: { … }                      # type-specific, below
 artifacts: [ ArtifactRef, … ]    # references only, never payloads
 reply_to: msg-…                  # message this one answers (optional)
@@ -103,6 +103,12 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   takes all of them, as before. Which project a session is in is found by file identity, so a case variant of
   the directory or a link into it counts as that project. An agent without `auto_worker` has nobody to hand
   the rest to, so its session takes and sees all work wherever it was started.
+- **Urgent work** (D-104): a REQUEST's `priority` has two levels, `normal` and `high`; the sender marks it as it
+  needs, and the leader's work (`leader: true`) counts as high. The owner's node decides once more with what the
+  post is doing: urgent work that arrives while the post's worker runs something not urgent stops that run; the
+  stopped task is laid out again behind the urgent one (the stop is not counted as a failed attempt, the next run
+  is told why, the requester sees "stopped for the urgent task …"). Urgent behind urgent waits its turn; work that
+  is not urgent waits for the run in hand. There is no "later" level. A session's work is not stopped.
 - **Interrupt, pause, resume** (D-089: "my instruction can interrupt directly"):
   - Who may do it (Codex review of 9f39ff0): a node lists in node.yaml `trusted_controllers` the addresses that
     may interrupt or pause any of its posts (at first only the secretary: the leader's word comes relayed by

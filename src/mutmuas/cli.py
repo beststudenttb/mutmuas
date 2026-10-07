@@ -684,7 +684,8 @@ def agentctl_parser() -> argparse.ArgumentParser:
     p.add_argument("--expect", action="append", help="expected output (repeatable)")
     p.add_argument("--accept", action="append", help="acceptance criterion (repeatable)")
     p.add_argument("--constraint", action="append", help="constraint on how to do it (repeatable)")
-    p.add_argument("--priority", default="normal", choices=["low", "normal", "high"])
+    p.add_argument("--priority", default="normal", choices=["normal", "high"],
+                   help="high: urgent, runs first and stops work that is not urgent (D-104)")
     p.add_argument("--timeout", type=float, help="task timeout on the owner side (s)")
     p.add_argument("--reply", choices=["required", "none"],
                    help="none: a notice, closed with a read receipt once they read it (default: required)")

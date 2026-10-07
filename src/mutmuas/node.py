@@ -140,6 +140,11 @@ def live_worker_runs(ledger, agent: str) -> dict[int, str]:
     return {pid: task_id for pid, start, task_id in ledger.worker_runs(agent) if same_process(pid, start)}
 
 
+def _urgent(task: dict[str, Any]) -> bool:
+    """High priority, or the leader's (D-049): such work goes first (D-104)."""
+    return task.get("priority") == "high" or bool(task["request"].get("leader"))
+
+
 def worker_task(ledger, agent: str | None = None) -> str | None:
     """The task this process works on as a worker: MUTMUAS_TASK_ID, which the daemon sets when it starts a run, if
     that task is this agent's and its worker process still runs (D-102: checked against the ledger, not taken on
@@ -731,8 +736,22 @@ class NodeDaemon:
             return
         self._queued[addr].add(task_id)
         task = self.hub.ledger.task(task_id, "owner")
-        self._queues[addr].put_nowait((0 if task["request"].get("leader") else 1, task["created_at"],
-                                       next(self._arrivals), task_id))
+        urgent = _urgent(task)
+        self._queues[addr].put_nowait((0 if urgent else 1, task["created_at"], next(self._arrivals), task_id))
+        if urgent:
+            self._make_way(addr, task_id)
+
+    def _make_way(self, addr: str, urgent_id: str) -> None:
+        """D-104: urgent work stops a run of this post that is not urgent; that task is laid out again behind it
+        (the stopped run is not counted as an attempt; its next run is told why). Urgent behind urgent waits."""
+        for task_id, runner in list(self._running.items()):
+            task = self.hub.ledger.task(task_id, "owner")
+            if not task or task["owner"] != addr or _urgent(task) or runner.done() or task_id in self._stopped_runs:
+                continue
+            self._note_interrupt(task_id, f"stopped for the urgent task {urgent_id}; carry on from where you were "
+                                          "once it is done")
+            self._stopped_runs[task_id] = f"stopped for the urgent task {urgent_id}; laid out again after it"
+            runner.cancel()
 
     async def _runner(self, agent: AgentConfig, addr: str, queue: asyncio.PriorityQueue) -> None:
         while True:
