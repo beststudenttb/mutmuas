@@ -425,12 +425,12 @@ class Hub:
         await self.publish_task_record(task_id)
         log.info("task %s finished: %s", task_id, result["status"])
         if manual and self._bus_up():   # D-109: a requester that cannot be woken never accepts: tell the secretary
-            card = await self.card_or_none(task["requester"])
-            if card is None or not card.get("online"):
-                why = "is retired or unknown" if card is None else "is on a node that is offline"
+            # Only one that is gone: an offline node gets the delivery when it is back, and judges then whether
+            # someone there can accept it (B:ops E1: reporting it here too would report it twice, or for nothing)
+            if await self.card_or_none(task["requester"]) is None:
                 await self.escalate(task["owner"], task_id, "acceptance",
-                                    f"{task_id} was delivered to {task['requester']}, who {why}: nobody can accept "
-                                    "it now")
+                                    f"{task_id} was delivered to {task['requester']}, who is retired or unknown: "
+                                    "nobody can accept it")
         self.drop_inbox_line(task_id)
         if workdir:
             workdir.mkdir(parents=True, exist_ok=True)          # as a run does; a post may not have run yet

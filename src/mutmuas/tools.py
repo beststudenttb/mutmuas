@@ -416,6 +416,10 @@ async def report_progress(hub: Hub, me: str, message: str, task_id: str | None =
         raise ValueError("task_id is required outside of a delegated task")
     task = _owned(hub, me, task_id)
     _check_actor(hub, task)
+    if task["status"] == DELIVERED:
+        # it would go out as RUNNING and take the delivery back unsaid (B:ops P4)
+        raise ValueError(f"{task_id} is delivered and waits for {task['requester']} to accept it: no progress to "
+                         "report; withdraw_delivery to take it back and work on")
     new_state = state or task["status"]
     if new_state not in ("RUNNING", "WAITING", "BLOCKED"):
         new_state = "RUNNING"

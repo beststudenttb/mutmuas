@@ -134,6 +134,7 @@ async def test_a_childs_delivery_wakes_its_parent_whose_wait_ends_only_with_acce
         await tools.submit_result(b_daemon.hub, "B:desk", "complete", "trained", task_id=task_id)
         await _carry(b_ledger, a_daemon, a_agent, "RESULT")
         assert "T-p" in a_daemon._queued["A:lead"]                         # woken to accept it
+        assert [d["task_id"] for d in a_daemon._deliveries_for_run("T-p")] == [task_id]   # its run is told
         await tools.add_job(a_daemon.hub, "A:lead", "T-p", children=True, note="the training")
         await a_daemon._check_jobs()
         assert a_ledger.jobs("T-p")                                         # delivered, not accepted: still waits
@@ -242,17 +243,138 @@ class _CardBus:
         pass
 
 
-@pytest.mark.parametrize("card, why", [(None, "retired"), ({"address": "A:lead", "last_heartbeat": "2000-01-01T00:00:00+00:00",
-                                                             "heartbeat_s": 5}, "offline")])
-async def test_the_owner_reports_a_delivery_to_a_requester_that_is_gone_or_offline(tmp_path, monkeypatch, card, why):
+@pytest.mark.parametrize("card", [None, {"address": "A:lead", "last_heartbeat": "2000-01-01T00:00:00+00:00",
+                                           "heartbeat_s": 5}])
+async def test_the_owner_reports_a_delivery_to_a_requester_that_is_gone_but_not_one_offline(tmp_path, card):
+    """Gone (retired or unknown): nobody will ever accept it. Offline: the delivery waits on the bus, and the
+    requester's node judges whether someone can accept it once it is back (and reports it then if not): telling the
+    secretary now as well would report it twice, or for nothing (B:ops E1)."""
     task_id, (a_agent, a_ledger, a_daemon), (b_agent, b_ledger, b_daemon) = await _manual_task(tmp_path)
     b_daemon.cfg.escalate_to = ["B:secretary"]
     b_daemon.hub.bus = _CardBus({"A.lead": card} if card else {})
     try:
         await tools.submit_result(b_daemon.hub, "B:desk", "complete", "trained", task_id=task_id)
-        [report] = [e for e in b_daemon.hub.bus.published
-                    if e.to == "B:secretary" and e.body.get("follow_up") == "acceptance"]
-        assert why in report.body["message"] and task_id in report.body["message"]
+        reports = [e for e in b_daemon.hub.bus.published
+                   if e.to == "B:secretary" and e.body.get("follow_up") == "acceptance"]
+        if card is None:
+            [report] = reports
+            assert "retired" in report.body["message"] and task_id in report.body["message"]
+        else:
+            assert reports == []
     finally:
         a_ledger.close()
         b_ledger.close()
+
+
+# ---- B:ops review of 2decb66 (P1-P5) ---------------------------------------------------------------------------------
+
+async def test_a_delivery_that_comes_while_its_parent_runs_ends_the_parents_next_wait(tmp_path):
+    """P1: the wake a delivery sends finds the parent's run still going and is dropped; that run started before the
+    delivery, so it was not told. Its wait on the children ends at once on the delivery it has not seen (once):
+    the next run is told and accepts it."""
+    task_id, (a_agent, a_ledger, a_daemon), (b_agent, b_ledger, b_daemon) = await _manual_task(tmp_path, parent="T-p")
+    try:
+        a_daemon._running["T-p"] = object()                     # the parent's run is still going
+        await tools.submit_result(b_daemon.hub, "B:desk", "complete", "trained", task_id=task_id)
+        await _carry(b_ledger, a_daemon, a_agent, "RESULT")
+        assert "T-p" not in a_daemon._queued["A:lead"]
+        del a_daemon._running["T-p"]
+        await tools.add_job(a_daemon.hub, "A:lead", "T-p", children=True, note="wait")   # the run ends waiting
+        await a_daemon._check_jobs()
+        assert a_ledger.jobs("T-p") == [] and "T-p" in a_daemon._queued["A:lead"]
+        ended = a_ledger.jobs("T-p", open_only=False)[-1]["ended"]
+        assert task_id in ended and "waits for your acceptance" in ended
+        assert [d["task_id"] for d in a_daemon._deliveries_for_run("T-p")] == [task_id]
+        await tools.add_job(a_daemon.hub, "A:lead", "T-p", children=True, note="wait")   # waits again unaccepted
+        await a_daemon._check_jobs()
+        assert a_ledger.jobs("T-p")                              # told once: now it is the parent's to accept
+    finally:
+        a_ledger.close(); b_ledger.close()
+
+
+async def test_a_fresh_delivery_ends_a_wait_only_with_the_other_children_done(tmp_path):
+    """As before D-109 a result did: the wait is on all the children."""
+    task_id, (a_agent, a_ledger, a_daemon), (b_agent, b_ledger, b_daemon) = await _manual_task(tmp_path, parent="T-p")
+    try:
+        await tools.send_request(a_daemon.hub, "A:lead", "B:desk", "second", "y", acceptance="manual", parent_task="T-p")
+        a_daemon._running["T-p"] = object()
+        await tools.submit_result(b_daemon.hub, "B:desk", "complete", "trained", task_id=task_id)
+        await _carry(b_ledger, a_daemon, a_agent, "RESULT")
+        del a_daemon._running["T-p"]
+        await tools.add_job(a_daemon.hub, "A:lead", "T-p", children=True, note="wait")
+        await a_daemon._check_jobs()
+        assert a_ledger.jobs("T-p")                              # the second child is still open
+    finally:
+        a_ledger.close(); b_ledger.close()
+
+
+async def test_pause_and_resume_leave_a_delivered_child_alone(tmp_path):
+    """P3: a delivered child has done its work: pausing and resuming its parent must not send it back to work
+    (it was put back in the queue and done again), and neither may a control sent to it directly."""
+    from mutmuas.protocol import Envelope
+    task_id, (a_agent, a_ledger, a_daemon), (b_agent, b_ledger, b_daemon) = await _manual_task(tmp_path, parent="T-p")
+    try:
+        await tools.submit_result(b_daemon.hub, "B:desk", "complete", "trained", task_id=task_id)
+        await _carry(b_ledger, a_daemon, a_agent, "RESULT")
+        for kind in ("pause", "resume"):
+            await a_daemon._cascade(Envelope(type="UPDATE", sender="C:boss", to="A:lead", task_id="T-p",
+                                             body={"message": kind, kind: True}), kind)
+        assert [e for e in a_ledger.outbox() if e.task_id == task_id and e.type == "UPDATE"] == []
+        queued = b_daemon._queues["B:desk"].qsize()          # (queued once already: the request, never taken here)
+        for kind in ("pause", "resume", "interrupt"):
+            env = Envelope(type="UPDATE", sender="A:lead", to="B:desk", task_id=task_id,
+                           body={"message": kind, kind: True})
+            b_ledger.ingest(env)
+            await b_daemon._handle(b_agent, env)
+        task = b_ledger.task(task_id, "owner")
+        assert task["status"] == "DELIVERED" and not task["paused"] and not task["interrupts"]
+        assert b_daemon._queues["B:desk"].qsize() == queued
+        await tools.accept_delivery(a_daemon.hub, "A:lead", task_id, "pass")       # still acceptable
+        assert a_ledger.task(task_id, "requester")["status"] == "COMPLETED"
+    finally:
+        a_ledger.close(); b_ledger.close()
+
+
+async def test_a_delivery_to_a_parent_that_is_itself_delivered_is_reported(tmp_path):
+    """P2: a delivered parent runs no more until its own requester answers: nothing wakes it to accept."""
+    task_id, (a_agent, a_ledger, a_daemon), (b_agent, b_ledger, b_daemon) = await _manual_task(tmp_path, parent="T-p")
+    a_daemon.cfg.escalate_to = ["B:secretary"]
+    try:
+        a_ledger.update_task("T-p", "owner", status="DELIVERED")
+        await tools.submit_result(b_daemon.hub, "B:desk", "complete", "trained", task_id=task_id)
+        await _carry(b_ledger, a_daemon, a_agent, "RESULT")
+        [report] = _to_secretary(a_ledger)
+        assert task_id in report.body["message"]
+    finally:
+        a_ledger.close(); b_ledger.close()
+
+
+async def test_progress_on_a_delivered_task_is_refused(tmp_path):
+    """P4: it was sent as RUNNING, which took the delivery back without saying so (and a pass crossing it was then
+    ignored: the owner stayed RUNNING). withdraw_delivery is the way back."""
+    task_id, (a_agent, a_ledger, a_daemon), (b_agent, b_ledger, b_daemon) = await _manual_task(tmp_path)
+    try:
+        await tools.submit_result(b_daemon.hub, "B:desk", "complete", "trained", task_id=task_id)
+        with pytest.raises(ValueError, match="withdraw_delivery"):
+            await tools.report_progress(b_daemon.hub, "B:desk", "delivered, see result", task_id=task_id)
+        assert b_ledger.task(task_id, "owner")["status"] == "DELIVERED"
+        assert [e for e in b_ledger.outbox() if e.type == "UPDATE"] == []
+    finally:
+        a_ledger.close(); b_ledger.close()
+
+
+async def test_agentctl_ask_needs_a_reason_but_not_outputs_or_criteria(monkeypatch):
+    """P5 (the secretary's call): a script's request is accepted on delivery, so agentctl does not ask it for expected
+    outputs or acceptance criteria; a request still says why (reply none: a notice, which needs neither)."""
+    from mutmuas import cli
+    sent = []
+
+    async def send_request(hub, me, to, objective, reason, **kw):
+        sent.append((to, objective, reason))
+        return {"task_id": "T-1"}
+    monkeypatch.setattr(tools, "send_request", send_request)
+    parse = cli.agentctl_parser().parse_args
+    await cli.cmd_ask(parse(["ask", "B:llm", "read notes", "--reason", "smoke", "--as", "A:a1"]), None)
+    assert sent == [("B:llm", "read notes", "smoke")]
+    with pytest.raises(SystemExit, match="reason"):
+        await cli.cmd_ask(parse(["ask", "B:x", "o", "--as", "A:a1"]), None)

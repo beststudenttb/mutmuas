@@ -14,15 +14,15 @@ from .visibility import short
 TEMPLATES: dict[str, dict[str, Any]] = yaml.safe_load(Path(__file__).with_name("letters.yaml").read_text())
 
 
-def missing(kind: str, values: dict[str, Any]) -> list[str]:
-    """The required blanks of template `kind` left empty, as '<key> (<label>)'."""
+def missing(kind: str, values: dict[str, Any], optional: tuple[str, ...] = ()) -> list[str]:
+    """The required blanks of template `kind` left empty, as '<key> (<label>)'; `optional` ones are not asked for."""
     return [f"{key} ({spec.get('label', key)})" for key, spec in TEMPLATES[kind]["fields"].items()
-            if spec.get("required") and values.get(key) in (None, "", [], {})]
+            if spec.get("required") and key not in optional and values.get(key) in (None, "", [], {})]
 
 
-def check(kind: str, values: dict[str, Any]) -> None:
+def check(kind: str, values: dict[str, Any], optional: tuple[str, ...] = ()) -> None:
     """Refuse a letter whose template has required blanks left empty (ValueError, naming them)."""
-    if gaps := missing(kind, values):
+    if gaps := missing(kind, values, optional):
         name = TEMPLATES[kind]["name"]
         raise ValueError(f"{name} ({kind}) is missing: {', '.join(gaps)}")
 

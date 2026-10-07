@@ -89,9 +89,8 @@ async def test_agentctl_refuses_an_incomplete_request_and_sends_a_notice(tmp_pat
     _, _, ledger, hub, _ = auto_worker_node(tmp_path)
     try:
         parser = cli.agentctl_parser()
-        with pytest.raises(SystemExit, match="acceptance_criteria"):
-            await cli.cmd_ask(parser.parse_args(["ask", "C:far", "train it", "--reason", "r", "--expect", "x",
-                                                 "--as", "B:desk"]), hub)
+        with pytest.raises(SystemExit, match="reason"):        # (outputs and criteria: see test_acceptance, P5)
+            await cli.cmd_ask(parser.parse_args(["ask", "C:far", "train it", "--expect", "x", "--as", "B:desk"]), hub)
         assert ledger.outbox() == []
         await cli.cmd_notice(parser.parse_args(["notice", "C:far", "the GPU is free again", "--as", "B:desk"]), hub)
         [notice] = _sent(ledger, "REQUEST")

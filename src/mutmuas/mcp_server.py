@@ -233,8 +233,9 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         deadline: when you need the reply, from now (+2h, +1d); overdue replies are followed up.
         Returns a task_id; the message is durable even if the target is offline. Its delivery waits for you to
         accept it (accept_delivery): you are woken when it comes.
-        The 需求 template (letters.yaml): objective, reason, expected_outputs, acceptance_criteria and deadline must
-        be filled (a notice, reply="none", needs only its objective: use send_notice)."""
+        The 需求 template (letters.yaml): objective, reason, expected_outputs and acceptance_criteria must be filled;
+        without a deadline the node's default applies (a notice, reply="none", needs only its objective: use
+        send_notice)."""
         if reply == "none":
             letters.check("notice", {"text": objective})
         else:

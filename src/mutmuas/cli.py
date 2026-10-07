@@ -168,10 +168,10 @@ async def cmd_find(args, hub: Hub):
     _print(await tools.find_agent(hub, args.capability), args.json)
 
 
-def _letter(kind: str, values: dict) -> None:
+def _letter(kind: str, values: dict, optional: tuple[str, ...] = ()) -> None:
     """A letter's template (D-109): refused here, before anything is sent, when a required blank is empty."""
     try:
-        letters.check(kind, values)
+        letters.check(kind, values, optional)
     except ValueError as e:
         raise SystemExit(f"error: {e}") from None
 
@@ -180,8 +180,10 @@ async def cmd_ask(args, hub: Hub):
     if args.reply == "none":
         _letter("notice", {"text": args.objective})
     else:
+        # a script's request is accepted on delivery (D-109), so it is not asked what to deliver or how it is judged
         _letter("request", {"objective": args.objective, "reason": args.reason, "expected_outputs": args.expect,
-                            "acceptance_criteria": args.accept, "deadline": args.due})
+                            "acceptance_criteria": args.accept, "deadline": args.due},
+                optional=("expected_outputs", "acceptance_criteria"))
     out = await tools.send_request(
         hub, _me(args), args.to, args.objective, args.reason or "a notice", kind=args.kind,
         inputs=_parse_kv(args.input) or None, expected_outputs=args.expect, acceptance_criteria=args.accept,
