@@ -78,12 +78,15 @@ ledger = Ledger(cfg.db_path)
 task = ledger.task("T-new", "owner")
 assert task["status"] == "WAITING" and task["paused"] == 1, task
 assert ledger.tasks(role="owner", limit=None) and ledger.jobs("T-new") and ledger.outbox()
+assert ledger.task("T-delivered", "owner")["status"] == "DELIVERED"
 for raw in json.load(open(sys.argv[2])):
     Envelope.from_json(json.dumps(raw)).validate()
 daemon = NodeDaemon(cfg)                               # a rollback: the previous daemon on this ledger
 daemon.hub = Hub(cfg, None, ledger)
 daemon._queues["B:desk"], daemon._queued["B:desk"] = asyncio.PriorityQueue(), set()
 asyncio.run(daemon.recover())
+assert ledger.task("T-delivered", "owner")["status"] == "DELIVERED"     # not run again, not closed
+assert "T-delivered" not in daemon._queued["B:desk"]
 print("OK")
 """
 
@@ -105,6 +108,12 @@ def test_the_previous_version_works_on_this_codes_ledger_and_messages(tmp_path):
     ledger.update_task("T-new", "owner", status="WAITING", paused=1, wait_reason="quota", run_log="/tmp/run.log",
                        interrupts=["your previous run stopped at the account's usage limit"])
     ledger.add_job("T-new", "B:desk", 99999, "start", "/tmp/done", "/tmp/log", "training")
+    done = Envelope(type="REQUEST", sender="A:main", to="B:desk", task_id="T-delivered",
+                    body={**request_body("check it", "compat"), "acceptance": "manual", "title": "【需求】check it"})
+    ledger.ingest(done)
+    ledger.create_owned_task(done)
+    ledger.update_task("T-delivered", "owner", status="DELIVERED", result_status="complete",
+                       result={"status": "complete", "summary": "checked", "acceptance": "pending"})   # D-109
     ledger.queue_outgoing(Envelope(type="RESULT", sender="B:desk", to="A:main", task_id="T-new",
                                    body={"status": "complete", "summary": "delivered", "next": "A:main"}))
     ledger.close()

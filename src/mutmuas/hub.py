@@ -109,6 +109,15 @@ class Hub:
     def _bus_up(self) -> bool:
         return self.bus is not None and self.bus.connected
 
+    async def escalate(self, sender: str, task_id: str, reason: str, text: str) -> None:
+        """Tell the node's escalation addresses (node.yaml escalate_to: the secretary) about something only they can
+        sort out: an FYI on the task (D-109: a delivery nobody can be woken to accept)."""
+        if not self.cfg.escalate_to:
+            log.warning("nobody to tell (escalate_to is empty): %s", text)
+        for target in self.cfg.escalate_to:
+            await self.send(Envelope(type="UPDATE", sender=sender, to=target, task_id=task_id,
+                                     body={"message": text, "fyi": True, "follow_up": reason}))
+
     async def card_or_none(self, target: str) -> dict[str, Any] | None:
         """Registry lookup that never blocks sending: None if unknown *or* the registry is unreachable."""
         if not self._bus_up():
@@ -415,6 +424,13 @@ class Hub:
         await self.try_publish(env)
         await self.publish_task_record(task_id)
         log.info("task %s finished: %s", task_id, result["status"])
+        if manual and self._bus_up():   # D-109: a requester that cannot be woken never accepts: tell the secretary
+            card = await self.card_or_none(task["requester"])
+            if card is None or not card.get("online"):
+                why = "is retired or unknown" if card is None else "is on a node that is offline"
+                await self.escalate(task["owner"], task_id, "acceptance",
+                                    f"{task_id} was delivered to {task['requester']}, who {why}: nobody can accept "
+                                    "it now")
         self.drop_inbox_line(task_id)
         if workdir:
             workdir.mkdir(parents=True, exist_ok=True)          # as a run does; a post may not have run yet

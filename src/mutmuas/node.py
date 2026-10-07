@@ -740,6 +740,10 @@ class NodeDaemon:
             summary = env.body.get("reason") or env.body.get("message")
             fields.update(result=result_body("failed", f"{env.type.lower()}: {summary}"), result_status="failed")
         ledger.update_task(env.task_id, "requester", status=status, **fields)
+        if status == DELIVERED and not self._can_wake(task):
+            await self.hub.escalate(task["local_agent"], env.task_id, "acceptance",
+                                    f"{env.task_id} was delivered to {task['local_agent']}, which has no session online "
+                                    "and no worker task to wake: nobody can accept it now")
 
     # ---- execution ----------------------------------------------------
 
@@ -1174,6 +1178,19 @@ class NodeDaemon:
         wake = Envelope(type="UPDATE", sender=owner, to=owner, task_id=task_id, body={"message": text, "next": owner})
         hub.ledger.ingest(wake)
         hub.ledger.mark_handled(wake.message_id)
+
+    def _can_wake(self, asked: dict[str, Any]) -> bool:
+        """Whether a delivery to this requester wakes someone to accept it (D-109): its session (online: the delivery
+        is pushed), or its worker through the task the request is part of (an auto_worker post)."""
+        addr = asked["local_agent"]
+        agent = self._agent_cfg(addr)
+        if agent is None:
+            return False
+        if session_fields(self.hub.ledger.session_of(addr)).get("session") == "online":
+            return True
+        parent = self.hub.ledger.task(asked["parent_task"], "owner") if asked.get("parent_task") else None
+        return bool(agent.auto_worker and parent and parent["owner"] == addr
+                    and parent["status"] not in TERMINAL_STATES)
 
     async def _on_acceptance(self, env: Envelope) -> None:
         """D-109: the requester's verdict on a delivered task. pass: done; close: ended as failed (a partial or failed

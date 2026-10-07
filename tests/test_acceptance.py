@@ -185,3 +185,74 @@ def test_a_woken_brain_is_told_which_deliveries_wait_for_it(tmp_path):
 def test_the_mcp_instructions_say_deliveries_wait_for_acceptance():
     from mutmuas.mcp_server import INSTRUCTIONS
     assert "accept_delivery" in INSTRUCTIONS
+
+
+# --------------------------------------------------------------------------- the requester cannot be woken (T3)
+
+
+def _to_secretary(ledger):
+    return [e for e in ledger.outbox() if e.to == "B:secretary" and e.body.get("follow_up") == "acceptance"]
+
+
+async def test_a_delivery_nobody_can_be_woken_for_is_reported_to_the_secretary(tmp_path):
+    """A plain interactive requester with no session (and no worker to start): nothing would ever accept it."""
+    task_id, (a_agent, a_ledger, a_daemon), (b_agent, b_ledger, b_daemon) = await _manual_task(tmp_path)
+    a_agent.auto_worker = False
+    a_daemon.cfg.escalate_to = ["B:secretary"]
+    try:
+        await tools.submit_result(b_daemon.hub, "B:desk", "complete", "trained", task_id=task_id)
+        await _carry(b_ledger, a_daemon, a_agent, "RESULT")
+        [report] = _to_secretary(a_ledger)
+        assert task_id in report.body["message"] and "A:lead" in report.body["message"] and report.body["fyi"]
+    finally:
+        a_ledger.close()
+        b_ledger.close()
+
+
+async def test_a_requester_that_can_be_woken_is_not_reported(tmp_path):
+    task_id, (a_agent, a_ledger, a_daemon), (b_agent, b_ledger, b_daemon) = await _manual_task(tmp_path,
+                                                                                              parent="T-p")
+    a_daemon.cfg.escalate_to = ["B:secretary"]
+    try:
+        await tools.add_job(a_daemon.hub, "A:lead", "T-p", children=True, note="the training")
+        await tools.submit_result(b_daemon.hub, "B:desk", "complete", "trained", task_id=task_id)
+        await _carry(b_ledger, a_daemon, a_agent, "RESULT")
+        assert "T-p" in a_daemon._queued["A:lead"] and _to_secretary(a_ledger) == []
+    finally:
+        a_ledger.close()
+        b_ledger.close()
+
+
+class _CardBus:
+    connected = True
+
+    def __init__(self, cards):
+        from types import SimpleNamespace
+        self.cards = cards
+        self.names = SimpleNamespace(agents_kv="agents")
+        self.published = []
+
+    async def kv_get(self, bucket, key):
+        return self.cards.get(key)
+
+    async def publish(self, env):
+        self.published.append(env)
+
+    async def kv_put(self, *a, **k):
+        pass
+
+
+@pytest.mark.parametrize("card, why", [(None, "retired"), ({"address": "A:lead", "last_heartbeat": "2000-01-01T00:00:00+00:00",
+                                                             "heartbeat_s": 5}, "offline")])
+async def test_the_owner_reports_a_delivery_to_a_requester_that_is_gone_or_offline(tmp_path, monkeypatch, card, why):
+    task_id, (a_agent, a_ledger, a_daemon), (b_agent, b_ledger, b_daemon) = await _manual_task(tmp_path)
+    b_daemon.cfg.escalate_to = ["B:secretary"]
+    b_daemon.hub.bus = _CardBus({"A.lead": card} if card else {})
+    try:
+        await tools.submit_result(b_daemon.hub, "B:desk", "complete", "trained", task_id=task_id)
+        [report] = [e for e in b_daemon.hub.bus.published
+                    if e.to == "B:secretary" and e.body.get("follow_up") == "acceptance"]
+        assert why in report.body["message"] and task_id in report.body["message"]
+    finally:
+        a_ledger.close()
+        b_ledger.close()
