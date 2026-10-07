@@ -22,7 +22,7 @@ from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
 from mcp_types import JSONRPCNotification
 
-from . import tools
+from . import letters, tools
 from .config import NodeConfig
 from .hub import Hub
 from .node import _code_version, lease_refusal, session_alive
@@ -226,7 +226,14 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         leader: true only when the leader asked for this task (it goes first in their queue).
         reply: required (the default: they owe you a RESULT) | none (a notice; closed once they read it).
         deadline: when you need the reply, from now (+2h, +1d); overdue replies are followed up.
-        Returns a task_id; the message is durable even if the target is offline."""
+        Returns a task_id; the message is durable even if the target is offline.
+        The 需求 template (letters.yaml): objective, reason, expected_outputs, acceptance_criteria and deadline must
+        be filled (a notice, reply="none", needs only its objective: use send_notice)."""
+        if reply == "none":
+            letters.check("notice", {"text": objective})
+        else:
+            letters.check("request", {"objective": objective, "reason": reason, "expected_outputs": expected_outputs,
+                                      "acceptance_criteria": acceptance_criteria, "deadline": deadline})
         return dump(await tools.send_request(
             hub(), state["me"], to, objective, reason, kind=kind, inputs=inputs, expected_outputs=expected_outputs,
             constraints=constraints, acceptance_criteria=acceptance_criteria, timeout_s=timeout_s,
@@ -282,6 +289,7 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         """Come back to something later: at (+10m / +2h / +1d from now) the node puts the text into
         your inbox, which wakes you like new mail (and waits there if no session runs). every (e.g. "5h") repeats
         it until cancel_reminder. Use it instead of promising to "check again in a while"."""
+        letters.check("reminder", {"at": at, "text": text})
         return dump(await tools.remind_me(hub(), state["me"], at, text, every=every, task_id=worker_task))
 
     @server.tool()
@@ -300,12 +308,15 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
     async def accept_task(task_id: str, eta: str | None = None) -> str:
         """Accept a task that was sent to you (interactive agents). eta: when you expect to deliver, from now
         (+2h, +1d); the requester's node reminds you once it passes and asks for a new one."""
+        letters.check("receipt", {"task_id": task_id})
         return dump(await tools.accept_task(hub(), state["me"], task_id, eta=eta))
 
     @server.tool()
-    async def reject_task(task_id: str, reason: str) -> str:
-        """Refuse a task sent to you, with the reason."""
-        return dump(await tools.reject_task(hub(), state["me"], task_id, reason))
+    async def reject_task(task_id: str, reason: str, suggest: str = "") -> str:
+        """Refuse a task sent to you (退回): the reason, and whom to ask instead (suggest: an address, or who
+        might know)."""
+        letters.check("refusal", {"task_id": task_id, "reason": reason, "suggest": suggest})
+        return dump(await tools.reject_task(hub(), state["me"], task_id, reason, suggest=suggest))
 
     @server.tool()
     async def report_progress(message: str, task_id: str | None = None, state_: str | None = None,
@@ -313,6 +324,8 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         """Tell the requester about progress on a task you own. state_: RUNNING | WAITING | BLOCKED.
         next: the address whose move it is now (wakes them). eta: a new estimate from now (+2h, +1d),
         e.g. when you were reminded that the old one passed."""
+        task_id = task_id or worker_task
+        letters.check("progress", {"task_id": task_id, "message": message})
         return dump(await tools.report_progress(hub(), state["me"], message, task_id, state_, next=next, eta=eta))
 
     @server.tool()
@@ -342,7 +355,10 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
                             how: str | None = None, notes: str | None = None) -> str:
         """Finish a task you own. status: complete | partial | failed — be honest; never call partial complete.
         artifacts: references returned by publish_artifact. next: who moves next, if anyone (wakes them).
-        how / notes: how you did it and anything worth noting; the node writes them into worker-log.md."""
+        how / notes: how you did it and anything worth noting; the node writes them into worker-log.md.
+        The 交付回执 template: task_id (the task this delivers; a worker's own by default), status and summary."""
+        task_id = task_id or worker_task
+        letters.check("delivery", {"task_id": task_id, "status": status, "summary": summary})
         return dump(await tools.submit_result(
             hub(), state["me"], status, summary, task_id=task_id, outputs=outputs, artifacts=artifacts,
             evidence=evidence, limitations=limitations, follow_up=follow_up, next=next, how=how, notes=notes))
@@ -350,12 +366,35 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
     @server.tool()
     async def ask_question(task_id: str, question: str, next: str | None = None) -> str:
         """Ask the other party of a task a question."""
+        letters.check("question", {"task_id": task_id, "question": question})
         return dump(await tools.ask_question(hub(), state["me"], task_id, question, next=next))
 
     @server.tool()
     async def answer_question(task_id: str, answer: str, next: str | None = None) -> str:
         """Answer a QUESTION about a task."""
+        letters.check("answer", {"task_id": task_id, "answer": answer})
         return dump(await tools.answer(hub(), state["me"], task_id, answer, next=next))
+
+    @server.tool()
+    async def send_notice(to: str, text: str, priority: str = "normal", kind: str = "notice") -> str:
+        """告知: tell someone something that needs no reply (it closes once they read it). kind: notice, or
+        patrol for a patrol summary (巡查汇总). priority: high if it is urgent."""
+        letters.check(kind if kind in ("notice", "patrol") else "notice", {"text": text})
+        return dump(await tools.send_notice(hub(), state["me"], to, text, priority=priority,
+                                            kind=kind if kind in ("notice", "patrol") else "notice"))
+
+    @server.tool()
+    async def send_data(to: str, artifacts: list[dict[str, Any]], note: str, task_id: str | None = None) -> str:
+        """数据: hand someone artifacts (references from publish_artifact) with a note on what they are and where
+        they go; on a task (task_id) or on their own."""
+        letters.check("data", {"task_id": task_id, "artifacts": artifacts, "note": note})
+        return dump(await tools.send_data(hub(), state["me"], to, artifacts, note, task_id=task_id))
+
+    @server.tool()
+    async def chase_task(task_id: str, message: str = "") -> str:
+        """催交: ask the owner of a task you requested where it stands (wakes them)."""
+        letters.check("chase", {"task_id": task_id, "message": message})
+        return dump(await tools.chase_task(hub(), state["me"], task_id, message or None))
 
     @server.tool()
     async def quota_waits() -> str:
@@ -373,6 +412,7 @@ def build_server(cfg: NodeConfig, me: str | None, io: dict[str, Any] | None = No
         pause stops its run and keeps it waiting until resume; interrupt stops its run (if it runs) and lays it
         out again with your message first. Its requester may pause and resume it; an address in the owner node's
         trusted_controllers (the secretary) may do all three on any task. Anything else is ignored there."""
+        letters.check("control", {"task_id": task_id, "action": action, "message": message})
         return dump(await tools.control_task(hub(), state["me"], task_id, action, message))
 
     @server.tool()

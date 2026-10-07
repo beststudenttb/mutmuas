@@ -120,6 +120,15 @@ structured result at all, the result is `partial` (exit 0) or `failed` (non-zero
   `delivery` a message it sent keeps failing to go out; `worker` its last two runs failed with nothing finished
   since). Never a task id or content. Both keys are absent when nothing holds it up. Example: `{"stuck": true,
   "stuck_reason": "blocked,delivery"}`.
+- **Letters follow templates** (D-109): every letter an agent writes has a fixed template,
+  `src/mutmuas/letters.yaml` (the wording lives there alone): sent directly — 需求 request (send_request), 告知
+  notice (send_notice), 交付回执 delivery (submit_result, naming its task), 数据 data (send_data); receipts — 收到
+  (accept_task), 退回 refusal (reject_task, with whom to ask instead: `suggest`); other kinds — question, answer,
+  催交 chase (chase_task), progress, pause/resume/interrupt, reminder, 巡查汇总 patrol (send_notice
+  kind=patrol). The framework renders each letter's `title` (body key, e.g. `"【需求】<objective>"`,
+  `"Re:<the task's objective>"`); a required blank left empty refuses the letter at the MCP tool or agentctl
+  command, before anything is sent. Code calling the tools directly is not checked. A delivery is always a
+  delivery receipt naming its task: a new letter is never taken for one.
 - **Waiting for quota** (D-104): a worker run that ends at the vendor account's usage limit (the vendor CLI's own
   words, e.g. Claude's "usage limit reached", Codex's `usage_limit_reached`, or a line `MUTMUAS_QUOTA: <what>`
   from any runtime or script) does not fail its task: the task waits, paused with `wait_reason: quota` (in the

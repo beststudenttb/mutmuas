@@ -40,8 +40,8 @@ async def test_agent_delegates_through_mcp(make_config, cluster, tmp_path):
         assert me["address"] == "A:main"
         best = (await call(session, "find_agent", capability="isaac_lab"))["best"]["address"]
         sent = await call(session, "send_request", to=best, objective="run a short experiment",
-                          reason="mcp test", kind="experiment",
-                          inputs={"action": "experiment", "steps": 2, "step_s": 0.05})
+                          reason="mcp test", kind="experiment", expected_outputs=["losses"],
+                          acceptance_criteria=["it finishes"], inputs={"action": "experiment", "steps": 2, "step_s": 0.05})
         result = await call(session, "wait_for_result", task_id=sent["task_id"], timeout_s=30)
         assert result["result_status"] == "complete"
         fetched = await call(session, "fetch_artifact", uri=result["output_refs"][0]["uri"])

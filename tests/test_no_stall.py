@@ -85,13 +85,14 @@ async def test_g3_default_deadline_leaves_room_for_the_task_timeout(make_config,
 
 
 async def test_g3_the_cli_ask_path_gets_the_default_too(make_config, cluster):
+    import os
     import subprocess
     import sys
-    from pathlib import Path
     a, b, hub_a, hub_b = await _pair(make_config, cluster, default_reply_deadline_s=7200)
-    out = subprocess.run([str(Path(sys.executable).parent / "agentctl"), "ask", "B:desk", "report", "--reason", "cli",
-                          "--json", "--config", str(a.path), "--as", "A:main"], capture_output=True, text=True,
-                         timeout=60)
+    out = subprocess.run([sys.executable, "-m", "mutmuas.cli", "ask", "B:desk", "report", "--reason", "cli",
+                          "--expect", "a report", "--accept", "it says", "--json", "--config", str(a.path),
+                          "--as", "A:main"], capture_output=True, text=True, timeout=60,
+                         env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)})   # the code under test
     assert out.returncode == 0, out.stderr
     import json
     task_id = json.loads(out.stdout)["task_id"]

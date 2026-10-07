@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from . import node   # node imports tools as well: its names are looked up when called
+from . import letters, node   # node imports tools as well: its names are looked up when called
 from .hub import Hub
 from .ids import Address, parse_iso
 from .visibility import acl, artifact_visible, is_participant, short
@@ -68,6 +68,7 @@ async def send_request(hub: Hub, me: str, to: str, objective: str, reason: str, 
                         deadline=deadline or default_deadline, timeout_s=timeout_s, reply=reply, observers=observers,
                         deadline_default=bool(default_deadline),  # the owner can tell it from a chosen one
                         leader=leader)
+    body["title"] = letters.title("request", {"objective": objective})
     return await _send_request(hub, me, to, body, artifacts=artifacts, parent_task=parent_task, priority=priority,
                                project=project)
 
@@ -336,7 +337,8 @@ async def accept_task(hub: Hub, me: str, task_id: str, eta: str | None = None) -
     if refused and "worker" in refused:
         raise PermissionError(f"{task_id} is being done by the worker the daemon started before this session; "
                               "it is not interrupted (D-032a): wait for its result (whoami: worker_running)")
-    body = {"state": "RUNNING", "message": f"accepted by {me}" + (f"; eta {eta}" if eta else "")}
+    body = {"state": "RUNNING", "message": f"accepted by {me}" + (f"; eta {eta}" if eta else ""),
+            "title": letters.title("receipt", {}, _original(hub, task_id))}
     if eta:
         body["eta"] = eta                         # the requester's node chases it once it passes (D-076)
         hub.ledger.update_task(task_id, "owner", eta=eta)
@@ -394,9 +396,11 @@ async def add_job(hub: Hub, me: str, task_id: str | None = None, pid: int | None
     return {"task_id": task_id, "job_id": job_id, "state": "WAITING"}
 
 
-async def reject_task(hub: Hub, me: str, task_id: str, reason: str) -> dict[str, Any]:
+async def reject_task(hub: Hub, me: str, task_id: str, reason: str, suggest: str | None = None) -> dict[str, Any]:
     _check_actor(hub, _owned(hub, me, task_id))
-    ok = await hub.owner_transition(task_id, "FAILED", reason, msg_type="REJECT", body={"reason": reason})
+    body = {"reason": reason, "title": letters.title("refusal", {}, _original(hub, task_id)),
+            **({"suggest": suggest} if suggest else {})}                     # who to ask instead (D-109)
+    ok = await hub.owner_transition(task_id, "FAILED", reason, msg_type="REJECT", body=body)
     return {"task_id": task_id, "rejected": ok}
 
 
@@ -413,6 +417,7 @@ async def report_progress(hub: Hub, me: str, message: str, task_id: str | None =
         new_state = "RUNNING"
     msg_type = "BLOCKED" if new_state == "BLOCKED" else "UPDATE"
     body = {"reason": message} if msg_type == "BLOCKED" else {"state": new_state, "message": message}
+    body["title"] = letters.title("progress", {}, task["request"].get("objective"))
     if next:
         body["next"] = next
     if (eta := from_now(eta, "eta")):
@@ -439,6 +444,7 @@ async def submit_result(hub: Hub, me: str, status: str, summary: str, *, task_id
     worker_of = _check_actor(hub, task)
     body = result_body(status, summary, outputs=outputs, evidence=evidence, limitations=limitations,
                        follow_up=follow_up, how=how, notes=notes)
+    body["title"] = letters.title("delivery", {}, task["request"].get("objective"))
     if next:
         body["next"] = next
     refs = [ArtifactRef.from_dict(a) for a in artifacts or []]
@@ -452,7 +458,8 @@ async def submit_result(hub: Hub, me: str, status: str, summary: str, *, task_id
 
 
 async def ask_question(hub: Hub, me: str, task_id: str, question: str, next: str | None = None) -> dict[str, Any]:
-    delivery = await hub.reply(me, task_id, "QUESTION", {"question": question, **({"next": next} if next else {})})
+    delivery = await hub.reply(me, task_id, "QUESTION", {"question": question, **({"next": next} if next else {}),
+                                                         "title": letters.title("question", {}, _original(hub, task_id))})
     return {"task_id": task_id, "delivery": delivery}
 
 
@@ -468,7 +475,8 @@ async def control_task(hub: Hub, me: str, task_id: str, action: str, message: st
     if action not in CONTROLS:
         raise ValueError(f"action={action!r}: one of {', '.join(CONTROLS)}")
     addr, _ = hub.local_agent(me)
-    body = {"message": message, action: True}
+    body = {"message": message, action: True,
+            "title": letters.title("control", {"action": action}, _original(hub, task_id))}
     asked = hub.ledger.task(task_id, "requester")
     if asked and asked["local_agent"] == str(addr):
         delivery = await hub.reply(me, task_id, "UPDATE", body)
@@ -497,8 +505,49 @@ async def resume_quota_waits(hub: Hub, me: str, message: str = "the usage limit 
     return {"resumed": resumed}
 
 
+def _original(hub: Hub, task_id: str) -> str | None:
+    """The title of the task a letter is about: its objective."""
+    task = hub.ledger.task(task_id)
+    return ((task or {}).get("request") or {}).get("objective")
+
+
+async def send_notice(hub: Hub, me: str, to: str, text: str, *, priority: str = "normal",
+                      kind: str = "notice") -> dict[str, Any]:
+    """告知 (D-109): a notice that needs no reply (it closes once read). kind: notice, or patrol (巡查汇总)."""
+    body = request_body(text, letters.TEMPLATES[kind]["name"], reply="none")
+    body["title"] = letters.title(kind, {"text": text})
+    return await _send_request(hub, me, to, body, artifacts=None, parent_task=None, priority=priority, project=None)
+
+
+async def send_data(hub: Hub, me: str, to: str, artifacts: list[dict], note: str,
+                    task_id: str | None = None) -> dict[str, Any]:
+    """数据 (D-109): artifacts with a note on what they are and where they go. On a task: an UPDATE to its other
+    party; else a notice carrying them."""
+    if not task_id:
+        body = request_body(note, letters.TEMPLATES["data"]["name"], reply="none")
+        body["title"] = letters.title("data", {"note": note})
+        return await _send_request(hub, me, to, body, artifacts=artifacts, parent_task=None, priority="normal",
+                                   project=None)
+    body = {"message": note, "data": True, "title": letters.title("data", {"note": note})}
+    delivery = await hub.reply(me, task_id, "UPDATE", body, [ArtifactRef.from_dict(a) for a in artifacts],
+                               to=await hub.resolve(to))
+    return {"task_id": task_id, "delivery": delivery}
+
+
+async def chase_task(hub: Hub, me: str, task_id: str, message: str | None = None) -> dict[str, Any]:
+    """催交 (D-109): the requester asks the owner where its task stands; it names the owner next (wakes it)."""
+    addr, _ = hub.local_agent(me)
+    task = hub.ledger.task(task_id, "requester")
+    if task is None or task["local_agent"] != str(addr):
+        raise PermissionError(f"{addr} did not request {task_id}: only its requester chases it")
+    body = {"message": message or "where does this stand? an eta or the result, please", "next": task["owner"],
+            "title": letters.title("chase", {}, _original(hub, task_id))}
+    return {"task_id": task_id, "delivery": await hub.reply(me, task_id, "UPDATE", body)}
+
+
 async def answer(hub: Hub, me: str, task_id: str, text: str, next: str | None = None) -> dict[str, Any]:
-    delivery = await hub.reply(me, task_id, "ANSWER", {"answer": text, **({"next": next} if next else {})})
+    delivery = await hub.reply(me, task_id, "ANSWER", {"answer": text, **({"next": next} if next else {}),
+                                                       "title": letters.title("answer", {}, _original(hub, task_id))})
     return {"task_id": task_id, "delivery": delivery}
 
 
